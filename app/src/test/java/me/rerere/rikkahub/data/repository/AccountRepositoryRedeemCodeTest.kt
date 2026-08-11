@@ -1,0 +1,28 @@
+package me.rerere.rikkahub.data.repository
+
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class AccountRepositoryRedeemCodeTest {
+
+    @Test
+    fun `lowercase redeem code is preserved`() {
+        val code = "03ae124d1c13dd9e07408f268c5077e5"
+
+        assertEquals(code, AccountRepository.normalizeRedeemCode(code))
+    }
+
+    @Test
+    fun `mixed case and separators are preserved`() {
+        val code = "AbCd1234-EfGh5678-IjKl9012-MnOp3456"
+
+        assertEquals(code, AccountRepository.normalizeRedeemCode(code))
+    }
+
+    @Test
+    fun `surrounding whitespace and zero width characters are removed`() {
+        val input = " \n\u200BAb-cD\uFEFF\t "
+
+        assertEquals("Ab-cD", AccountRepository.normalizeRedeemCode(input))
+    }
+}

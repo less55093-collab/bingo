@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   API 31+ 的备份/还原规则 (API 30 及以下见 backup_rules.xml)。
+
+   cloud-backup: 卸载重装后由系统还原, 用于找回聊天记录。
+   device-transfer: 换机直连迁移, 不经过云端, 所以可以带上登录凭证。
+
+   两边都不备份 WAL/SHM: 它们是 Room 的运行时状态, 单独还原会和数据库主文件错位。
+-->
+<data-extraction-rules>
+  <cloud-backup>
+    <!-- 聊天记录数据库 (Room: rikka_hub) -->
+    <include
+      domain="database"
+      path="rikka_hub" />
+    <!-- 应用设置 (助手、供应商等)。DataStore Preferences 落在 filesDir/datastore/ 下 -->
+    <include
+      domain="file"
+      path="datastore/settings.preferences_pb" />
+    <!-- 以下内容不在 include 列表里, 因此不会上云, 无需 (也不允许) 显式 exclude:
+         - upload/ 图片与附件: 体积远大于文字且配额有限。还原后消息里的图片会被
+           整条省略 (见 ConversationRepository.stripMissingImages), 用户需自行保存到相册。
+           注意 device-transfer 仍然带图片: 换机直连不经过云端, 也没有配额限制。
+         - datastore/auth.preferences_pb 登录凭证: 不上云, 重装后重新登录。
+         - rikka_hub-wal / rikka_hub-shm: Room 运行时状态, 主库已在退后台时 checkpoint。 -->
+  </cloud-backup>
+
+  <device-transfer>
+    <include
+      domain="database"
+      path="rikka_hub" />
+    <include
+      domain="file"
+      path="datastore/settings.preferences_pb" />
+    <!-- 换机直连不经过云端, 可以带上登录凭证, 迁移后无需重新登录 -->
+    <include
+      domain="file"
+      path="datastore/auth.preferences_pb" />
+    <include
+      domain="file"
+      path="upload/" />
+    <!-- WAL/SHM 未 include, 因此不参与迁移: 主库已在退后台时 checkpoint。 -->
+  </device-transfer>
+</data-extraction-rules>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   API 30 及以下的自动备份规则 (API 31+ 见 data_extraction_rules.xml)。
+
+   注意: 一旦出现任何 <include>, 未被 include 的路径就全部不备份。
+   之前这里只 include 了 upload/, 导致聊天记录数据库根本没有进入备份,
+   用户卸载重装后拿不回历史对话。这里补全数据库与设置, 并排除登录凭证。
+-->
+<full-backup-content>
+  <!-- 聊天记录数据库 (Room: rikka_hub) -->
+  <include
+    domain="database"
+    path="rikka_hub" />
+  <!-- 应用设置 (助手、供应商等)。DataStore Preferences 落在 filesDir/datastore/ 下 -->
+  <include
+    domain="file"
+    path="datastore/settings.preferences_pb" />
+  <!-- 以下内容因为不在 include 列表里, 所以不会进入备份, 无需 (也不允许) 显式 exclude:
+       - upload/ 图片与附件: 体积远大于文字且备份配额有限。还原后消息里的图片会被
+         整条省略 (见 ConversationRepository.stripMissingImages), 不会留下坏引用。
+       - datastore/auth.preferences_pb 登录凭证: 不上云, 重装后重新登录。
+       - rikka_hub-wal / rikka_hub-shm: Room 运行时状态, 单独还原会与主库错位;
+         主库在退到后台时已做 checkpoint (见 DatabaseUtil)。 -->
+</full-backup-content>
