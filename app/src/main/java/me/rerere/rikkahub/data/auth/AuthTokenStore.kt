@@ -93,6 +93,8 @@ class AuthTokenStore(private val context: Context) {
      */
     fun tokensBlocking(): AuthTokens = runBlocking { currentTokens() }
 
+    fun profileBlocking(): UserProfile? = runBlocking { profileFlow.first() }
+
     suspend fun saveTokens(accessToken: String, refreshToken: String?, expiresInSeconds: Long) {
         dataStore.edit { prefs ->
             prefs[ACCESS_TOKEN] = accessToken

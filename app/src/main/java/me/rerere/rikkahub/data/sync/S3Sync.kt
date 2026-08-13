@@ -14,6 +14,7 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.migration.SettingsJsonMigrator
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 import me.rerere.rikkahub.data.sync.s3.S3Client
 import me.rerere.rikkahub.data.sync.s3.S3Config
 import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
@@ -210,7 +211,7 @@ class S3Sync(
                 check(DatabaseUtil.checkpoint(database)) {
                     "Unable to checkpoint database for backup"
                 }
-                val dbFile = context.getDatabasePath("rikka_hub")
+                val dbFile = context.getDatabasePath(AccountDatabaseManager.currentDatabaseName(context))
                 check(dbFile.isFile) { "Database file does not exist" }
                 addFileToZip(zipOut, dbFile, "rikka_hub.db")
             }

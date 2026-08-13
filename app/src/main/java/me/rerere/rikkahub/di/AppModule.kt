@@ -16,6 +16,12 @@ import me.rerere.rikkahub.utils.EmojiUtils
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
+import me.rerere.rikkahub.data.sync.ChatBackupScheduler
+import me.rerere.rikkahub.data.sync.ChatBackupSync
+import me.rerere.rikkahub.data.sync.ChatBackupWorker
+import org.koin.androidx.workmanager.dsl.worker
+import org.koin.core.qualifier.named
+import me.rerere.rikkahub.di.GATEWAY_RAW_CLIENT
 import me.rerere.rikkahub.web.WebServerManager
 import me.rerere.tts.provider.TTSManager
 import org.koin.dsl.module
@@ -38,6 +44,27 @@ val appModule = module {
     single {
         AppScope()
     }
+
+    single {
+        ChatBackupSync(
+            context = get(),
+            api = get(),
+            tokenStore = get(),
+            database = get(),
+            rawHttpClient = get(named(GATEWAY_RAW_CLIENT)),
+            json = get(),
+        )
+    }
+
+    single {
+        ChatBackupScheduler(
+            context = get(),
+            database = get(),
+            scope = get<AppScope>(),
+        )
+    }
+
+    worker { ChatBackupWorker(get(), get(), get()) }
 
     single<EmojiData> {
         EmojiUtils.loadEmoji(get())

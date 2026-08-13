@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.data.repository
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.first
@@ -23,6 +24,8 @@ import me.rerere.rikkahub.data.model.gateway.SendVerifyCodeRequest
 import me.rerere.rikkahub.data.model.gateway.TokenPair
 import me.rerere.rikkahub.data.model.gateway.UserProfile
 import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
+import me.rerere.rikkahub.data.sync.ChatBackupSync
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 
 sealed interface AuthState {
     /** Startup state, before the token store has been read. */
@@ -39,9 +42,11 @@ sealed interface AuthState {
  */
 class AccountRepository(
     private val api: BingoGatewayAPI,
+    private val context: Context,
     private val tokenStore: AuthTokenStore,
     private val keyProvisioner: KeyProvisioner,
     private val s3CredentialStore: S3CredentialStore,
+    private val chatBackupSync: ChatBackupSync,
     private val scope: CoroutineScope,
 ) {
     private val _state = MutableStateFlow<AuthState>(AuthState.Loading)
@@ -79,6 +84,7 @@ class AccountRepository(
      * cannot work yet, so it is surfaced by [me.rerere.rikkahub.data.auth.ProviderKeys.isComplete].
      */
     private suspend fun onAuthenticated(pair: TokenPair) {
+        val previousDatabase = AccountDatabaseManager.currentDatabaseName(context)
         tokenStore.saveTokens(
             accessToken = pair.accessToken,
             refreshToken = pair.refreshToken,
@@ -88,6 +94,9 @@ class AccountRepository(
         runCatching { keyProvisioner.ensureProvisioned() }
             .onFailure { Log.w(TAG, "key provisioning failed after auth", it) }
         if (pair.user == null) runCatching { refreshProfile() }
+        val profile = tokenStore.profileFlow.first()
+        val targetDatabase = AccountDatabaseManager.databaseName(profile?.id?.takeIf { it > 0 })
+        if (previousDatabase != targetDatabase) chatBackupSync.restartApp()
     }
 
     /** Called on cold start when already authenticated, to self-heal missing or revoked keys. */
@@ -117,6 +126,8 @@ class AccountRepository(
      * the next account on this device a spendable key belonging to the previous user.
      */
     suspend fun logout() {
+        runCatching { chatBackupSync.uploadNow() }
+            .onFailure { Log.w(TAG, "final chat backup failed during logout", it) }
         // Read the profile ID before clearing the auth store so this account's isolated OSS secret
         // can be removed without touching credentials belonging to another account.
         val accountId = tokenStore.profileFlow.first()?.s3CredentialAccountId()
@@ -129,6 +140,7 @@ class AccountRepository(
         tokenStore.clear()
         runCatching { keyProvisioner.applyToSettings(ProviderKeys()) }
             .onFailure { Log.w(TAG, "failed to clear injected keys on logout", it) }
+        chatBackupSync.restartApp()
     }
 
     companion object {

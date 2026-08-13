@@ -89,9 +89,11 @@ val repositoryModule = module {
     single {
         AccountRepository(
             api = get(),
+            context = get(),
             tokenStore = get(),
             keyProvisioner = get(),
             s3CredentialStore = get(),
+            chatBackupSync = get(),
             scope = get<AppScope>(),
         )
     }

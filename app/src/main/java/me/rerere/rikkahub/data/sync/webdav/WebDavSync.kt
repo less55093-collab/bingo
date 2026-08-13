@@ -12,6 +12,7 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.WebDavConfig
 import me.rerere.rikkahub.data.datastore.migration.SettingsJsonMigrator
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 import me.rerere.rikkahub.data.sync.forBackup
 import me.rerere.rikkahub.data.sync.withLocalSyncConfiguration
 import me.rerere.rikkahub.utils.fileSizeToString
@@ -155,17 +156,18 @@ class WebDavSync(
 
             // Backup database files
             if (config.items.contains(WebDavConfig.BackupItem.DATABASE)) {
-                val dbFile = context.getDatabasePath("rikka_hub")
+                val databaseName = AccountDatabaseManager.currentDatabaseName(context)
+                val dbFile = context.getDatabasePath(databaseName)
                 if (dbFile.exists()) {
                     addFileToZip(zipOut, dbFile, "rikka_hub.db")
                 }
 
-                val walFile = File(dbFile.parentFile, "rikka_hub-wal")
+                val walFile = File(dbFile.parentFile, "$databaseName-wal")
                 if (walFile.exists()) {
                     addFileToZip(zipOut, walFile, "rikka_hub-wal")
                 }
 
-                val shmFile = File(dbFile.parentFile, "rikka_hub-shm")
+                val shmFile = File(dbFile.parentFile, "$databaseName-shm")
                 if (shmFile.exists()) {
                     addFileToZip(zipOut, shmFile, "rikka_hub-shm")
                 }
@@ -247,16 +249,18 @@ class WebDavSync(
 
                         "rikka_hub.db", "rikka_hub-wal", "rikka_hub-shm" -> {
                             if (config.items.contains(WebDavConfig.BackupItem.DATABASE)) {
+                                val databaseName = AccountDatabaseManager.currentDatabaseName(context)
+                                val targetDatabase = context.getDatabasePath(databaseName)
                                 val dbFile = when (zipEntry.name) {
-                                    "rikka_hub.db" -> context.getDatabasePath("rikka_hub")
+                                    "rikka_hub.db" -> targetDatabase
                                     "rikka_hub-wal" -> File(
-                                        context.getDatabasePath("rikka_hub").parentFile,
-                                        "rikka_hub-wal"
+                                        targetDatabase.parentFile,
+                                        "$databaseName-wal"
                                     )
 
                                     "rikka_hub-shm" -> File(
-                                        context.getDatabasePath("rikka_hub").parentFile,
-                                        "rikka_hub-shm"
+                                        targetDatabase.parentFile,
+                                        "$databaseName-shm"
                                     )
 
                                     else -> null

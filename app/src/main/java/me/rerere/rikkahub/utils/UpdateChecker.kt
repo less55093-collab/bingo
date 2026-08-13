@@ -30,6 +30,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.UPDATE_NOTIFICATION_CHANNEL_ID
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 import me.rerere.rikkahub.data.sync.forBackup
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -181,7 +182,9 @@ class UpdateChecker(
             FileOutputStream(partial).use { fileOutput ->
                 ZipOutputStream(fileOutput).use { zip ->
                     zip.writeText("settings.json", json.encodeToString(settingsStore.settingsFlow.value.forBackup()))
-                    context.getDatabasePath("rikka_hub").takeIf(File::isFile)?.let { zip.writeFile(it, "rikka_hub.db") }
+                    context.getDatabasePath(AccountDatabaseManager.currentDatabaseName(context))
+                        .takeIf(File::isFile)
+                        ?.let { zip.writeFile(it, "rikka_hub.db") }
                     listOf("upload", "images", "skills", "fonts").forEach { name ->
                         File(context.filesDir, name).takeIf(File::isDirectory)?.let { zip.writeDirectory(it, "$name/") }
                     }

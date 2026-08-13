@@ -28,6 +28,7 @@ import me.rerere.rikkahub.data.auth.KeyProvisioner
 import me.rerere.rikkahub.data.auth.TokenAuthenticator
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 import me.rerere.rikkahub.data.db.fts.MessageFtsManager
 import me.rerere.rikkahub.data.db.fts.SimpleDictManager
 import me.rerere.rikkahub.data.db.migrations.Migration_6_7
@@ -56,7 +57,11 @@ val dataSourceModule = module {
 
     single {
         val context: Context = get()
-        Room.databaseBuilder(context, AppDatabase::class.java, "rikka_hub")
+        Room.databaseBuilder(
+            context,
+            AppDatabase::class.java,
+            AccountDatabaseManager.currentDatabaseName(context),
+        )
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
             .addMigrations(Migration_6_7, Migration_11_12, Migration_13_14, Migration_14_15, Migration_15_16)
             .addCallback(object : RoomDatabase.Callback() {
@@ -279,6 +284,18 @@ val dataSourceModule = module {
             .build()
     }
 
+    // Presigned OSS URLs must not receive the gateway Bearer token or authenticator.
+    single(named(GATEWAY_RAW_CLIENT)) {
+        OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.MINUTES)
+            .writeTimeout(10, TimeUnit.MINUTES)
+            .followSslRedirects(true)
+            .followRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+
     single(named(GATEWAY_RETROFIT)) {
         Retrofit.Builder()
             .baseUrl(BingoGatewayAPI.BASE_URL)
@@ -296,3 +313,4 @@ val dataSourceModule = module {
 
 const val GATEWAY_CLIENT = "gatewayClient"
 const val GATEWAY_RETROFIT = "gatewayRetrofit"
+const val GATEWAY_RAW_CLIENT = "gatewayRawClient"

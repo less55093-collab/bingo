@@ -20,8 +20,8 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.0.6"
+        versionCode = 9
+        versionName = "1.0.7"
 
         // 版本更新检查地址. 指向一个返回 UpdateInfo JSON 的静态文件即可,
         // 格式见 UpdateChecker.kt 中 UpdateInfo/UpdateDownload 的定义.

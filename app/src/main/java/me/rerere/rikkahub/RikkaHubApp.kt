@@ -34,6 +34,10 @@ import me.rerere.rikkahub.di.viewModelModule
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
+import me.rerere.rikkahub.data.auth.AuthTokenStore
+import me.rerere.rikkahub.data.sync.ChatBackupScheduler
+import me.rerere.rikkahub.data.sync.ChatBackupSync
 import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
@@ -61,6 +65,7 @@ const val WEB_SERVER_NOTIFICATION_CHANNEL_ID = "web_server"
 class RikkaHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        AccountDatabaseManager.prepare(this)
         DatabaseRestoreCoordinator.applyPendingRestore(this)
         startKoin {
             androidLogger()
@@ -102,6 +107,7 @@ class RikkaHubApp : Application() {
 
         // 退到后台时把 WAL 回写主库, 保证系统自动备份能拿到完整聊天记录
         registerDatabaseCheckpoint()
+        registerAutomaticChatBackup()
 
         // Increment launch count
         incrementLaunchCount()
@@ -118,6 +124,21 @@ class RikkaHubApp : Application() {
                 get<AppScope>().launch(Dispatchers.IO) {
                     DatabaseUtil.checkpoint(get<AppDatabase>())
                 }
+            }
+        })
+    }
+
+    private fun registerAutomaticChatBackup() {
+        val scheduler = get<ChatBackupScheduler>()
+        scheduler.start()
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching { get<ChatBackupSync>().restoreIfLocalEmpty() }
+                .onSuccess { restored -> if (restored) get<ChatBackupSync>().restartApp() }
+                .onFailure { error -> Log.w(TAG, "automatic chat restore failed", error) }
+        }
+        ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                scheduler.enqueue(immediate = true)
             }
         })
     }
@@ -190,6 +211,9 @@ class RikkaHubApp : Application() {
     }
 
     private fun syncManagedFiles() {
+        // The physical upload directory predates account namespaces. Scanning it into an
+        // authenticated database would register files left by another account on this device.
+        if (get<AuthTokenStore>().profileBlocking()?.id?.let { it > 0 } == true) return
         get<AppScope>().launch(Dispatchers.IO) {
             runCatching {
                 get<FilesManager>().syncFolder()

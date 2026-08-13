@@ -107,3 +107,23 @@ data class RedeemHistoryItem(
     @SerialName("used_at") val usedAt: String? = null,
     @SerialName("created_at") val createdAt: String? = null,
 )
+
+@Serializable
+data class ChatBackupStatus(
+    val enabled: Boolean = false,
+    val exists: Boolean = false,
+    val size: Long = 0,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val etag: String = "",
+)
+
+@Serializable
+data class ChatBackupUploadRequest(val size: Long)
+
+@Serializable
+data class ChatBackupURL(
+    val url: String,
+    val method: String,
+    val headers: Map<String, String> = emptyMap(),
+    @SerialName("expires_in") val expiresIn: Int = 0,
+)

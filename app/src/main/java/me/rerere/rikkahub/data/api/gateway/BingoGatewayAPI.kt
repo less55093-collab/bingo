@@ -12,6 +12,9 @@ import me.rerere.rikkahub.data.model.gateway.RegisterRequest
 import me.rerere.rikkahub.data.model.gateway.SendVerifyCodeRequest
 import me.rerere.rikkahub.data.model.gateway.TokenPair
 import me.rerere.rikkahub.data.model.gateway.UserProfile
+import me.rerere.rikkahub.data.model.gateway.ChatBackupStatus
+import me.rerere.rikkahub.data.model.gateway.ChatBackupUploadRequest
+import me.rerere.rikkahub.data.model.gateway.ChatBackupURL
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
@@ -64,6 +67,17 @@ interface BingoGatewayAPI {
 
     @GET("api/v1/redeem/history")
     suspend fun redeemHistory(): GatewayEnvelope<List<RedeemHistoryItem>>
+
+    @GET("api/v1/user/chat-backup")
+    suspend fun chatBackupStatus(): GatewayEnvelope<ChatBackupStatus>
+
+    @POST("api/v1/user/chat-backup/upload-url")
+    suspend fun chatBackupUploadURL(
+        @Body body: ChatBackupUploadRequest,
+    ): GatewayEnvelope<ChatBackupURL>
+
+    @POST("api/v1/user/chat-backup/download-url")
+    suspend fun chatBackupDownloadURL(): GatewayEnvelope<ChatBackupURL>
 
     companion object {
         const val BASE_URL = "https://api.bingoapi.top/"

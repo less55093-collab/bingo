@@ -6,6 +6,7 @@ import androidx.core.util.AtomicFile
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import me.rerere.rikkahub.data.db.AccountDatabaseManager
 
 /**
  * Stages a downloaded database until the next cold app start.
@@ -19,10 +20,18 @@ internal object DatabaseRestoreCoordinator {
     private const val DIRECTORY = "pending_database_restore"
     private const val STAGED_DATABASE = "rikka_hub.db"
     private const val MARKER = "pending"
+    private const val TARGET_DATABASE = "target_database"
 
-    fun stage(context: Context, source: File) {
+    fun stage(
+        context: Context,
+        source: File,
+        targetDatabaseName: String = AccountDatabaseManager.currentDatabaseName(context),
+    ) {
         require(source.isFile && source.length() > 0L) { "The backup database is empty" }
         require(isSQLiteDatabase(source)) { "The backup is not a SQLite database" }
+        require(targetDatabaseName == "rikka_hub" || targetDatabaseName.matches(Regex("rikka_hub_user_[1-9][0-9]*"))) {
+            "Invalid restore database target"
+        }
 
         val directory = directory(context).apply { mkdirs() }
         val stagedFile = File(directory, STAGED_DATABASE)
@@ -38,6 +47,7 @@ internal object DatabaseRestoreCoordinator {
             check(temporaryFile.length() > 0L) { "The staged database is empty" }
             check(isSQLiteDatabase(temporaryFile)) { "The staged file is not a SQLite database" }
             replace(temporaryFile, stagedFile)
+            File(directory, TARGET_DATABASE).writeText(targetDatabaseName, Charsets.US_ASCII)
             writeMarker(File(directory, MARKER))
         } catch (error: Throwable) {
             temporaryFile.delete()
@@ -63,13 +73,21 @@ internal object DatabaseRestoreCoordinator {
             return
         }
 
-        val target = context.getDatabasePath(DATABASE_NAME)
+        val databaseName = File(directory, TARGET_DATABASE).takeIf { it.isFile }
+            ?.readText(Charsets.US_ASCII)
+            ?.takeIf { it == "rikka_hub" || it.matches(Regex("rikka_hub_user_[1-9][0-9]*")) }
+        if (databaseName == null) {
+            Log.w(TAG, "Discarding pending restore with invalid target")
+            clear(directory)
+            return
+        }
+        val target = context.getDatabasePath(databaseName)
         val targetDirectory = requireNotNull(target.parentFile)
         check(targetDirectory.exists() || targetDirectory.mkdirs()) {
             "Unable to create database directory"
         }
 
-        val replacement = File(targetDirectory, "$DATABASE_NAME.restore")
+        val replacement = File(targetDirectory, "$databaseName.restore")
         replacement.delete()
         try {
             FileInputStream(stagedFile).use { input ->
@@ -84,8 +102,8 @@ internal object DatabaseRestoreCoordinator {
             // The archive is made after a WAL checkpoint. Never replay pre-restore WAL state.
             // Remove sidecars before making the restored main database visible: a crash after a
             // main-file replacement but before these deletes could otherwise replay old writes.
-            File(targetDirectory, "$DATABASE_NAME-wal").delete()
-            File(targetDirectory, "$DATABASE_NAME-shm").delete()
+            File(targetDirectory, "$databaseName-wal").delete()
+            File(targetDirectory, "$databaseName-shm").delete()
             replace(replacement, target)
             clear(directory)
             Log.i(TAG, "Applied pending database restore")
@@ -138,6 +156,5 @@ internal object DatabaseRestoreCoordinator {
         directory.delete()
     }
 
-    private const val DATABASE_NAME = "rikka_hub"
     private val SQLITE_HEADER = "SQLite format 3\u0000".toByteArray(Charsets.US_ASCII)
 }
