@@ -91,6 +91,7 @@ val repositoryModule = module {
             api = get(),
             tokenStore = get(),
             keyProvisioner = get(),
+            s3CredentialStore = get(),
             scope = get<AppScope>(),
         )
     }

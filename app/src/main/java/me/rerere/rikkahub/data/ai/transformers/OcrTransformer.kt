@@ -82,7 +82,7 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
     suspend fun performOcr(part: UIMessagePart.Image): String = runCatching {
         // Check cache first
         cache.get(part.url)?.let { cachedResult ->
-            Log.i(TAG, "performOcr: Using cached result for ${part.url}")
+            Log.i(TAG, "performOcr: cache hit")
             return cachedResult
         }
 
@@ -106,7 +106,7 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
             ),
         )
         val content = result.choices[0].message?.toText() ?: "[ERROR, OCR failed]"
-        Log.i(TAG, "performOcr: $content")
+        Log.i(TAG, "performOcr: completed outputChars=${content.length}")
         val ocrResult = """
             <image_file_ocr>
                $content
@@ -117,7 +117,8 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
         // Cache the result
         cache.put(part.url, ocrResult)
         return ocrResult
-    }.getOrElse {
-        "[ERROR, OCR failed: $it]"
+    }.getOrElse { error ->
+        Log.w(TAG, "performOcr: failed error=${error.javaClass.simpleName}")
+        "[ERROR, OCR failed]"
     }
 }

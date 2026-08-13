@@ -91,6 +91,7 @@ class DefaultProvidersTest {
             overwrite is ProviderSetting.OpenAI,
         )
         assertEquals(BINGO_IMAGE_OVERWRITE_ID, (overwrite as ProviderSetting.OpenAI).id)
+        assertTrue(overwrite.useAsyncImageTasks)
     }
 
     @Test

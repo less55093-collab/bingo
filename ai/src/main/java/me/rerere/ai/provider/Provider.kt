@@ -52,6 +52,16 @@ interface Provider<T : ProviderSetting> {
     ): Flow<ImageGenerationItem> {
         error("Image edit is not supported")
     }
+
+    suspend fun resumeImageTask(
+        providerSetting: ProviderSetting,
+        taskId: String,
+        customHeaders: List<CustomHeader> = emptyList(),
+        traceId: String = "",
+        onTaskFailed: suspend (String) -> Unit = {},
+    ): Flow<ImageGenerationItem> {
+        error("Asynchronous image tasks are not supported")
+    }
 }
 
 @Serializable
@@ -76,6 +86,10 @@ data class ImageGenerationParams(
     val customBody: List<CustomBody> = emptyList(),
     /** Internal-only correlation ID for performance logs. It is never sent to an API. */
     @Transient val traceId: String = "",
+    /** Called after the gateway has durably accepted an asynchronous task. */
+    @Transient val onTaskSubmitted: suspend (String) -> Unit = {},
+    /** Called only when the gateway reports a terminal failed task. */
+    @Transient val onTaskFailed: suspend (String) -> Unit = {},
 )
 
 @Serializable
@@ -89,6 +103,10 @@ data class ImageEditParams(
     val customBody: List<CustomBody> = emptyList(),
     /** Internal-only correlation ID for performance logs. It is never sent to an API. */
     @Transient val traceId: String = "",
+    /** Called after the gateway has durably accepted an asynchronous task. */
+    @Transient val onTaskSubmitted: suspend (String) -> Unit = {},
+    /** Called only when the gateway reports a terminal failed task. */
+    @Transient val onTaskFailed: suspend (String) -> Unit = {},
 )
 
 @Serializable

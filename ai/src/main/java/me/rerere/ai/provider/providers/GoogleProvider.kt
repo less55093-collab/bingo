@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonArrayBuilder
@@ -36,6 +37,7 @@ import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.providers.vertex.ServiceAccountTokenProvider
 import me.rerere.ai.registry.ModelRegistry
@@ -52,6 +54,7 @@ import me.rerere.ai.util.configureReferHeaders
 import me.rerere.ai.util.encodeBase64
 import me.rerere.ai.util.json
 import me.rerere.ai.util.mergeCustomBody
+import me.rerere.ai.util.parseErrorDetail
 import me.rerere.ai.util.removeElements
 import me.rerere.ai.util.stringSafe
 import me.rerere.ai.util.toHeaders
@@ -68,13 +71,25 @@ import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.apache.commons.text.StringEscapeUtils
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
 
 private const val TAG = "GoogleProvider"
+private const val CHAT_HTTP2_PING_INTERVAL_SECONDS = 15L
 
 class GoogleProvider(private val client: OkHttpClient, context: Context? = null) : Provider<ProviderSetting.Google> {
     private val keyRoulette = if (context != null) KeyRoulette.lru(context) else KeyRoulette.default()
+    private val streamingClient = client.newBuilder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(CHAT_HTTP2_PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        // Do not let OkHttp replay a streaming POST across a 307/308 redirect. Recovery needs an
+        // explicit provider protocol with an idempotency key or resume cursor.
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
     private val serviceAccountTokenProvider by lazy {
         ServiceAccountTokenProvider(client)
     }
@@ -128,7 +143,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             val response = client.newCall(request).await()
             if (response.isSuccessful) {
                 val body = response.body?.string() ?: error("empty body")
-                Log.d(TAG, "listModels: $body")
+                Log.d(TAG, "listModels: responseBytes=${body.toByteArray().size}")
                 val bodyObject = json.parseToJsonElement(body).jsonObject
                 val models = bodyObject["models"]?.jsonArray ?: return@withContext emptyList()
 
@@ -184,7 +199,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
 
         val response = client.newCall(request).await()
         if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body?.string()}")
+            throw Exception("Google request failed with HTTP ${response.code}")
         }
 
         val bodyStr = response.body?.string() ?: ""
@@ -215,6 +230,46 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): Flow<MessageChunk> = callbackFlow {
+        val producer = this
+        val completed = AtomicBoolean(false)
+        val closedByCollector = AtomicBoolean(false)
+
+        fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                producer.close()
+            }
+        }
+
+        fun fail(cause: Throwable) {
+            if (!completed.get() && !closedByCollector.get() && producer.isActive) {
+                producer.close(cause)
+            }
+        }
+
+        fun transportFailure(t: Throwable?, response: Response?): Throwable {
+            val bodyRaw = try {
+                response?.body?.stringSafe()
+            } catch (bodyError: Throwable) {
+                return StreamInterruptedException(
+                    "Google stream failed before completion and its error response could not be read",
+                    t ?: bodyError,
+                )
+            }
+            if (!bodyRaw.isNullOrBlank()) {
+                return try {
+                    val payload = json.parseToJsonElement(bodyRaw)
+                    val detail = (payload as? JsonObject)?.get("error") ?: payload
+                    detail.parseErrorDetail()
+                } catch (parseError: Throwable) {
+                    StreamInterruptedException(
+                        "Google stream failed before completion and its error response was malformed",
+                        parseError,
+                    )
+                }
+            }
+            return StreamInterruptedException("Google stream failed before completion", t)
+        }
+
         val requestBody = buildCompletionRequestBody(messages, params)
 
         val url = buildUrl(
@@ -238,7 +293,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 .build()
         )
 
-        Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
+        Log.i(TAG, "streamText: starting model=${params.model.modelId}")
 
         val listener = object : EventSourceListener() {
             override fun onEvent(
@@ -247,18 +302,28 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 type: String?,
                 data: String
             ) {
-                Log.i(TAG, "onEvent: $data")
+                Log.d(TAG, "onEvent: type=$type bytes=${data.toByteArray().size}")
+                if (data.trim() == "[DONE]") {
+                    complete()
+                    return
+                }
 
                 try {
                     val jsonData = json.parseToJsonElement(data).jsonObject
+                    jsonData["error"]?.let {
+                        fail(it.parseErrorDetail())
+                        return
+                    }
                     val reason =
                         jsonData["promptFeedback"]?.jsonObject?.get("blockReason")?.jsonPrimitiveOrNull?.contentOrNull
                     if (reason != null) {
-                        close(RuntimeException("Prompt feedback: $reason"))
+                        fail(RuntimeException("Prompt feedback: $reason"))
+                        return
                     }
                     val candidates = jsonData["candidates"]?.jsonArray ?: return
                     if (candidates.isEmpty()) return
                     val usage = parseUsageMeta(jsonData["usageMetadata"] as? JsonObject)
+                    var hasTerminalFinishReason = false
                     val messageChunk = MessageChunk(
                         id = Uuid.random().toString(),
                         model = params.model.modelId,
@@ -268,6 +333,9 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                             val groundingMetadata = candidateObj["groundingMetadata"]?.jsonObject
                             val finishReason =
                                 candidateObj["finishReason"]?.jsonPrimitive?.contentOrNull
+                            if (isTerminalFinishReason(finishReason)) {
+                                hasTerminalFinishReason = true
+                            }
 
                             val message = content?.let {
                                 parseMessage(buildJsonObject {
@@ -289,12 +357,14 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                         usage = usage
                     )
 
-                    trySend(messageChunk).onFailure { e ->
-                        Log.w(TAG, "onEvent: chunk dropped (${e?.message})")
+                    producer.trySend(messageChunk).onFailure { e ->
+                        Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    println("[onEvent] 解析错误: $data")
+                    if (hasTerminalFinishReason) {
+                        complete()
+                    }
+                } catch (e: Throwable) {
+                    fail(StreamInterruptedException("Google stream received an invalid event", e))
                 }
             }
 
@@ -303,50 +373,33 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 t: Throwable?,
                 response: Response?
             ) {
-                var exception = t
-
-                t?.printStackTrace()
-                println("[onFailure] 发生错误: ${t?.message}")
-
-                try {
-                    if (t == null && response != null) {
-                        val bodyStr = response.body.stringSafe()
-                        if (!bodyStr.isNullOrEmpty()) {
-                            val bodyElement = json.parseToJsonElement(bodyStr)
-                            println(bodyElement)
-                            if (bodyElement is JsonObject) {
-                                exception = Exception(
-                                    bodyElement["error"]?.jsonObject?.get("message")?.jsonPrimitive?.content
-                                        ?: "unknown"
-                                )
-                            }
-                        } else {
-                            exception = Exception("Unknown error: ${response.code}")
-                        }
-                    }
-                } catch (e: Throwable) {
-                    e.printStackTrace()
-                    exception = e
-                } finally {
-                    close(exception ?: Exception("Stream failed"))
-                }
+                Log.e(
+                    TAG,
+                    "onFailure: error=${t?.javaClass?.simpleName} status=${response?.code} protocol=${response?.protocol}",
+                )
+                fail(transportFailure(t, response))
             }
 
             override fun onClosed(eventSource: EventSource) {
-                println("[onClosed] 连接已关闭")
-                close()
+                fail(StreamInterruptedException("Google stream closed before completion"))
             }
         }
 
-        val eventSource = EventSources.createFactory(client)
+        val eventSource = EventSources.createFactory(streamingClient)
                 .newEventSource(request, listener)
 
         awaitClose {
-            println("[awaitClose] 关闭eventSource")
+            closedByCollector.set(true)
             eventSource.cancel()
         }
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
     }.buffer(Channel.UNLIMITED)
+
+    private fun isTerminalFinishReason(reason: String?): Boolean {
+        return !reason.isNullOrBlank() &&
+            !reason.equals("null", ignoreCase = true) &&
+            !reason.equals("FINISH_REASON_UNSPECIFIED", ignoreCase = true)
+    }
 
     private fun buildCompletionRequestBody(
         messages: List<UIMessage>,
@@ -525,7 +578,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         } ?: emptyList()
 
         val groundingMetadata = message["groundingMetadata"]?.jsonObject
-        Log.i(TAG, "parseMessage: $groundingMetadata")
+        Log.d(TAG, "parseMessage: groundingPresent=${groundingMetadata != null}")
         val annotations = parseSearchGroundingMetadata(groundingMetadata)
 
         return UIMessage(
@@ -547,7 +600,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 url = uri
             )
         }
-        Log.i(TAG, "parseSearchGroundingMetadata: $chunks")
+        Log.d(TAG, "parseSearchGroundingMetadata: citationCount=${chunks.size}")
         return chunks
     }
 

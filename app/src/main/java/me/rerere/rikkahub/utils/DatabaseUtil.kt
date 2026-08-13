@@ -14,13 +14,25 @@ object DatabaseUtil {
      * 而 Room 开启了 WRITE_AHEAD_LOGGING 且不会主动 checkpoint, 未回写的最新消息就不会
      * 进入备份。应用退到后台时调一次, 保证备份里的聊天记录是完整的。
      */
-    fun checkpoint(database: RoomDatabase) {
-        try {
+    fun checkpoint(database: RoomDatabase): Boolean {
+        return try {
             database.openHelper.writableDatabase
                 .query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .use { it.moveToFirst() }
+                .use { cursor ->
+                    if (!cursor.moveToFirst()) {
+                        Log.w(TAG, "checkpoint returned no result")
+                        false
+                    } else {
+                        val busy = cursor.getInt(0)
+                        if (busy != 0) {
+                            Log.w(TAG, "checkpoint was busy")
+                        }
+                        busy == 0
+                    }
+                }
         } catch (e: Exception) {
             Log.w(TAG, "checkpoint failed", e)
+            false
         }
     }
 

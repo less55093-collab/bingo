@@ -38,6 +38,11 @@ import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.repository.ConversationRepository
+import me.rerere.rikkahub.data.sync.DatabaseRestoreCoordinator
+import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.GenerationProtectionManager
+import me.rerere.rikkahub.service.GenerationRecoveryGate
 import me.rerere.workspace.WorkspaceManager
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
@@ -50,11 +55,13 @@ private const val TAG = "RikkaHubApp"
 const val CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID = "chat_completed"
 const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update"
 const val IMAGE_GENERATION_NOTIFICATION_CHANNEL_ID = "image_generation"
+const val UPDATE_NOTIFICATION_CHANNEL_ID = "app_update"
 const val WEB_SERVER_NOTIFICATION_CHANNEL_ID = "web_server"
 
 class RikkaHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        DatabaseRestoreCoordinator.applyPendingRestore(this)
         startKoin {
             androidLogger()
             androidContext(this@RikkaHubApp)
@@ -87,6 +94,8 @@ class RikkaHubApp : Application() {
         // sync upload files to DB
         syncManagedFiles()
 
+        recoverInterruptedGenerations()
+
         // The local web server has no UI in this build; ensure a stale
         // enabled flag from an older install cannot start it.
         stopWebServer()
@@ -103,11 +112,28 @@ class RikkaHubApp : Application() {
     private fun registerDatabaseCheckpoint() {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStop(owner: LifecycleOwner) {
+                // An image request can be active without a ChatService session. Truncating WAL in
+                // either case risks contending with a streaming snapshot write.
+                if (get<GenerationProtectionManager>().hasActiveLeases()) return
                 get<AppScope>().launch(Dispatchers.IO) {
                     DatabaseUtil.checkpoint(get<AppDatabase>())
                 }
             }
         })
+    }
+
+    private fun recoverInterruptedGenerations() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            try {
+                runCatching { get<ConversationRepository>().recoverInterruptedGenerations() }
+                    .onSuccess { count ->
+                        if (count > 0) Log.i(TAG, "recovered $count interrupted generation(s)")
+                    }
+                    .onFailure { error -> Log.w(TAG, "interrupted generation recovery failed", error) }
+            } finally {
+                get<GenerationRecoveryGate>().complete()
+            }
+        }
     }
 
     private fun incrementLaunchCount() {
@@ -217,6 +243,14 @@ class RikkaHubApp : Application() {
             .setShowBadge(false)
             .build()
         notificationManager.createNotificationChannel(imageGenerationChannel)
+
+        val updateChannel = NotificationChannelCompat
+            .Builder(UPDATE_NOTIFICATION_CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)
+            .setName(getString(R.string.notification_channel_app_update))
+            .setVibrationEnabled(false)
+            .setShowBadge(false)
+            .build()
+        notificationManager.createNotificationChannel(updateChannel)
 
         val webServerChannel = NotificationChannelCompat
             .Builder(WEB_SERVER_NOTIFICATION_CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)

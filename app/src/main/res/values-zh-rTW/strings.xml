@@ -198,7 +198,7 @@
   <string name="backup_page_reminder_no_record">未記錄備份時間</string>
   <string name="backup_page_reminder_title">備份提醒</string>
   <string name="backup_page_restart_app">重啟應用</string>
-  <string name="backup_page_restart_desc">應用需要重啟以使設置生效。</string>
+  <string name="backup_page_restart_desc">應用需要重啟以使恢復的資料生效。</string>
   <string name="backup_page_restore">恢復</string>
   <string name="backup_page_restore_failed">恢復失敗: %s</string>
   <string name="backup_page_restore_now">恢復</string>
@@ -304,6 +304,7 @@
   <string name="chat_size_dialog_content">目前訊息數：%1$d。這可能導致應用程式崩潰或延遲，甚至遺失此對話資料。請盡快建立新對話以繼續聊天。</string>
   <string name="chat_size_dialog_title">此對話資料過大</string>
   <string name="citations_count">%1$d 條引用</string>
+  <string name="generation_interrupted">生成已中斷，已保留已生成內容</string>
   <string name="code_block_collapse">摺疊</string>
   <string name="code_block_copy">複製代碼</string>
   <string name="code_block_expand">展開</string>
@@ -396,6 +397,16 @@
   <string name="imggen_page_delete">刪除</string>
   <string name="imggen_page_gallery">相簿</string>
   <string name="imggen_page_generate_image">生成圖片</string>
+  <string name="setting_background_generation_title">允許背景持續生成</string>
+  <string name="setting_background_generation_desc">開啟應用程式資訊，進入耗電管理後選擇「完全允許背景行為」。部分裝置的系統最佳化會中斷尚未開始輸出的回覆。</string>
+  <string name="background_generation_interrupted_dialog_title">背景生成已中斷</string>
+  <string name="background_generation_interrupted_dialog_message">已保留已生成內容。裝置的背景最佳化可能中斷串流回覆；如經常發生，可在耗電管理中選擇「完全允許背景行為」。</string>
+  <string name="background_generation_interrupted_dialog_settings">開啟耗電管理</string>
+  <string name="background_generation_interrupted_dialog_not_now">暫不設定</string>
+  <string name="background_generation_first_message_dialog_title">允許背景持續生成</string>
+  <string name="background_generation_first_message_dialog_message">為避免切換到背景後回覆被系統中斷，請在應用程式資訊中進入耗電管理，關閉背景最佳化或選擇「完全允許背景行為」。</string>
+  <string name="background_generation_first_message_dialog_settings">開啟應用程式資訊</string>
+  <string name="background_generation_first_message_dialog_not_now">暫不設定</string>
   <string name="imggen_page_generating">正在生成圖片…</string>
   <string name="imggen_page_generating_slow_hint">生成時間較長，可以退出等待，完成後會通知您</string>
   <string name="imggen_page_generation_count">生成數量</string>
@@ -437,6 +448,7 @@
   <string name="notification_channel_chat_completed">聊天完成</string>
   <string name="notification_channel_chat_live_update">聊天生成進度</string>
   <string name="notification_channel_image_generation">背景生成工作</string>
+  <string name="notification_channel_app_update">應用程式更新</string>
   <string name="notification_channel_web_server">網頁伺服器</string>
   <string name="notification_live_update_chip_thinking">思考中</string>
   <string name="notification_live_update_chip_tool">工具</string>
@@ -1079,7 +1091,14 @@
   <string name="unpin_chat">取消釘選聊天</string>
   <string name="update_card_close">關閉</string>
   <string name="update_card_downloading">正在下載，請查看狀態列以瞭解進度</string>
+  <string name="update_card_downloading_without_notification">正在下載更新套件；通知未開啟，狀態列不會顯示進度</string>
+  <string name="update_card_install_failed">更新安裝失敗</string>
   <string name="update_card_new_version_found">發現新版本 %s</string>
+  <string name="update_notification_title">正在更新 Bingo</string>
+  <string name="update_notification_connecting">正在連接下載伺服器</string>
+  <string name="update_notification_progress">已下載 %1$d%%</string>
+  <string name="update_notification_preparing">下載完成，正在驗證並備份資料</string>
+  <string name="update_notification_failed">更新失敗：%1$s</string>
   <string name="upload_file">上傳檔案</string>
   <string name="use_web_search">網路搜尋</string>
   <string name="user_default_name">用戶</string>
@@ -1122,6 +1141,7 @@
   <string name="setting_model_page_fast_model">快速模型</string>
   <string name="setting_model_page_fast_model_desc">用於快速或背景任務的模型，未設置時也作為標題和建議模型的後備。</string>
   <string name="setting_model_page_enable_suggestion">啟用聊天建議</string>
+  <string name="setting_model_page_enable_suggestion_desc">在回覆下方顯示可直接傳送的建議內容</string>
   <string name="assistant_page_gradient_background">漸層背景</string>
   <string name="assistant_page_gradient_background_desc">在聊天頁面上使用動態漸變背景</string>
   <string name="assistant_page_workspace">工作區</string>

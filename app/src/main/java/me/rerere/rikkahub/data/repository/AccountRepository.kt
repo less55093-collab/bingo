@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.repository
 
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,6 +22,7 @@ import me.rerere.rikkahub.data.model.gateway.RegisterRequest
 import me.rerere.rikkahub.data.model.gateway.SendVerifyCodeRequest
 import me.rerere.rikkahub.data.model.gateway.TokenPair
 import me.rerere.rikkahub.data.model.gateway.UserProfile
+import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
 
 sealed interface AuthState {
     /** Startup state, before the token store has been read. */
@@ -39,6 +41,7 @@ class AccountRepository(
     private val api: BingoGatewayAPI,
     private val tokenStore: AuthTokenStore,
     private val keyProvisioner: KeyProvisioner,
+    private val s3CredentialStore: S3CredentialStore,
     private val scope: CoroutineScope,
 ) {
     private val _state = MutableStateFlow<AuthState>(AuthState.Loading)
@@ -114,6 +117,15 @@ class AccountRepository(
      * the next account on this device a spendable key belonging to the previous user.
      */
     suspend fun logout() {
+        // Read the profile ID before clearing the auth store so this account's isolated OSS secret
+        // can be removed without touching credentials belonging to another account.
+        val accountId = tokenStore.profileFlow.first()?.s3CredentialAccountId()
+        accountId?.let {
+            runCatching { s3CredentialStore.clear(it) }
+                .onFailure { error -> Log.w(TAG, "failed to clear S3 credentials on logout", error) }
+        }
+        runCatching { s3CredentialStore.clearLegacySettingsCredentials() }
+            .onFailure { error -> Log.w(TAG, "failed to clear legacy S3 credentials on logout", error) }
         tokenStore.clear()
         runCatching { keyProvisioner.applyToSettings(ProviderKeys()) }
             .onFailure { Log.w(TAG, "failed to clear injected keys on logout", it) }
@@ -139,3 +151,6 @@ class AccountRepository(
             .trim()
     }
 }
+
+/** Only positive gateway IDs identify a persisted account namespace. */
+internal fun UserProfile?.s3CredentialAccountId(): Long? = this?.id?.takeIf { it > 0 }

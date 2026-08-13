@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.Serializable
 import me.rerere.rikkahub.data.model.gateway.UserProfile
 import me.rerere.rikkahub.utils.JsonInstant
 
@@ -48,6 +49,7 @@ class AuthTokenStore(private val context: Context) {
         private val CLAUDE_KEY = stringPreferencesKey("claude_api_key")
         private val GPT_KEY = stringPreferencesKey("gpt_api_key")
         private val IMAGE_KEY = stringPreferencesKey("image_api_key")
+        private val PENDING_IMAGE_TASKS = stringPreferencesKey("pending_image_tasks")
         private val TUTORIAL_SHOWN = booleanPreferencesKey("tutorial_shown")
     }
 
@@ -73,9 +75,17 @@ class AuthTokenStore(private val context: Context) {
 
     val tutorialShownFlow: Flow<Boolean> = dataStore.data.map { it[TUTORIAL_SHOWN] ?: false }
 
+    val pendingImageTasksFlow: Flow<List<PendingImageTask>> = dataStore.data.map { prefs ->
+        prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+            runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+        } ?: emptyList()
+    }
+
     suspend fun currentTokens(): AuthTokens = tokensFlow.first()
 
     suspend fun currentProviderKeys(): ProviderKeys = providerKeysFlow.first()
+
+    suspend fun currentPendingImageTasks(): List<PendingImageTask> = pendingImageTasksFlow.first()
 
     /**
      * Read tokens without suspending. Used once in `RouteActivity.onCreate` to pick the start
@@ -108,11 +118,42 @@ class AuthTokenStore(private val context: Context) {
         dataStore.edit { it[TUTORIAL_SHOWN] = shown }
     }
 
+    suspend fun savePendingImageTask(task: PendingImageTask) {
+        dataStore.edit { prefs ->
+            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+                runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+            }.orEmpty()
+            prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(
+                tasks.filterNot { it.taskId == task.taskId } + task
+            )
+        }
+    }
+
+    suspend fun removePendingImageTask(taskId: String) {
+        dataStore.edit { prefs ->
+            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+                runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+            }.orEmpty().filterNot { it.taskId == taskId }
+            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
+            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        }
+    }
+
     /** Clears everything account-scoped so the next login cannot inherit these keys. */
     suspend fun clear() {
         dataStore.edit { it.clear() }
     }
 }
+
+@Serializable
+data class PendingImageTask(
+    val taskId: String,
+    val prompt: String,
+    val sourcePaths: String? = null,
+    val modelName: String,
+    val origin: String,
+    val createdAt: Long = System.currentTimeMillis(),
+)
 
 data class ProviderKeys(
     val claudeKey: String = "",

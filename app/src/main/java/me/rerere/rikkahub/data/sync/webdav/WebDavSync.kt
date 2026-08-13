@@ -12,7 +12,8 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.WebDavConfig
 import me.rerere.rikkahub.data.datastore.migration.SettingsJsonMigrator
-import me.rerere.rikkahub.data.auth.ProviderInjector
+import me.rerere.rikkahub.data.sync.forBackup
+import me.rerere.rikkahub.data.sync.withLocalSyncConfiguration
 import me.rerere.rikkahub.utils.fileSizeToString
 import java.io.File
 import java.io.FileInputStream
@@ -148,7 +149,7 @@ class WebDavSync(
                 // Keys are re-provisioned from the gateway on launch, so stripping them here keeps
                 // spendable credentials out of the user's own cloud storage.
                 content = json.encodeToString(
-                    ProviderInjector.clear(settingsStore.settingsFlow.value)
+                    settingsStore.settingsFlow.value.forBackup()
                 )
             )
 
@@ -234,7 +235,9 @@ class WebDavSync(
                             try {
                                 val migratedJson = SettingsJsonMigrator.migrate(settingsJson)
                                 val settings = json.decodeFromString<Settings>(migratedJson)
-                                settingsStore.update(settings)
+                                settingsStore.update { current ->
+                                    settings.withLocalSyncConfiguration(current)
+                                }
                                 Log.i(TAG, "restoreFromBackupFile: Settings restored successfully")
                             } catch (e: Exception) {
                                 Log.e(TAG, "restoreFromBackupFile: Failed to restore settings", e)

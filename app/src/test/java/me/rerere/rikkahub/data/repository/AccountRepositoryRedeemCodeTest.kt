@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.data.repository
 
+import me.rerere.rikkahub.data.model.gateway.UserProfile
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class AccountRepositoryRedeemCodeTest {
@@ -24,5 +26,13 @@ class AccountRepositoryRedeemCodeTest {
         val input = " \n\u200BAb-cD\uFEFF\t "
 
         assertEquals("Ab-cD", AccountRepository.normalizeRedeemCode(input))
+    }
+
+    @Test
+    fun `only a positive profile id selects an S3 credential namespace`() {
+        assertNull(null.s3CredentialAccountId())
+        assertNull(UserProfile(id = 0).s3CredentialAccountId())
+        assertNull(UserProfile(id = -1).s3CredentialAccountId())
+        assertEquals(42L, UserProfile(id = 42).s3CredentialAccountId())
     }
 }

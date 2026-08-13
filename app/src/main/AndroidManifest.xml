@@ -4,6 +4,7 @@
 
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
   <uses-permission android:name="android.permission.CAMERA" />
   <uses-permission android:name="android.permission.RECORD_AUDIO" />
   <uses-permission
@@ -115,9 +116,10 @@
       android:theme="@style/Theme.AppCompat.Light.NoActionBar" />
 
     <service
-      android:name=".service.ImageGenerationForegroundService"
+      android:name=".service.GenerationForegroundService"
       android:exported="false"
-      android:foregroundServiceType="dataSync" />
+      android:foregroundServiceType="dataSync"
+      android:stopWithTask="false" />
 
     <service
       android:name=".service.WebServerService"

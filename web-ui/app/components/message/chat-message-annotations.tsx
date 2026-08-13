@@ -5,7 +5,9 @@ import { ExternalLink } from "lucide-react";
 import { cn } from "~/lib/utils";
 import type { UIMessageAnnotation } from "~/types";
 
-function getCitationLabel(annotation: UIMessageAnnotation): string {
+function getCitationLabel(
+  annotation: Extract<UIMessageAnnotation, { type: "url_citation" }>,
+): string {
   if (annotation.title.trim().length > 0) {
     return annotation.title;
   }
@@ -33,8 +35,12 @@ export function ChatMessageAnnotationsRow({
     () => annotations?.filter((annotation) => annotation.type === "url_citation") ?? [],
     [annotations],
   );
+  const interrupted = React.useMemo(
+    () => annotations?.some((annotation) => annotation.type === "generation_interrupted") ?? false,
+    [annotations],
+  );
 
-  if (citations.length === 0) {
+  if (citations.length === 0 && !interrupted) {
     return null;
   }
 
@@ -45,6 +51,9 @@ export function ChatMessageAnnotationsRow({
         alignRight ? "justify-end" : "justify-start",
       )}
     >
+      {interrupted ? (
+        <span className="text-xs text-muted-foreground">生成已中断，已保留已生成内容</span>
+      ) : null}
       {citations.map((annotation, index) => {
         const label = getCitationLabel(annotation);
 

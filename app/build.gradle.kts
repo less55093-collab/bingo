@@ -20,13 +20,17 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 8
+        versionName = "1.0.6"
 
         // 版本更新检查地址. 指向一个返回 UpdateInfo JSON 的静态文件即可,
         // 格式见 UpdateChecker.kt 中 UpdateInfo/UpdateDownload 的定义.
         // 留空字符串则完全关闭更新检查 (不发任何网络请求, 侧边栏不显示更新卡片).
-        buildConfigField("String", "UPDATE_URL", "\"\"")
+        buildConfigField(
+            "String",
+            "UPDATE_URL",
+            "\"https://gitee.com/chenyifan888/bingo-releases/raw/master/update.json\""
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -295,6 +299,7 @@ dependencies {
 
     // tests
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

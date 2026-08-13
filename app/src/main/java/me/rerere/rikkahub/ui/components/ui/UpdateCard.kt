@@ -1,5 +1,10 @@
 package me.rerere.rikkahub.ui.components.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,6 +28,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,8 +36,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastForEach
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dokar.sonner.ToastType
+import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Download01
@@ -55,6 +63,7 @@ fun UpdateCard(vm: ChatVM) {
     val state by vm.updateState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val toaster = LocalToaster.current
+    val scope = rememberCoroutineScope()
     // 检查失败 (断网 / 更新源不可用) 不在侧边栏常驻报错卡, 静默跳过即可.
     // 未配置更新源时状态为 Idle, 同样不渲染任何内容.
     state.onSuccess { info ->
@@ -102,10 +111,37 @@ fun UpdateCard(vm: ChatVM) {
             }
         }
         if (showDetail) {
-            val downloadHandler = useThrottle<UpdateDownload>(500) { item ->
-                vm.updateChecker.downloadUpdate(context, item)
+            var pendingDownload by remember { mutableStateOf<UpdateDownload?>(null) }
+            val startDownload: (UpdateDownload) -> Unit = { item ->
                 showDetail = false
-                toaster.show(context.getString(R.string.update_card_downloading), type = ToastType.Info)
+                scope.launch {
+                    val message = if (vm.updateChecker.canShowDownloadProgress(context)) {
+                        R.string.update_card_downloading
+                    } else {
+                        R.string.update_card_downloading_without_notification
+                    }
+                    toaster.show(context.getString(message), type = ToastType.Info)
+                    vm.updateChecker.downloadAndInstall(context, item).onFailure { error ->
+                        toaster.show(error.message ?: context.getString(R.string.update_card_install_failed), type = ToastType.Error)
+                    }
+                }
+            }
+            val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) {
+                pendingDownload?.let(startDownload)
+                pendingDownload = null
+            }
+            val downloadHandler = useThrottle<UpdateDownload>(500) { item ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    pendingDownload = item
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    startDownload(item)
+                }
             }
             ModalBottomSheet(
                 onDismissRequest = { showDetail = false },

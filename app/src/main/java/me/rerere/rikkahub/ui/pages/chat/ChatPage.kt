@@ -58,6 +58,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.isEmptyInputMessage
 import me.rerere.common.android.appTempFolder
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Cancel01
@@ -73,7 +74,9 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.service.BackgroundGenerationNoticeKind
 import me.rerere.rikkahub.service.ChatError
+import me.rerere.rikkahub.service.BackgroundGenerationInterruptionNotice
 import me.rerere.rikkahub.ui.components.ai.ChatInput
 import me.rerere.rikkahub.ui.components.ai.FilesPicker
 import me.rerere.rikkahub.ui.components.ai.completion.WorkspaceCompletionProvider
@@ -92,6 +95,7 @@ import me.rerere.rikkahub.utils.ImageUtils
 import me.rerere.rikkahub.utils.base64Decode
 import me.rerere.rikkahub.utils.isAllowedFileType
 import me.rerere.rikkahub.utils.navigateToChatPage
+import me.rerere.rikkahub.utils.openBackgroundGenerationSettings
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
@@ -106,6 +110,8 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
         }
     )
     val filesManager: FilesManager = koinInject()
+    val backgroundInterruptionNotice: BackgroundGenerationInterruptionNotice = koinInject()
+    val context = LocalContext.current
     val navController = LocalNavController.current
     val scope = rememberCoroutineScope()
 
@@ -116,6 +122,8 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
     val currentChatModel by vm.currentChatModel.collectAsStateWithLifecycle()
     val enableWebSearch by vm.enableWebSearch.collectAsStateWithLifecycle()
     val errors by vm.errors.collectAsStateWithLifecycle()
+    val showBackgroundGenerationHint by backgroundInterruptionNotice.pending.collectAsStateWithLifecycle()
+    val backgroundGenerationHintKind by backgroundInterruptionNotice.pendingKind.collectAsStateWithLifecycle()
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val softwareKeyboardController = LocalSoftwareKeyboardController.current
@@ -136,6 +144,66 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
         if (wantsNotification && !notificationPermission.allRequiredPermissionsGranted) {
             notificationPermission.requestPermissions()
         }
+    }
+
+    if (showBackgroundGenerationHint) {
+        val firstMessageHint = backgroundGenerationHintKind == BackgroundGenerationNoticeKind.FIRST_MESSAGE
+        AlertDialog(
+            onDismissRequest = backgroundInterruptionNotice::acknowledge,
+            title = {
+                Text(
+                    stringResource(
+                        if (firstMessageHint) {
+                            R.string.background_generation_first_message_dialog_title
+                        } else {
+                            R.string.background_generation_interrupted_dialog_title
+                        }
+                    )
+                )
+            },
+            text = {
+                Text(
+                    stringResource(
+                        if (firstMessageHint) {
+                            R.string.background_generation_first_message_dialog_message
+                        } else {
+                            R.string.background_generation_interrupted_dialog_message
+                        }
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        backgroundInterruptionNotice.acknowledge()
+                        context.openBackgroundGenerationSettings()
+                    },
+                ) {
+                    Text(
+                        stringResource(
+                            if (firstMessageHint) {
+                                R.string.background_generation_first_message_dialog_settings
+                            } else {
+                                R.string.background_generation_interrupted_dialog_settings
+                            }
+                        )
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = backgroundInterruptionNotice::acknowledge) {
+                    Text(
+                        stringResource(
+                            if (firstMessageHint) {
+                                R.string.background_generation_first_message_dialog_not_now
+                            } else {
+                                R.string.background_generation_interrupted_dialog_not_now
+                            }
+                        )
+                    )
+                }
+            },
+        )
     }
 
     // Handle back press when drawer is open
@@ -237,6 +305,7 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                     errors = errors,
                     onDismissError = { vm.dismissError(it) },
                     onClearAllErrors = { vm.clearAllErrors() },
+                    onFirstMessageSubmitted = backgroundInterruptionNotice::recordFirstMessageIfEligible,
                 )
             }
         }
@@ -269,6 +338,7 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                     errors = errors,
                     onDismissError = { vm.dismissError(it) },
                     onClearAllErrors = { vm.clearAllErrors() },
+                    onFirstMessageSubmitted = backgroundInterruptionNotice::recordFirstMessageIfEligible,
                 )
             }
             BackHandler(drawerState.isOpen) {
@@ -295,14 +365,39 @@ private fun ChatPageContent(
     errors: List<ChatError>,
     onDismissError: (Uuid) -> Unit,
     onClearAllErrors: () -> Unit,
+    onFirstMessageSubmitted: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val toaster = LocalToaster.current
+    val context = LocalContext.current
     val workspaceRepository: WorkspaceRepository = koinInject()
     var previewMode by rememberSaveable { mutableStateOf(false) }
     val hazeState = rememberHazeState()
     val assistant = setting.getCurrentAssistant()
     var showFilesSheet by remember { mutableStateOf(false) }
+
+    fun submitChatMessage() {
+        if (currentChatModel == null) {
+            toaster.show("请先选择模型", type = ToastType.Error)
+            return
+        }
+        if (inputState.isEditing()) {
+            vm.handleMessageEdit(
+                parts = inputState.getContents(),
+                messageId = inputState.editingMessage!!,
+            )
+        } else {
+            val content = inputState.getContents()
+            if (!content.isEmptyInputMessage()) {
+                vm.handleMessageSend(content)
+                onFirstMessageSubmitted()
+                scope.launch {
+                    chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                }
+            }
+        }
+        inputState.clearInput()
+    }
 
     val completionProviders = remember(assistant.workspaceId, conversation.workspaceCwd, workspaceRepository) {
         assistant.workspaceId?.let { workspaceId ->
@@ -368,22 +463,7 @@ private fun ChatPageContent(
                         )
                     },
                     onSendClick = {
-                        if (currentChatModel == null) {
-                            toaster.show("请先选择模型", type = ToastType.Error)
-                            return@ChatInput
-                        }
-                        if (inputState.isEditing()) {
-                            vm.handleMessageEdit(
-                                parts = inputState.getContents(),
-                                messageId = inputState.editingMessage!!,
-                            )
-                        } else {
-                            vm.handleMessageSend(inputState.getContents())
-                            scope.launch {
-                                chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
-                            }
-                        }
-                        inputState.clearInput()
+                        submitChatMessage()
                     },
                     onLongSendClick = {
                         if (inputState.isEditing()) {
@@ -392,9 +472,13 @@ private fun ChatPageContent(
                                 messageId = inputState.editingMessage!!,
                             )
                         } else {
-                            vm.handleMessageSend(content = inputState.getContents(), answer = false)
-                            scope.launch {
-                                chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                            val content = inputState.getContents()
+                            if (!content.isEmptyInputMessage()) {
+                                vm.handleMessageSend(content = content, answer = false)
+                                onFirstMessageSubmitted()
+                                scope.launch {
+                                    chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                                }
                             }
                         }
                         inputState.clearInput()

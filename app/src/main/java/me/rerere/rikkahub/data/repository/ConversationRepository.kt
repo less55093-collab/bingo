@@ -11,8 +11,11 @@ import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import me.rerere.ai.core.MessageRole
+import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.markGenerationInterrupted
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.fts.MessageFtsManager
 import me.rerere.rikkahub.data.db.fts.MessageSearchSort
@@ -308,6 +311,29 @@ class ConversationRepository(
         messageFtsManager.indexConversation(conversation)
     }
 
+    /**
+     * Saves a streaming snapshot without rebuilding the search index. Message node IDs are stable,
+     * so REPLACE updates only the changed rows and keeps the write suitable for regular checkpoints.
+     */
+    suspend fun saveStreamingSnapshot(conversation: Conversation) {
+        database.withTransaction {
+            conversationDAO.update(conversationToConversationEntity(conversation))
+            upsertMessageNodes(conversation.id.toString(), conversation.messageNodes)
+        }
+    }
+
+    /** Converts stale in-progress replies left by a process death into readable partial history. */
+    suspend fun recoverInterruptedGenerations(): Int {
+        var recovered = 0
+        conversationDAO.getAllIds().forEach { id ->
+            val conversation = runCatching { getConversationById(Uuid.parse(id)) }.getOrNull() ?: return@forEach
+            val recoveredConversation = conversation.recoverSelectedGeneration() ?: return@forEach
+            updateConversation(recoveredConversation)
+            recovered++
+        }
+        return recovered
+    }
+
     suspend fun deleteConversation(conversation: Conversation) {
         // 获取完整的 Conversation（包含 messageNodes）以正确清理文件
         val fullConversation = if (conversation.messageNodes.isEmpty()) {
@@ -486,6 +512,53 @@ class ConversationRepository(
         }
         messageNodeDAO.insertAll(entities)
     }
+
+    /** Streaming snapshots never remove branches, so preserve existing node rows and FTS state. */
+    private suspend fun upsertMessageNodes(conversationId: String, nodes: List<MessageNode>) {
+        val entities = nodes.mapIndexed { index, node ->
+            MessageNodeEntity(
+                id = node.id.toString(),
+                conversationId = conversationId,
+                nodeIndex = index,
+                messages = JsonInstant.encodeToString(node.messages),
+                selectIndex = node.selectIndex,
+            )
+        }
+        messageNodeDAO.upsertAll(entities)
+    }
+}
+
+/**
+ * Marks only the last assistant message on the currently selected branch after process death.
+ * Unselected variants are preserved verbatim and never influence the recovery decision.
+ */
+internal fun Conversation.recoverSelectedGeneration(
+    recoveredAt: Instant = Instant.now(),
+): Conversation? {
+    val selectedAssistant = messageNodes
+        .withIndex()
+        .lastOrNull { (_, node) -> node.currentMessage.role == MessageRole.ASSISTANT }
+        ?: return null
+    val nodeIndex = selectedAssistant.index
+    val node = selectedAssistant.value
+    val message = node.currentMessage
+    val tools = message.parts.filterIsInstance<UIMessagePart.Tool>()
+    val waitingForApproval = tools.any { it.approvalState is ToolApprovalState.Pending }
+    val unfinishedTool = tools.any {
+        !it.isExecuted && it.approvalState !is ToolApprovalState.Pending
+    }
+    if (waitingForApproval || (message.finishedAt != null && !unfinishedTool)) return null
+
+    val updatedMessage = message.markGenerationInterrupted()
+    val updatedNode = node.copy(
+        messages = node.messages.map { candidate ->
+            if (candidate.id == message.id) updatedMessage else candidate
+        },
+    )
+    return copy(
+        messageNodes = messageNodes.toMutableList().also { it[nodeIndex] = updatedNode },
+        updateAt = recoveredAt,
+    )
 }
 
 /**

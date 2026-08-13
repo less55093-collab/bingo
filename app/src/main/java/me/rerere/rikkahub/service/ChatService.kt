@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import androidx.core.net.toUri
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
@@ -33,13 +35,13 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderManager
+import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.canResumeToolExecution
 import me.rerere.ai.ui.finishPendingTools
-import me.rerere.ai.ui.finishReasoning
 import me.rerere.ai.ui.isEmptyInputMessage
 import me.rerere.common.android.Logging
 import me.rerere.rikkahub.AppScope
@@ -88,6 +90,7 @@ import me.rerere.workspace.WorkspaceShellStatus
 import java.time.Instant
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.uuid.Uuid
 
 private const val TAG = "ChatService"
@@ -134,12 +137,15 @@ class ChatService(
     private val appEventBus: AppEventBus,
     private val settingsStore: SettingsStore,
     private val conversationRepo: ConversationRepository,
+    private val streamCheckpoint: ConversationStreamCheckpoint,
+    private val generationRecoveryGate: GenerationRecoveryGate,
+    private val generationProtectionManager: GenerationProtectionManager,
+    private val backgroundInterruptionNotice: BackgroundGenerationInterruptionNotice,
     private val memoryRepository: MemoryRepository,
     private val generationHandler: GenerationHandler,
     private val templateTransformer: TemplateTransformer,
     private val providerManager: ProviderManager,
     private val localTools: LocalTools,
-    private val imageGenerationManager: ImageGenerationManager,
     val mcpManager: McpManager,
     private val filesManager: FilesManager,
     private val skillManager: SkillManager,
@@ -151,6 +157,14 @@ class ChatService(
 
     // 统一会话管理
     private val sessions = ConcurrentHashMap<Uuid, ConversationSession>()
+    // Foreground-service run tokens are shared by nested work. Persistence needs a token per chat
+    // turn so a cancelled predecessor can never write after a newer turn starts.
+    private val nextStreamGenerationToken = AtomicLong(0)
+    // A user stop is different from a provider/network interruption. Keep that intent next to the
+    // checkpoint token so the cancellation path can make the partial message terminal without
+    // adding the persistent interruption annotation.
+    private val activeStreamTokens = ConcurrentHashMap<Uuid, Long>()
+    private val userStoppedStreamTokens = ConcurrentHashMap<Uuid, Long>()
     private val _sessionsVersion = MutableStateFlow(0L)
 
     // 错误状态
@@ -243,12 +257,21 @@ class ChatService(
     /** Starts background protection before this coroutine can yield to an immediate app switch. */
     private fun launchChatGeneration(
         conversationId: Uuid,
-        block: suspend () -> Unit,
+        block: suspend (GenerationLease) -> Unit,
     ): Job = appScope.launch(start = CoroutineStart.UNDISPATCHED) {
-        imageGenerationManager.withChatGenerationProtection(
+        val lease = generationProtectionManager.begin(
+            kind = GenerationKind.CHAT,
             conversationId = conversationId.toString(),
-            block = block,
         )
+        try {
+            // Recovery must establish the last durable generation state before a new turn can
+            // select or replace that branch. begin() intentionally remains above this suspension
+            // so an immediate background transition is protected while recovery finishes.
+            ensureConversationInitialized(conversationId)
+            block(lease)
+        } finally {
+            withContext(NonCancellable) { lease.close() }
+        }
     }
 
     // ---- 对话状态访问 ----
@@ -282,30 +305,35 @@ class ChatService(
         }
     }
 
+    fun hasActiveGeneration(): Boolean = sessions.values.any { it.isGenerating }
+
     // ---- 初始化对话 ----
 
     suspend fun initializeConversation(conversationId: Uuid) {
+        ensureConversationInitialized(conversationId)
+        settingsStore.updateAssistant(getOrCreateSession(conversationId).state.value.assistantId)
+    }
+
+    private suspend fun ensureConversationInitialized(conversationId: Uuid) {
+        generationRecoveryGate.await()
         val session = getOrCreateSession(conversationId) // 确保 session 存在
-        val conversation = conversationRepo.getConversationById(conversationId)
-        if (conversation != null) {
-            // 正在生成时不要用数据库快照覆盖内存中的流式状态,
-            // 否则重新进入该对话会丢掉正在增量写入的消息 (表现为"思考中"被截断)
-            if (!session.isGenerating) {
+        session.initializeOnce {
+            val conversation = conversationRepo.getConversationById(conversationId)
+            if (conversation != null) {
+                // initializeOnce orders this load before every generation. Re-entering a live
+                // session is a no-op, so its in-memory stream can no longer be replaced by Room.
                 updateConversation(conversationId, conversation)
             } else {
-                Log.i(TAG, "initializeConversation: keep live state for $conversationId (generating)")
+                // 新建对话, 并添加预设消息
+                val currentSettings = settingsStore.settingsFlowRaw.first()
+                val assistant = currentSettings.getCurrentAssistant()
+                val newConversation = Conversation.ofId(
+                    id = conversationId,
+                    assistantId = assistant.id,
+                    newConversation = true
+                ).updateCurrentMessages(assistant.presetMessages)
+                updateConversation(conversationId, newConversation)
             }
-            settingsStore.updateAssistant(conversation.assistantId)
-        } else {
-            // 新建对话, 并添加预设消息
-            val currentSettings = settingsStore.settingsFlowRaw.first()
-            val assistant = currentSettings.getCurrentAssistant()
-            val newConversation = Conversation.ofId(
-                id = conversationId,
-                assistantId = assistant.id,
-                newConversation = true
-            ).updateCurrentMessages(assistant.presetMessages)
-            updateConversation(conversationId, newConversation)
         }
     }
 
@@ -318,7 +346,7 @@ class ChatService(
         val previousJob = session.getJob()
         previousJob?.cancel()
 
-        val job = launchChatGeneration(conversationId) {
+        val job = launchChatGeneration(conversationId) { lease ->
             try {
                 runCatching { previousJob?.join() }
                 finishInterruptedPendingTools(conversationId)
@@ -340,12 +368,17 @@ class ChatService(
 
                 // 开始补全
                 if (answer) {
-                    handleMessageComplete(conversationId)
+                    generationProtectionManager.withActiveLease(lease) {
+                        val completed = handleMessageComplete(
+                            conversationId,
+                            generationToken = nextStreamGenerationToken.incrementAndGet(),
+                            protectionRunToken = lease.runToken,
+                        )
+                        if (completed) _generationDoneFlow.emit(conversationId)
+                    }
                 }
-
-                _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
-                e.printStackTrace()
+                Logging.log(TAG, "sendMessage failed: ${e.javaClass.simpleName}")
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
             }
         }
@@ -378,10 +411,14 @@ class ChatService(
         regenerateAssistantMsg: Boolean = true
     ) {
         val session = getOrCreateSession(conversationId)
-        session.getJob()?.cancel()
+        val previousJob = session.getJob()
+        previousJob?.cancel()
 
-        val job = launchChatGeneration(conversationId) {
+        val job = launchChatGeneration(conversationId) { lease ->
             try {
+                // Let the predecessor flush its terminal state before this branch replaces it.
+                // The stream checkpoint then receives a new token and old callbacks lose write access.
+                runCatching { previousJob?.join() }
                 val conversation = session.state.value
 
                 if (message.role == MessageRole.USER) {
@@ -392,18 +429,38 @@ class ChatService(
                         messageNodes = conversation.messageNodes.subList(0, indexAt + 1)
                     )
                     saveConversation(conversationId, newConversation)
-                    handleMessageComplete(conversationId)
+                    generationProtectionManager.withActiveLease(lease) {
+                        val completed = handleMessageComplete(
+                            conversationId,
+                            generationToken = nextStreamGenerationToken.incrementAndGet(),
+                            protectionRunToken = lease.runToken,
+                        )
+                        if (completed) _generationDoneFlow.emit(conversationId)
+                    }
                 } else {
                     if (regenerateAssistantMsg) {
                         val node = conversation.getMessageNodeByMessage(message)
                         val nodeIndex = conversation.messageNodes.indexOf(node)
-                        handleMessageComplete(conversationId, messageRange = 0..<nodeIndex)
+                        val generationTarget = node?.let {
+                            StreamGenerationTarget(
+                                nodeId = it.id,
+                                previousMessageId = message.id,
+                            )
+                        }
+                        generationProtectionManager.withActiveLease(lease) {
+                            val completed = handleMessageComplete(
+                                conversationId,
+                                messageRange = 0..<nodeIndex,
+                                generationToken = nextStreamGenerationToken.incrementAndGet(),
+                                generationTarget = generationTarget,
+                                protectionRunToken = lease.runToken,
+                            )
+                            if (completed) _generationDoneFlow.emit(conversationId)
+                        }
                     } else {
                         saveConversation(conversationId, conversation)
                     }
                 }
-
-                _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 addError(e, conversationId, title = context.getString(R.string.error_title_regenerate_message))
             }
@@ -422,10 +479,12 @@ class ChatService(
         answer: String? = null,
     ) {
         val session = getOrCreateSession(conversationId)
-        session.getJob()?.cancel()
+        val previousJob = session.getJob()
+        previousJob?.cancel()
 
-        val job = launchChatGeneration(conversationId) {
+        val job = launchChatGeneration(conversationId) { lease ->
             try {
+                runCatching { previousJob?.join() }
                 val conversation = session.state.value
                 val newApprovalState = when {
                     answer != null -> ToolApprovalState.Answered(answer)
@@ -463,10 +522,15 @@ class ChatService(
 
                 // Only continue generation when all pending tools are handled
                 if (!hasPendingTools) {
-                    handleMessageComplete(conversationId)
+                    generationProtectionManager.withActiveLease(lease) {
+                        val completed = handleMessageComplete(
+                            conversationId,
+                            generationToken = nextStreamGenerationToken.incrementAndGet(),
+                            protectionRunToken = lease.runToken,
+                        )
+                        if (completed) _generationDoneFlow.emit(conversationId)
+                    }
                 }
-
-                _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 addError(e, conversationId, title = context.getString(R.string.error_title_tool_approval))
             }
@@ -479,13 +543,16 @@ class ChatService(
 
     private suspend fun handleMessageComplete(
         conversationId: Uuid,
-        messageRange: ClosedRange<Int>? = null
-    ) {
+        messageRange: ClosedRange<Int>? = null,
+        generationToken: Long,
+        generationTarget: StreamGenerationTarget? = null,
+        protectionRunToken: Long,
+    ): Boolean {
         val settings = settingsStore.settingsFlow.first()
         val initialConversation = getConversationFlow(conversationId).value
         val assistant = settings.getAssistantById(initialConversation.assistantId)
             ?: settings.getCurrentAssistant()
-        val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId) ?: return
+        val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId) ?: return false
 
         val senderName = if (assistant.useAssistantAvatar) {
             assistant.name.ifEmpty { context.getString(R.string.assistant_page_default_assistant) }
@@ -493,7 +560,9 @@ class ChatService(
             model.displayName
         }
 
-        runCatching {
+        var streamStarted = false
+        var completedAndPersisted = false
+        try {
 
             // reset suggestions
             updateConversation(conversationId, initialConversation.copy(chatSuggestions = emptyList()))
@@ -515,6 +584,14 @@ class ChatService(
 
             // start generating
             val session = getOrCreateSession(conversationId)
+            activeStreamTokens[conversationId] = generationToken
+            streamCheckpoint.start(
+                conversationId = conversationId,
+                generationToken = generationToken,
+                initialConversation = conversation,
+                target = generationTarget,
+            )
+            streamStarted = true
             generationHandler.generateText(
                 settings = settings,
                 model = model,
@@ -574,7 +651,7 @@ class ChatService(
                                 ),
                                 conversationId = conversationId,
                             )
-                            return
+                            return false
                         }
                     }.forEach { (serverId, serverName, tool) ->
                         add(
@@ -590,64 +667,80 @@ class ChatService(
                         )
                     }
                 },
-            ).onCompletion {
-                // 可能被取消了，或者意外结束，兜底更新
-                val updatedConversation = getConversationFlow(conversationId).value.copy(
-                    messageNodes = getConversationFlow(conversationId).value.messageNodes.map { node ->
-                        node.copy(messages = node.messages.map { it.finishReasoning() })
-                    },
+            ).onCompletion { cause ->
+                if (!streamCheckpoint.isCurrent(conversationId, generationToken)) return@onCompletion
+                // Provider flows only return normally after their protocol-level terminal event.
+                // Errors and user cancellation are finalized in onFailure below, so they cannot
+                // be surfaced as a successful reply or produce duplicate terminal events.
+                if (cause != null) return@onCompletion
+                val updatedConversation = getConversationFlow(conversationId).value.finishGenerationReasoning(
+                    generationTarget,
                     updateAt = Instant.now()
                 )
                 updateConversation(conversationId, updatedConversation)
-
-                // 生成结束：取消 Live Update 通知，后台时发送完成通知
-                appEventBus.emit(
-                    AppEvent.ChatGenerationEnded(
+                withContext(NonCancellable) {
+                    streamCheckpoint.flush(
                         conversationId = conversationId,
-                        senderName = senderName,
-                        contentPreview = updatedConversation.currentMessages.lastOrNull()
-                            ?.toText()?.take(50)?.trim() ?: "",
+                        generationToken = generationToken,
+                        conversation = updatedConversation,
                     )
-                )
+                }
             }.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Messages -> {
+                        if (!streamCheckpoint.isCurrent(conversationId, generationToken)) return@collect
                         val updatedConversation = getConversationFlow(conversationId).value
                             .updateCurrentMessages(chunk.messages)
+                        generationTarget?.observe(updatedConversation)
                         updateConversation(conversationId, updatedConversation)
+                        streamCheckpoint.offer(conversationId, generationToken, updatedConversation)
 
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
                         // tryEmit 不挂起，事件丢失只影响单次通知更新，不能反压生成链
                         chunk.messages.lastOrNull()?.let { lastMessage ->
                             appEventBus.tryEmit(
-                                AppEvent.ChatGenerationUpdate(conversationId, lastMessage, senderName)
+                                AppEvent.ChatGenerationUpdate(
+                                    conversationId = conversationId,
+                                    lastMessage = lastMessage,
+                                    senderName = senderName,
+                                    runToken = protectionRunToken,
+                                )
                             )
                         }
                     }
                 }
             }
-        }.onFailure {
-            // 兜底取消 Live Update 通知（生成开始前失败时 onCompletion 不会执行）
-            appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null))
-
-            // 取消/失败时也要落库: 否则这一轮已经流式收到的内容(尤其是工具的 output)只存在于内存,
-            // 重进对话时工具还是 output 为空, 会被判成 isExecuted=false 而永久停在"加载中".
-            runCatching { saveConversation(conversationId, getConversationFlow(conversationId).value) }
-                .onFailure { e -> Logging.log(TAG, "save on failure failed: $e") }
-
-            if (it is CancellationException) {
-                // 用户主动切走/停止生成不是错误, 不弹错误卡片; 但上面的落库必须已经完成.
-                Logging.log(TAG, "handleMessageComplete: cancelled")
-                return@onFailure
-            }
-
-            it.printStackTrace()
-            addError(it, conversationId, title = context.getString(R.string.error_title_generation))
-            Logging.log(TAG, "handleMessageComplete: $it")
-            Logging.log(TAG, it.stackTraceToString())
-        }.onSuccess {
             val finalConversation = getConversationFlow(conversationId).value
-            saveConversation(conversationId, finalConversation)
+            val persisted = withContext(NonCancellable) {
+                streamCheckpoint.saveFinal(
+                    conversationId = conversationId,
+                    generationToken = generationToken,
+                    conversation = finalConversation,
+                ) { completedConversation ->
+                    saveConversation(conversationId, completedConversation)
+                }
+            }
+            if (!persisted) return false
+            completedAndPersisted = true
+            Logging.log(
+                TAG,
+                "stream_terminal generation=$generationToken run=$protectionRunToken result=completed",
+            )
+
+            // A protocol terminal event alone is not enough. The completion event drives
+            // notifications and post-processing, so release it only after the final Room write
+            // succeeds and the partial response is durably recoverable.
+            emitGenerationEnded(
+                AppEvent.ChatGenerationEnded(
+                    conversationId = conversationId,
+                    senderName = senderName,
+                    result = AppEvent.ChatGenerationResult.COMPLETED,
+                    contentPreview = finalConversation.generationMessage(generationTarget)
+                        ?.toText()
+                        ?.take(50)
+                        ?.trim(),
+                )
+            )
 
             // Sequential, not two parallel launches: the gateway caps concurrent requests per user,
             // and these background calls would otherwise contend with each other and with the next
@@ -656,6 +749,130 @@ class ChatService(
                 generateTitle(conversationId, finalConversation)
                 generateSuggestion(conversationId, finalConversation)
             }
+            return true
+        } catch (error: Throwable) {
+            // A completed response is already durably stored. A cancellation while delivering its
+            // terminal event must not rewrite it as an interrupted response.
+            if (completedAndPersisted) return true
+
+            val ownsStream = streamStarted && withContext(NonCancellable) {
+                streamCheckpoint.isCurrent(conversationId, generationToken)
+            }
+            if (!ownsStream) {
+                if (error !is CancellationException) {
+                    addError(error, conversationId, title = context.getString(R.string.error_title_generation))
+                    Logging.log(TAG, "handleMessageComplete failed before stream ownership: ${error.javaClass.simpleName}")
+                }
+                return false
+            }
+
+            val stoppedByUser = error is CancellationException &&
+                userStoppedStreamTokens.remove(conversationId, generationToken)
+            val protectionLost = generationProtectionManager.isProtectionLost(protectionRunToken)
+            val interrupted = error !is CancellationException || protectionLost
+            backgroundInterruptionNotice.recordIfEligible(
+                error = error,
+                protectionLost = protectionLost,
+            )
+            val causeTypes = generateSequence(error) { it.cause }
+                .take(4)
+                .joinToString(">"){ cause ->
+                    cause.javaClass.simpleName.ifEmpty { cause.javaClass.name.substringAfterLast('.') }
+                }
+            Logging.log(
+                TAG,
+                "stream_terminal generation=$generationToken run=$protectionRunToken result=" +
+                    (if (interrupted) "interrupted" else "cancelled") +
+                    " error=$causeTypes stream_interrupted=${error is StreamInterruptedException}" +
+                    " protection_error=${error is GenerationProtectionException}" +
+                    " protection_lost=$protectionLost",
+            )
+            Log.i(
+                TAG,
+                "stream_terminal generation=$generationToken run=$protectionRunToken result=" +
+                    (if (interrupted) "interrupted" else "cancelled") +
+                    " error=$causeTypes stream_interrupted=${error is StreamInterruptedException}" +
+                    " protection_error=${error is GenerationProtectionException}" +
+                    " protection_lost=$protectionLost",
+            )
+            // Cancellation/failure must retain received tool output as well as text. The final
+            // save shares the checkpoint mutex, so an older generation cannot overwrite a newer
+            // branch after it has been cancelled.
+            val failedConversation = if (interrupted) {
+                markCurrentGenerationInterrupted(conversationId, generationTarget)
+            } else {
+                finishCurrentGenerationByUser(conversationId, generationTarget)
+            }
+            try {
+                withContext(NonCancellable) {
+                    streamCheckpoint.offer(conversationId, generationToken, failedConversation)
+                    streamCheckpoint.saveFinal(
+                        conversationId = conversationId,
+                        generationToken = generationToken,
+                        conversation = failedConversation,
+                    ) { finalConversation ->
+                        saveConversation(conversationId, finalConversation)
+                    }
+                }
+            } catch (saveError: Throwable) {
+                Logging.log(
+                    TAG,
+                    "failed to persist terminal stream state: ${saveError.javaClass.simpleName}",
+                )
+            }
+
+            // Persist the partial reply first, then reliably clear the live notification. Terminal
+            // events are low frequency and must not be dropped when the shared-flow buffer is full.
+            emitGenerationEnded(
+                AppEvent.ChatGenerationEnded(
+                    conversationId = conversationId,
+                    senderName = senderName,
+                    result = if (interrupted) {
+                        AppEvent.ChatGenerationResult.INTERRUPTED
+                    } else {
+                        AppEvent.ChatGenerationResult.CANCELLED
+                    },
+                )
+            )
+
+            if (error !is CancellationException) {
+                addError(error, conversationId, title = context.getString(R.string.error_title_generation))
+                Logging.log(TAG, "handleMessageComplete failed: ${error.javaClass.simpleName}")
+            } else {
+                Logging.log(
+                    TAG,
+                    "handleMessageComplete cancelled result=" +
+                        when {
+                            interrupted -> "protection_lost"
+                            stoppedByUser -> "user"
+                            else -> "replacement_or_owner"
+                        },
+                )
+            }
+            return false
+        } finally {
+            // This also runs when setup fails before a provider Flow exists. Leaving the map entry
+            // behind would make a later user stop attach its intent to an unrelated generation.
+            activeStreamTokens.remove(conversationId, generationToken)
+            userStoppedStreamTokens.remove(conversationId, generationToken)
+            if (streamStarted) {
+                try {
+                    withContext(NonCancellable) {
+                        streamCheckpoint.discard(conversationId, generationToken)
+                    }
+                } catch (cleanupError: Throwable) {
+                    Logging.log(
+                        TAG,
+                        "failed to discard stream checkpoint: ${cleanupError.javaClass.simpleName}",
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun emitGenerationEnded(event: AppEvent.ChatGenerationEnded) {
+        withContext(NonCancellable) {
+            appEventBus.emit(event)
         }
     }
 
@@ -752,6 +969,25 @@ class ChatService(
         saveConversation(conversationId, updatedConversation)
     }
 
+    /**
+     * A user-issued stop preserves the partial assistant reply, including completed tool output,
+     * but closes pending tools and reasoning so recovery will not later mislabel it as a network
+     * interruption. This is called from the token-scoped failure finalization path.
+     */
+    private fun finishCurrentGenerationByUser(
+        conversationId: Uuid,
+        generationTarget: StreamGenerationTarget? = null,
+    ): Conversation {
+        val conversation = getConversationFlow(conversationId).value
+        return conversation.finishGenerationByUser(
+            target = generationTarget,
+            cancelTool = ::cancelToolByUser,
+            updateAt = Instant.now(),
+        ).also {
+            updateConversation(conversationId, it)
+        }
+    }
+
     // ---- 生成标题 ----
 
     suspend fun generateTitle(
@@ -793,7 +1029,7 @@ class ChatService(
                 )
             }
         }.onFailure {
-            it.printStackTrace()
+            Logging.log(TAG, "generateTitle failed: ${it.javaClass.simpleName}")
             // Only surface this when the user asked for a title. Automatic titling runs after every
             // reply and competes with the reply itself for the gateway's per-user concurrency slots,
             // so a background failure here is not something the user did or can act on.
@@ -852,7 +1088,7 @@ class ChatService(
                 )
             )
         }.onFailure {
-            it.printStackTrace()
+            Logging.log(TAG, "generateSuggestion failed: ${it.javaClass.simpleName}")
         }
     }
 
@@ -949,6 +1185,19 @@ class ChatService(
         val session = getOrCreateSession(conversationId)
         checkFilesDelete(conversation, session.state.value)
         session.state.value = conversation
+    }
+
+    private fun markCurrentGenerationInterrupted(
+        conversationId: Uuid,
+        generationTarget: StreamGenerationTarget? = null,
+    ): Conversation {
+        val conversation = getConversationFlow(conversationId).value
+        return conversation.markGenerationInterrupted(
+            target = generationTarget,
+            updateAt = Instant.now(),
+        ).also {
+            updateConversation(conversationId, it)
+        }
     }
 
     fun updateConversationState(conversationId: Uuid, update: (Conversation) -> Conversation) {
@@ -1284,8 +1533,12 @@ class ChatService(
     // 停止当前会话生成任务（不清理会话缓存）
     suspend fun stopGeneration(conversationId: Uuid) {
         val job = sessions[conversationId]?.getJob() ?: return
+        // Mark intent before cancelling. handleMessageComplete owns the active checkpoint token and
+        // will perform the final write while holding that token's per-conversation mutex.
+        activeStreamTokens[conversationId]?.let { token ->
+            userStoppedStreamTokens[conversationId] = token
+        }
         job.cancel()
         runCatching { job.join() }
-        finishInterruptedPendingTools(conversationId)
     }
 }

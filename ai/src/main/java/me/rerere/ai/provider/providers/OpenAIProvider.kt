@@ -7,6 +7,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
@@ -55,13 +56,25 @@ private const val TAG = "OpenAIProvider"
 
 class OpenAIProvider(
     private val client: OkHttpClient,
-    context: Context? = null
+    context: Context? = null,
+    private val imageTaskPollIntervalMillis: Long = IMAGE_TASK_POLL_INTERVAL_MS,
 ) : Provider<ProviderSetting.OpenAI> {
     private val appContext = context?.applicationContext
     private val keyRoulette = if (context != null) KeyRoulette.lru(context) else KeyRoulette.default()
 
-    private val chatCompletionsAPI = ChatCompletionsAPI(client = client, keyRoulette = keyRoulette)
-    private val responseAPI = ResponseAPI(client = client, keyRoulette = keyRoulette)
+    // A reasoning stream can pause for longer than normal request traffic. Keep it on a dedicated
+    // client so its socket stays alive across long output and mobile network idle periods.
+    private val streamingClient = client.newBuilder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(CHAT_HTTP2_PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        // A 307/308 preserves a POST body. Streaming requests are billable and cannot safely be
+        // replayed without a provider-specific idempotency contract.
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+    private val chatCompletionsAPI = ChatCompletionsAPI(client = streamingClient, keyRoulette = keyRoulette)
+    private val responseAPI = ResponseAPI(client = streamingClient, keyRoulette = keyRoulette)
     private val imageRequestClient = client.newBuilder()
         // Image POSTs are long-lived and billable. Never reuse a chat socket that an OEM may have
         // silently killed in the background; keep a negotiated HTTP/2 call alive while it waits.
@@ -264,7 +277,10 @@ class OpenAIProvider(
         )
 
         val request = Request.Builder()
-            .url("${providerSetting.baseUrl}/images/generations")
+            .url(
+                "${providerSetting.baseUrl}/images/generations" +
+                    if (providerSetting.useAsyncImageTasks) "/async" else ""
+            )
             .headers(params.customHeaders.toHeaders())
             .addHeader("Authorization", "Bearer $key")
             .addHeader("Content-Type", "application/json")
@@ -290,7 +306,19 @@ class OpenAIProvider(
                 "response_body_read",
                 "action=generate chars=${bodyStr.length} elapsed_ms=${elapsedSince(bodyStartedAt)}",
             )
-            parseImageResponse(bodyStr, traceId)
+            if (providerSetting.useAsyncImageTasks) {
+                pollSubmittedImageTask(
+                    providerSetting = providerSetting,
+                    key = key,
+                    submitBody = bodyStr,
+                    customHeaders = params.customHeaders,
+                    traceId = traceId,
+                    onTaskSubmitted = params.onTaskSubmitted,
+                    onTaskFailed = params.onTaskFailed,
+                )
+            } else {
+                parseImageResponse(bodyStr, traceId)
+            }
         }
 
         items.forEach { emit(it) }
@@ -343,7 +371,10 @@ class OpenAIProvider(
         }
 
         val request = Request.Builder()
-            .url("${providerSetting.baseUrl}/images/edits")
+            .url(
+                "${providerSetting.baseUrl}/images/edits" +
+                    if (providerSetting.useAsyncImageTasks) "/async" else ""
+            )
             .headers(params.customHeaders.toHeaders())
             .addHeader("Authorization", "Bearer $key")
             .post(bodyBuilder.build())
@@ -373,22 +404,173 @@ class OpenAIProvider(
                 "response_body_read",
                 "action=edit chars=${bodyStr.length} elapsed_ms=${elapsedSince(bodyStartedAt)}",
             )
-            parseImageResponse(bodyStr, traceId)
+            if (providerSetting.useAsyncImageTasks) {
+                pollSubmittedImageTask(
+                    providerSetting = providerSetting,
+                    key = key,
+                    submitBody = bodyStr,
+                    customHeaders = params.customHeaders,
+                    traceId = traceId,
+                    onTaskSubmitted = params.onTaskSubmitted,
+                    onTaskFailed = params.onTaskFailed,
+                )
+            } else {
+                parseImageResponse(bodyStr, traceId)
+            }
         }
 
         items.forEach { emit(it) }
     }
 
+    override suspend fun resumeImageTask(
+        providerSetting: ProviderSetting,
+        taskId: String,
+        customHeaders: List<me.rerere.ai.provider.CustomHeader>,
+        traceId: String,
+        onTaskFailed: suspend (String) -> Unit,
+    ): Flow<ImageGenerationItem> = flow {
+        require(providerSetting is ProviderSetting.OpenAI) {
+            "Expected OpenAI provider setting"
+        }
+        require(providerSetting.useAsyncImageTasks) {
+            "Asynchronous image tasks are not enabled for this provider"
+        }
+        require(taskId.isNotBlank()) { "Image task ID cannot be blank" }
+
+        val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+        pollImageTask(
+            providerSetting = providerSetting,
+            key = key,
+            taskId = taskId,
+            customHeaders = customHeaders,
+            traceId = traceId(traceId),
+            onTaskFailed = onTaskFailed,
+        ).forEach { emit(it) }
+    }
+
+    private suspend fun pollSubmittedImageTask(
+        providerSetting: ProviderSetting.OpenAI,
+        key: String,
+        submitBody: String,
+        customHeaders: List<me.rerere.ai.provider.CustomHeader>,
+        traceId: String,
+        onTaskSubmitted: suspend (String) -> Unit,
+        onTaskFailed: suspend (String) -> Unit,
+    ): List<ImageGenerationItem> {
+        val body = json.parseToJsonElement(submitBody).jsonObject
+        val taskId = body["task_id"]?.jsonPrimitive?.contentOrNull
+            ?: body["id"]?.jsonPrimitive?.contentOrNull
+            ?: error("No task_id in asynchronous image response")
+        onTaskSubmitted(taskId)
+        trace(traceId, "async_task_submitted", "task_id=$taskId")
+        return pollImageTask(
+            providerSetting = providerSetting,
+            key = key,
+            taskId = taskId,
+            customHeaders = customHeaders,
+            traceId = traceId,
+            onTaskFailed = onTaskFailed,
+        )
+    }
+
+    private suspend fun pollImageTask(
+        providerSetting: ProviderSetting.OpenAI,
+        key: String,
+        taskId: String,
+        customHeaders: List<me.rerere.ai.provider.CustomHeader>,
+        traceId: String,
+        onTaskFailed: suspend (String) -> Unit,
+    ): List<ImageGenerationItem> = withContext(Dispatchers.IO) {
+        val startedAt = SystemClock.elapsedRealtime()
+        var pollCount = 0
+        while (elapsedSince(startedAt) < IMAGE_TASK_POLL_TIMEOUT_MS) {
+            pollCount++
+            val request = Request.Builder()
+                .url("${providerSetting.baseUrl.trimEnd('/')}/images/tasks/$taskId")
+                .headers(customHeaders.toHeaders())
+                .addHeader("Authorization", "Bearer $key")
+                .get()
+                .configureReferHeaders(providerSetting.baseUrl)
+                .build()
+
+            val response = try {
+                client.newCall(request).await()
+            } catch (e: java.io.IOException) {
+                trace(
+                    traceId,
+                    "async_task_poll_retry",
+                    "task_id=$taskId poll=$pollCount error=${e.javaClass.simpleName}",
+                )
+                delay(imageTaskPollIntervalMillis)
+                continue
+            }
+            if (!response.isSuccessful) {
+                if (response.code >= 500 || response.code == 408 || response.code == 429) {
+                    response.close()
+                    delay(imageTaskPollIntervalMillis)
+                    continue
+                }
+                if (response.code == 404) {
+                    onTaskFailed(taskId)
+                }
+                throw imageApiError("poll", response)
+            }
+
+            val bodyStr = response.body.string()
+            val body = json.parseToJsonElement(bodyStr).jsonObject
+            when (body["status"]?.jsonPrimitive?.contentOrNull) {
+                "processing" -> {
+                    trace(traceId, "async_task_processing", "task_id=$taskId poll=$pollCount")
+                    delay(imageTaskPollIntervalMillis)
+                }
+
+                "completed" -> {
+                    val result = body["result"] ?: error("No result in completed image task")
+                    trace(
+                        traceId,
+                        "async_task_completed",
+                        "task_id=$taskId polls=$pollCount elapsed_ms=${elapsedSince(startedAt)}",
+                    )
+                    try {
+                        return@withContext parseImageResponse(result.toString(), traceId)
+                    } catch (e: java.io.IOException) {
+                        // The server result is durable. If only the object-storage download fails,
+                        // poll the same completed task again instead of replaying image generation.
+                        trace(
+                            traceId,
+                            "async_result_download_retry",
+                            "task_id=$taskId error=${e.javaClass.simpleName}",
+                        )
+                        delay(imageTaskPollIntervalMillis)
+                    }
+                }
+
+                "failed" -> {
+                    onTaskFailed(taskId)
+                    val detail = (body["error"] as? JsonObject)
+                        ?.get("message")?.jsonPrimitive?.contentOrNull
+                        ?: "Image generation task failed"
+                    throw IllegalStateException("Failed to generate image: $detail")
+                }
+
+                else -> error("Unknown asynchronous image task status")
+            }
+        }
+        throw java.net.SocketTimeoutException("Timed out waiting for image generation task")
+    }
+
     /**
-     * 网关的报错信息在 error.message 里, 直接把整个 JSON body 抛出去会原样显示给用户.
-     * 复用聊天那条链路上的 [parseErrorDetail], 取出真正可读的那句话.
+     * Preserve a structured gateway error message when available, but never put an arbitrary
+     * response body in an exception. Gateways can echo prompts or credentials in HTML/text errors.
      */
     private fun imageApiError(action: String, response: Response): Throwable {
         val bodyStr = response.body.string()
         val detail = runCatching { json.parseToJsonElement(bodyStr).parseErrorDetail().message }
             .getOrNull()
             ?.takeIf { it.isNotBlank() }
-            ?: bodyStr.ifBlank { "HTTP ${response.code}" }
+            ?.takeUnless { it.trimStart().startsWith("{") || it.trimStart().startsWith("[") }
+            ?.take(500)
+            ?: "HTTP ${response.code}"
         return IllegalStateException("Failed to $action image: $detail")
     }
 
@@ -571,6 +753,9 @@ class OpenAIProvider(
         private const val IMAGE_DOWNLOAD_ATTEMPTS = 3
         private const val IMAGE_DOWNLOAD_RETRY_DELAY_MS = 500L
         private const val IMAGE_HTTP2_PING_INTERVAL_SECONDS = 20L
+        private const val CHAT_HTTP2_PING_INTERVAL_SECONDS = 15L
+        private const val IMAGE_TASK_POLL_INTERVAL_MS = 3_000L
+        private const val IMAGE_TASK_POLL_TIMEOUT_MS = 31 * 60 * 1000L
 
         private fun traceId(value: String): String = value.ifBlank { "provider-untracked" }
 

@@ -69,13 +69,11 @@ private class ReasoningState(
 ) {
     var expandState by mutableStateOf(ReasoningCardState.Collapsed)
     var duration by mutableStateOf(initialDuration)
+    var userCollapsed by mutableStateOf(false)
 
-    fun onExpandedChange(nextExpanded: Boolean, loading: Boolean) {
-        expandState = if (loading) {
-            if (nextExpanded) ReasoningCardState.Expanded else ReasoningCardState.Preview
-        } else {
-            if (nextExpanded) ReasoningCardState.Expanded else ReasoningCardState.Collapsed
-        }
+    fun onExpandedChange(nextExpanded: Boolean) {
+        userCollapsed = !nextExpanded
+        expandState = if (nextExpanded) ReasoningCardState.Expanded else ReasoningCardState.Collapsed
     }
 }
 
@@ -84,6 +82,7 @@ private fun rememberReasoningState(reasoning: UIMessagePart.Reasoning): Pair<Rea
     val settings = LocalSettings.current
     val loading = reasoning.finishedAt == null
     val scrollState = rememberScrollState()
+    val initialLoading = remember(reasoning.createdAt) { loading }
 
     val state = remember(reasoning.createdAt) {
         ReasoningState(
@@ -93,18 +92,31 @@ private fun rememberReasoningState(reasoning: UIMessagePart.Reasoning): Pair<Rea
         )
     }
 
+    LaunchedEffect(loading, settings.displaySetting.showThinkingContent, settings.displaySetting.autoCloseThinking) {
+        if (loading) {
+            if (!state.userCollapsed && state.expandState == ReasoningCardState.Collapsed &&
+                settings.displaySetting.showThinkingContent
+            ) {
+                state.expandState = ReasoningCardState.Preview
+            }
+        } else if (initialLoading) {
+            state.duration = reasoning.finishedAt?.let { it - reasoning.createdAt }
+                ?: (Clock.System.now() - reasoning.createdAt)
+            state.expandState = if (settings.displaySetting.autoCloseThinking || state.userCollapsed) {
+                ReasoningCardState.Collapsed
+            } else {
+                ReasoningCardState.Expanded
+            }
+        }
+    }
+
+    LaunchedEffect(reasoning.finishedAt) {
+        reasoning.finishedAt?.let { state.duration = it - reasoning.createdAt }
+    }
+
     LaunchedEffect(reasoning.reasoning, loading) {
         if (loading) {
-            if (!state.expandState.expanded && settings.displaySetting.showThinkingContent)
-                state.expandState = ReasoningCardState.Preview
             scrollState.animateScrollTo(scrollState.maxValue)
-        } else {
-            if (state.expandState.expanded) {
-                state.expandState = if (settings.displaySetting.autoCloseThinking)
-                    ReasoningCardState.Collapsed
-                else
-                    ReasoningCardState.Expanded
-            }
         }
     }
 
@@ -205,7 +217,7 @@ fun ChainOfThoughtScope.ChatMessageReasoningStep(
 
     ControlledChainOfThoughtStep(
         expanded = state.expandState == ReasoningCardState.Expanded,
-        onExpandedChange = { state.onExpandedChange(it, loading) },
+        onExpandedChange = state::onExpandedChange,
         icon = {
             Icon(
                 imageVector = HugeIcons.Idea01,

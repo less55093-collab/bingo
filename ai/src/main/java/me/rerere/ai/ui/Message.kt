@@ -419,6 +419,21 @@ fun UIMessage.finishReasoning(): UIMessage {
     )
 }
 
+/** Marks an incomplete assistant message as terminal without changing its received content. */
+fun UIMessage.finishGeneration(): UIMessage {
+    if (finishedAt != null) return finishReasoning()
+    return copy(
+        finishedAt = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault())
+    ).finishReasoning()
+}
+
+/** Records an abnormal stream end once so restored history can explain a partial reply. */
+fun UIMessage.markGenerationInterrupted(): UIMessage {
+    val finished = finishGeneration()
+    if (finished.annotations.any { it is UIMessageAnnotation.GenerationInterrupted }) return finished
+    return finished.copy(annotations = finished.annotations + UIMessageAnnotation.GenerationInterrupted)
+}
+
 fun UIMessage.finishPendingTools(
     transform: (UIMessagePart.Tool) -> UIMessagePart.Tool
 ): UIMessage {

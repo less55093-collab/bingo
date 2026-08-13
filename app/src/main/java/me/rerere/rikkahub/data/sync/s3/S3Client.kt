@@ -12,6 +12,7 @@ import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpMethod
 import io.ktor.http.isSuccess
+import io.ktor.http.content.OutgoingContent
 import io.ktor.utils.io.jvm.javaio.toInputStream
 import io.ktor.utils.io.readAvailable
 import io.ktor.util.cio.readChannel
@@ -30,6 +31,12 @@ class S3Client(
     private val config: S3Config,
     private val httpClient: HttpClient,
 ) {
+    init {
+        // Every operation sends the configured access key; callers must not bypass the HTTPS
+        // requirement by constructing a client directly.
+        config.requireSecureEndpoint()
+    }
+
     suspend fun putObject(
         key: String,
         data: ByteArray,
@@ -87,7 +94,13 @@ class S3Client(
                     signed.headers.forEach { (k, v) -> append(k, v) }
                 }
                 // Stream large files to avoid loading backup archives into heap.
-                setBody(file.readChannel())
+                // Supplying contentLength on the outgoing body prevents OkHttp from falling
+                // back to chunked transfer, which OSS does not accept for PutObject.
+                setBody(object : OutgoingContent.ReadChannelContent() {
+                    override val contentLength: Long = file.length()
+
+                    override fun readFrom() = file.readChannel()
+                })
             }
 
             if (!response.status.isSuccess()) {
@@ -290,12 +303,12 @@ class S3Client(
     }
 
     fun getPublicUrl(key: String): String {
+        config.requireSecureEndpoint()
         val path = "/${key.trimStart('/')}"
         return if (config.pathStyle) {
-            "${config.endpoint.trimEnd('/')}/${config.bucket}$path"
+            "${config.normalizedEndpoint}/${config.bucket}$path"
         } else {
-            val scheme = if (config.isHttps) "https://" else "http://"
-            "$scheme${config.bucket}.${config.host}$path"
+            "${config.bucketUrl()}$path"
         }
     }
 

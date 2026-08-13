@@ -112,6 +112,20 @@ fun Context.openUsageAccessSettings() {
     }
 }
 
+/** Opens the vendor-controlled per-app background policy screen when the device exposes it. */
+fun Context.openBackgroundGenerationSettings() {
+    runCatching {
+        startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", packageName, null)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
+    }.onFailure {
+        Log.e(TAG, "openBackgroundGenerationSettings failed", it)
+    }
+}
+
 /**
  * Open a url
  */

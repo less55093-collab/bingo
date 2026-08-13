@@ -1,9 +1,10 @@
 package me.rerere.rikkahub.service
 
 import android.app.Application
+import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.Lifecycle
@@ -12,7 +13,6 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
-import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID
@@ -43,11 +43,16 @@ class ChatNotificationManager(
     appScope: AppScope,
     eventBus: AppEventBus,
     private val settingsStore: SettingsStore,
+    private val generationProtectionManager: GenerationProtectionManager,
 ) {
     private val isForeground = MutableStateFlow(false)
     private val liveUpdateLastSentAt = ConcurrentHashMap<Uuid, Long>()
+    private val legacyNotificationCleaned = ConcurrentHashMap.newKeySet<Uuid>()
 
     init {
+        appScope.launch(Dispatchers.Default) {
+            cleanupLegacyLiveUpdateNotifications()
+        }
         // ProcessLifecycleOwner 要求在主线程注册观察者
         appScope.launch {
             ProcessLifecycleOwner.get().lifecycle.addObserver(
@@ -73,6 +78,7 @@ class ChatNotificationManager(
     }
 
     private fun handleGenerationUpdate(event: AppEvent.ChatGenerationUpdate) {
+        cancelLegacyLiveUpdateNotificationOnce(event.conversationId)
         if (isForeground.value) return
         val displaySetting = settingsStore.settingsFlow.value.displaySetting
         if (!displaySetting.enableNotificationOnMessageGeneration) return
@@ -83,12 +89,14 @@ class ChatNotificationManager(
         if (lastSentAt != null && now - lastSentAt < LIVE_UPDATE_NOTIFICATION_THROTTLE_MS) return
         liveUpdateLastSentAt[event.conversationId] = now
 
-        sendLiveUpdateNotification(event.conversationId, event.lastMessage, event.senderName)
+        updateForegroundGenerationNotification(event)
     }
 
     private fun handleGenerationEnded(event: AppEvent.ChatGenerationEnded) {
-        cancelLiveUpdateNotification(event.conversationId)
+        liveUpdateLastSentAt.remove(event.conversationId)
+        cancelLegacyLiveUpdateNotificationOnce(event.conversationId)
 
+        if (event.result != AppEvent.ChatGenerationResult.COMPLETED) return
         val contentPreview = event.contentPreview ?: return
         if (isForeground.value) return
         if (!settingsStore.settingsFlow.value.displaySetting.enableNotificationOnMessageGeneration) return
@@ -117,7 +125,7 @@ class ChatNotificationManager(
         }
     }
 
-    private fun getImagePendingIntent(context: Context): PendingIntent {
+    private fun getImagePendingIntent(context: android.content.Context): PendingIntent {
         val intent = Intent(context, RouteActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -147,33 +155,17 @@ class ChatNotificationManager(
         }
     }
 
-    private fun getLiveUpdateNotificationId(conversationId: Uuid): Int {
-        return conversationId.hashCode() + 10000
-    }
-
-    private fun sendLiveUpdateNotification(
-        conversationId: Uuid,
-        lastMessage: UIMessage,
-        senderName: String
-    ) {
+    private fun updateForegroundGenerationNotification(event: AppEvent.ChatGenerationUpdate) {
         // 确定当前状态
-        val (chipText, statusText, contentText) = determineNotificationContent(lastMessage.parts)
-
-        context.sendNotification(
-            channelId = CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID,
-            notificationId = getLiveUpdateNotificationId(conversationId)
-        ) {
-            title = senderName
-            content = contentText
-            subText = statusText
-            ongoing = true
-            onlyAlertOnce = true
-            category = NotificationCompat.CATEGORY_PROGRESS
-            useBigTextStyle = true
-            contentIntent = getPendingIntent(context, conversationId)
-            requestPromotedOngoing = true
-            shortCriticalText = chipText
-        }
+        val (chipText, statusText, contentText) = determineNotificationContent(event.lastMessage.parts)
+        generationProtectionManager.updateProgress(
+            runToken = event.runToken,
+            conversationId = event.conversationId.toString(),
+            title = event.senderName,
+            status = statusText,
+            content = contentText,
+            chipText = chipText,
+        )
     }
 
     private fun determineNotificationContent(parts: List<UIMessagePart>): Triple<String, String, String> {
@@ -219,12 +211,7 @@ class ChatNotificationManager(
         }
     }
 
-    private fun cancelLiveUpdateNotification(conversationId: Uuid) {
-        liveUpdateLastSentAt.remove(conversationId)
-        context.cancelNotification(getLiveUpdateNotificationId(conversationId))
-    }
-
-    private fun getPendingIntent(context: Context, conversationId: Uuid): PendingIntent {
+    private fun getPendingIntent(context: android.content.Context, conversationId: Uuid): PendingIntent {
         val intent = Intent(context, RouteActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("conversationId", conversationId.toString())
@@ -236,4 +223,22 @@ class ChatNotificationManager(
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
     }
+
+    private fun cancelLegacyLiveUpdateNotificationOnce(conversationId: Uuid) {
+        if (legacyNotificationCleaned.add(conversationId)) {
+            context.cancelNotification(conversationId.hashCode() + LEGACY_LIVE_UPDATE_ID_OFFSET)
+        }
+    }
+
+    private fun cleanupLegacyLiveUpdateNotifications() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        runCatching {
+            val notificationManager = context.getSystemService(NotificationManager::class.java)
+            notificationManager.activeNotifications
+                .filter { it.notification.channelId == CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID }
+                .forEach { notificationManager.cancel(it.tag, it.id) }
+        }
+    }
 }
+
+private const val LEGACY_LIVE_UPDATE_ID_OFFSET = 10_000

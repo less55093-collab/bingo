@@ -111,7 +111,7 @@ internal class McpOAuthCoordinator(
                 persistOAuthState(config.id, updated)
                 config.clone(commonOptions = config.commonOptions.copy(oauth = updated))
             }.getOrElse {
-                Log.w(TAG, "Token refresh failed for ${config.commonOptions.name}: ${it.message}")
+                Log.w(TAG, "Token refresh failed for ${config.commonOptions.name}: ${it.javaClass.simpleName}")
                 config
             }
         }
@@ -125,7 +125,7 @@ internal class McpOAuthCoordinator(
         }
         return runCatching { oauthClient.discoverProtectedResource(config.serverUrl) }
             .onFailure {
-                Log.i(TAG, "OAuth probe failed for ${config.commonOptions.name}: ${it.message}")
+                Log.i(TAG, "OAuth probe failed for ${config.commonOptions.name}: ${it.javaClass.simpleName}")
             }
             .isSuccess
     }

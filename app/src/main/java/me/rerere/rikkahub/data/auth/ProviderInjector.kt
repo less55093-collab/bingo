@@ -50,9 +50,12 @@ object ProviderInjector {
         if (provider.baseUrl != BINGO_PROVIDER.baseUrl) return false
         if (provider.models.map { it.modelId } != BINGO_MODELS.map { it.modelId }) return false
         return provider.models.all { model ->
+            val expected = BINGO_MODELS.firstOrNull { it.id == model.id }?.providerOverwrite
             when (val o = model.providerOverwrite) {
                 is ProviderSetting.Claude -> o.apiKey == keys.claudeKey
-                is ProviderSetting.OpenAI -> o.apiKey == keys.imageKey
+                is ProviderSetting.OpenAI ->
+                    o.apiKey == keys.imageKey && o.useAsyncImageTasks ==
+                        (expected as? ProviderSetting.OpenAI)?.useAsyncImageTasks
                 else -> true
             }
         }

@@ -12,7 +12,7 @@
     <include
       domain="database"
       path="rikka_hub" />
-    <!-- 应用设置 (助手、供应商等)。DataStore Preferences 落在 filesDir/datastore/ 下 -->
+    <!-- 应用设置。S3 凭据位于独立文件并不在此 include 列表中，不能进入系统云备份。 -->
     <include
       domain="file"
       path="datastore/settings.preferences_pb" />

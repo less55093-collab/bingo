@@ -107,6 +107,7 @@ import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesThemePage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesNotificationPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesGeneralPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesUIPage
+import me.rerere.rikkahub.ui.pages.setting.SettingBackupPage
 import me.rerere.rikkahub.ui.pages.setting.SettingThemePage
 import me.rerere.rikkahub.ui.pages.setting.SettingPage
 import me.rerere.rikkahub.ui.pages.setting.SettingSearchDetailPage
@@ -118,6 +119,7 @@ import me.rerere.rikkahub.ui.pages.translator.TranslatorPage
 import me.rerere.rikkahub.ui.pages.webview.WebViewPage
 import me.rerere.rikkahub.ui.theme.LocalDarkMode
 import me.rerere.rikkahub.ui.theme.RikkahubTheme
+import me.rerere.rikkahub.service.ImageGenerationManager
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.openUsageAccessSettings
 import okhttp3.OkHttpClient
@@ -131,6 +133,7 @@ class RouteActivity : ComponentActivity() {
     private val okHttpClient by inject<OkHttpClient>()
     private val settingsStore by inject<SettingsStore>()
     private var navStack: MutableList<NavKey>? = null
+    private var pendingConversationId: String? = null
 
     // Volume key listener registry — last registered handler wins
     internal val volumeKeyListeners = mutableListOf<(isVolumeUp: Boolean) -> Boolean>()
@@ -218,9 +221,16 @@ class RouteActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // Navigate to the chat screen if a conversation ID is provided
-        intent.getStringExtra("conversationId")?.let { text ->
-            navStack?.add(Screen.Chat(text))
+        setIntent(intent)
+        intent.validConversationId()?.let { conversationId ->
+            val currentStack = navStack
+            if (currentStack == null) {
+                // A notification can arrive after onCreate but before Compose publishes the
+                // navigation stack. Keep the destination instead of dropping that click.
+                pendingConversationId = conversationId
+            } else {
+                currentStack.openConversation(conversationId)
+            }
         }
     }
 
@@ -249,12 +259,15 @@ class RouteActivity : ComponentActivity() {
         val authTokenStore = koinInject<AuthTokenStore>()
         // Read synchronously before the first composition: resolving auth in a
         // LaunchedEffect would show the chat screen and then bounce to login.
-        val startScreen = remember {
+        val notificationConversationId = remember {
+            intent.validConversationId()
+        }
+        val startScreen = remember(notificationConversationId) {
             if (!authTokenStore.tokensBlocking().isPresent) {
                 Screen.Login
             } else {
                 Screen.Chat(
-                    id = if (readBooleanPreference("create_new_conversation_on_start", true)) {
+                    id = notificationConversationId ?: if (readBooleanPreference("create_new_conversation_on_start", true)) {
                         Uuid.random().toString()
                     } else {
                         readStringPreference(
@@ -267,13 +280,20 @@ class RouteActivity : ComponentActivity() {
         }
 
         val backStack = rememberNavBackStack(startScreen)
-        SideEffect { this@RouteActivity.navStack = backStack }
+        SideEffect {
+            this@RouteActivity.navStack = backStack
+            pendingConversationId?.let { conversationId ->
+                pendingConversationId = null
+                backStack.openConversation(conversationId)
+            }
+        }
 
         ShareHandler(backStack)
 
         // Logout, or a refresh token the gateway rejected, clears the store from
         // outside the UI. Bounce to login from wherever the user happens to be.
         val accountRepository = koinInject<AccountRepository>()
+        val imageGenerationManager = koinInject<ImageGenerationManager>()
         val authState by accountRepository.state.collectAsStateWithLifecycle()
         LaunchedEffect(authState) {
             if (authState is AuthState.Unauthenticated &&
@@ -288,6 +308,7 @@ class RouteActivity : ComponentActivity() {
             // build or a restored backup is normalized on the first authenticated launch.
             if (authState is AuthState.Authenticated) {
                 accountRepository.ensureKeysProvisioned()
+                imageGenerationManager.recoverPendingTasks()
                 // Show the top-up walkthrough once, after the first successful login.
                 // Gated on a persisted flag so it never reappears on later launches.
                 if (!authTokenStore.tutorialShownFlow.first()) {
@@ -459,6 +480,10 @@ class RouteActivity : ComponentActivity() {
                                 SettingPreferencesGeneralPage()
                             }
 
+                            entry<Screen.SettingBackup> {
+                                SettingBackupPage()
+                            }
+
                             entry<Screen.SettingPreferencesUI> {
                                 SettingPreferencesUIPage()
                             }
@@ -538,6 +563,18 @@ class RouteActivity : ComponentActivity() {
         }
     }
 }
+
+private fun MutableList<NavKey>.openConversation(conversationId: String) {
+    val validConversationId = conversationId.validUuidOrNull() ?: return
+    if ((lastOrNull() as? Screen.Chat)?.id == validConversationId) return
+    add(Screen.Chat(validConversationId))
+}
+
+internal fun Intent.validConversationId(): String? =
+    getStringExtra("conversationId").validUuidOrNull()
+
+private fun String?.validUuidOrNull(): String? =
+    this?.takeIf { runCatching { Uuid.parse(it) }.isSuccess }
 
 sealed interface Screen : NavKey {
     @Serializable
@@ -622,6 +659,9 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object SettingPreferencesGeneral : Screen
+
+    @Serializable
+    data object SettingBackup : Screen
 
     @Serializable
     data object SettingPreferencesUI : Screen

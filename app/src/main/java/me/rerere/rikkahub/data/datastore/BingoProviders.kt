@@ -79,6 +79,7 @@ private fun imageOverwrite() = ProviderSetting.OpenAI(
     apiKey = "",
     enabled = true,
     builtIn = true,
+    useAsyncImageTasks = true,
 )
 
 private fun gptModel(id: Uuid, modelId: String, displayName: String) = Model(

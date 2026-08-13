@@ -8,6 +8,7 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -33,6 +34,7 @@ import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -64,6 +66,7 @@ import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Clock
 
 private const val TAG = "ChatCompletionsAPI"
@@ -92,11 +95,11 @@ class ChatCompletionsAPI(
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
+        Log.i(TAG, "generateText: model=${params.model.modelId}")
 
         val response = client.newCall(request).await()
         if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body?.string()}")
+            throw Exception("OpenAI chat request failed with HTTP ${response.code}")
         }
 
         val bodyStr = response.body?.string() ?: ""
@@ -134,6 +137,45 @@ class ChatCompletionsAPI(
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): Flow<MessageChunk> = callbackFlow {
+        val producer = this
+        val completed = AtomicBoolean(false)
+        val closedByCollector = AtomicBoolean(false)
+        val sawTerminalFinishReason = AtomicBoolean(false)
+
+        fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                producer.close()
+            }
+        }
+
+        fun fail(cause: Throwable) {
+            if (!completed.get() && !closedByCollector.get() && producer.isActive) {
+                producer.close(cause)
+            }
+        }
+
+        fun transportFailure(t: Throwable?, response: Response?): Throwable {
+            val bodyRaw = try {
+                response?.body?.stringSafe()
+            } catch (bodyError: Throwable) {
+                return StreamInterruptedException(
+                    "OpenAI chat stream failed before completion and its error response could not be read",
+                    t ?: bodyError,
+                )
+            }
+            if (!bodyRaw.isNullOrBlank()) {
+                return try {
+                    json.parseToJsonElement(bodyRaw).parseErrorDetail()
+                } catch (parseError: Throwable) {
+                    StreamInterruptedException(
+                        "OpenAI chat stream failed before completion and its error response was malformed",
+                        parseError,
+                    )
+                }
+            }
+            return StreamInterruptedException("OpenAI chat stream failed before completion", t)
+        }
+
         val requestBody = buildChatCompletionRequest(
             messages = messages,
             params = params,
@@ -150,107 +192,132 @@ class ChatCompletionsAPI(
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
-
-        // just for debugging response body
-        // println(client.newCall(request).await().body?.string())
+        Log.i(TAG, "streamText: starting model=${params.model.modelId}")
 
         val listener = object : EventSourceListener() {
+            override fun onOpen(eventSource: EventSource, response: Response) {
+                Log.i(
+                    TAG,
+                    "stream_open api=chat_completions status=${response.code} protocol=${response.protocol}",
+                )
+            }
+
             override fun onEvent(
                 eventSource: EventSource,
                 id: String?,
                 type: String?,
                 data: String
             ) {
-                if (data == "[DONE]") {
-                    println("[onEvent] (done) 结束流: $data")
-                    close()
+                if (data.trim() == "[DONE]") {
+                    complete()
                     return
                 }
-                Log.d(TAG, "onEvent: $data")
-                data
-                    .trim()
-                    .split("\n")
-                    .filter { it.isNotBlank() }
-                    .map { json.parseToJsonElement(it).jsonObject }
-                    .forEach {
-                        if (it["error"] != null) {
-                            val error = it["error"]!!.parseErrorDetail()
-                            throw error
-                        }
-                        val id = it["id"]?.jsonPrimitive?.contentOrNull ?: ""
-                        val model = it["model"]?.jsonPrimitive?.contentOrNull ?: ""
 
-                        val choices = it["choices"]?.jsonArray ?: JsonArray(emptyList())
+                try {
+                    for (line in data.trim().split("\n").filter { it.isNotBlank() }) {
+                        val payload = json.parseToJsonElement(line).jsonObject
+                        if (payload["error"] != null) {
+                            fail(payload["error"]!!.parseErrorDetail())
+                            return
+                        }
+
+                        val id = payload["id"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val model = payload["model"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val choices = payload["choices"]?.jsonArray ?: JsonArray(emptyList())
                         val choiceList = buildList {
                             if (choices.isNotEmpty()) {
                                 val choice = choices[0].jsonObject
-                                val message =
-                                    choice["delta"]?.jsonObject ?: choice["message"]?.jsonObject
-                                    ?: throw Exception("delta/message is null")
-                                val finishReason =
-                                    choice["finish_reason"]?.jsonPrimitive?.contentOrNull
-                                        ?: "unknown"
-                                add(
-                                    UIMessageChoice(
-                                        index = 0,
-                                        delta = parseMessage(message),
-                                        message = null,
-                                        finishReason = finishReason,
+                                val finishReason = choice["finish_reason"]?.jsonPrimitive?.contentOrNull
+                                if (isTerminalFinishReason(finishReason)) {
+                                    sawTerminalFinishReason.set(true)
+                                }
+                                val message = choice["delta"]?.jsonObject ?: choice["message"]?.jsonObject
+                                if (message != null) {
+                                    add(
+                                        UIMessageChoice(
+                                            index = 0,
+                                            delta = parseMessage(message),
+                                            message = null,
+                                            finishReason = finishReason ?: "unknown",
+                                        )
                                     )
-                                )
+                                } else if (finishReason != null) {
+                                    add(
+                                        UIMessageChoice(
+                                            index = 0,
+                                            delta = null,
+                                            message = null,
+                                            finishReason = finishReason,
+                                        )
+                                    )
+                                } else {
+                                    error("OpenAI chat chunk is missing delta/message")
+                                }
                             }
                         }
-                        val usage = parseTokenUsage(it["usage"] as? JsonObject)
-
                         val messageChunk = MessageChunk(
                             id = id,
                             model = model,
                             choices = choiceList,
-                            usage = usage
+                            usage = parseTokenUsage(payload["usage"] as? JsonObject),
                         )
-                        trySend(messageChunk).onFailure { e ->
-                            Log.w(TAG, "onEvent: chunk dropped (${e?.message})")
+                        producer.trySend(messageChunk).onFailure { e ->
+                            Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
                         }
                     }
+                    // Some OpenAI-compatible gateways send a final finish_reason but keep their
+                    // SSE socket open. The terminal chunk itself is sufficient confirmation; do
+                    // not depend on a later TCP close to finish this billable request.
+                    if (sawTerminalFinishReason.get()) {
+                        complete()
+                    }
+                } catch (e: Throwable) {
+                    fail(StreamInterruptedException("OpenAI chat stream received an invalid event", e))
+                }
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                var exception = t
-
-                t?.printStackTrace()
-                println("[onFailure] 发生错误: ${t?.javaClass?.name} ${t?.message} / $response")
-
-                val bodyRaw = response?.body?.stringSafe()
-                try {
-                    if (!bodyRaw.isNullOrBlank()) {
-                        val bodyElement = Json.parseToJsonElement(bodyRaw)
-                        println(bodyElement)
-                        exception = bodyElement.parseErrorDetail()
-                        Log.i(TAG, "onFailure: $exception")
-                    }
-                } catch (e: Throwable) {
-                    Log.w(TAG, "onFailure: failed to parse from $bodyRaw")
-                    e.printStackTrace()
-                    exception = e
-                } finally {
-                    close(exception)
+                val terminalCompleted = completed.get()
+                val diagnostic = "stream_terminal api=chat_completions callback=onFailure " +
+                    "error=${t?.javaClass?.simpleName} status=${response?.code} " +
+                    "protocol=${response?.protocol} terminal_completed=$terminalCompleted " +
+                    "terminal_finish_reason=${sawTerminalFinishReason.get()}"
+                if (terminalCompleted) {
+                    Log.i(TAG, "$diagnostic ignored_after_terminal=true")
+                    complete()
+                } else {
+                    Log.e(TAG, diagnostic)
+                    fail(transportFailure(t, response))
                 }
             }
 
             override fun onClosed(eventSource: EventSource) {
-                close()
+                val terminalCompleted = completed.get()
+                val diagnostic = "stream_terminal api=chat_completions callback=onClosed " +
+                    "terminal_completed=$terminalCompleted " +
+                    "terminal_finish_reason=${sawTerminalFinishReason.get()}"
+                if (terminalCompleted) {
+                    Log.i(TAG, "$diagnostic ignored_after_terminal=true")
+                    complete()
+                } else {
+                    Log.w(TAG, diagnostic)
+                    fail(StreamInterruptedException("OpenAI chat stream closed before completion"))
+                }
             }
         }
 
         val eventSource = EventSources.createFactory(client).newEventSource(request, listener)
 
         awaitClose {
-            println("[awaitClose] 关闭eventSource ")
+            closedByCollector.set(true)
             eventSource.cancel()
         }
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
     }.buffer(Channel.UNLIMITED)
+
+    private fun isTerminalFinishReason(reason: String?): Boolean {
+        return !reason.isNullOrBlank() && !reason.equals("null", ignoreCase = true)
+    }
 
 
     private fun buildChatCompletionRequest(
@@ -593,7 +660,7 @@ class ChatCompletionsAPI(
                                             put("url", encodedImage.base64)
                                         })
                                     }.onFailure {
-                                        it.printStackTrace()
+                                        Log.w(TAG, "Failed to encode input image: ${it.javaClass.simpleName}")
                                         put("type", "text")
                                         put("text", "")
                                     }
@@ -650,7 +717,7 @@ class ChatCompletionsAPI(
                                             put("url", encodedImage.base64)
                                         })
                                     }.onFailure {
-                                        it.printStackTrace()
+                                        Log.w(TAG, "Failed to encode input image: ${it.javaClass.simpleName}")
                                         put("type", "text")
                                         put("text", "")
                                     }
@@ -699,7 +766,7 @@ class ChatCompletionsAPI(
                                         put("url", encodedImage.base64)
                                     })
                                 }.onFailure {
-                                    Log.w(TAG, "encode tool result image failed: ${part.url}", it)
+                                    Log.w(TAG, "encode tool result image failed: ${it.javaClass.simpleName}")
                                     put("type", "text")
                                     put("text", "Error: Failed to encode image to base64")
                                 }

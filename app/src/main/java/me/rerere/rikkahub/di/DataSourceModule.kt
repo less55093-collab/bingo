@@ -39,9 +39,9 @@ import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
 import me.rerere.search.SearchService
 import me.rerere.rikkahub.data.sync.S3Sync
+import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
 import retrofit2.Retrofit
@@ -207,9 +207,6 @@ val dataSourceModule = module {
             }
             .addNetworkInterceptor(RequestLoggingInterceptor())
             .addInterceptor(AIRequestInterceptor())
-            .addInterceptor(HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.HEADERS
-            })
             .build().also { SearchService.init(it, get()) }
     }
 
@@ -250,7 +247,10 @@ val dataSourceModule = module {
             settingsStore = get(),
             json = get(),
             context = get(),
-            httpClient = get()
+            httpClient = get(),
+            database = get(),
+            authTokenStore = get(),
+            credentialStore = get(),
         )
     }
 
@@ -266,6 +266,8 @@ val dataSourceModule = module {
     }
 
     single { AuthTokenStore(get()) }
+
+    single { S3CredentialStore(get()) }
 
     // Derived from the shared client to reuse its connection pool and generic headers, but kept a
     // distinct instance so the Authorization header and token refresh never touch inference traffic.

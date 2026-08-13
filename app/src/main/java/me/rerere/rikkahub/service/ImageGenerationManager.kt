@@ -3,10 +3,8 @@ package me.rerere.rikkahub.service
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -17,8 +15,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import me.rerere.ai.provider.ImageEditParams
 import me.rerere.ai.provider.ImageGenerationParams
@@ -29,6 +27,8 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
+import me.rerere.rikkahub.data.auth.AuthTokenStore
+import me.rerere.rikkahub.data.auth.PendingImageTask
 import me.rerere.rikkahub.data.db.entity.GenMediaEntity
 import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.event.AppEventBus
@@ -43,7 +43,27 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLHandshakeException
-import kotlin.coroutines.resume
+
+/**
+ * Holds an image lease across standalone-request hand-off, including an interrupted predecessor.
+ *
+ * The caller invokes this from `launch(UNDISPATCHED)`, so [GenerationProtectionManager.begin]
+ * synchronously requests the foreground service before [previous] can suspend. `withActiveLease`
+ * owns the same lease for the request itself; the outer close covers cancellation while waiting.
+ */
+internal suspend fun <T> withStandaloneImageGenerationLease(
+    protectionManager: GenerationProtectionManager,
+    previous: Job?,
+    block: suspend () -> T,
+): T {
+    val lease = protectionManager.begin(GenerationKind.IMAGE)
+    return try {
+        previous?.join()
+        protectionManager.withActiveLease(lease, block)
+    } finally {
+        withContext(NonCancellable) { lease.close() }
+    }
+}
 
 /**
  * Owns image generation so it survives the page that started it.
@@ -60,6 +80,10 @@ class ImageGenerationManager(
     private val filesManager: FilesManager,
     private val genMediaRepository: GenMediaRepository,
     private val appEventBus: AppEventBus,
+    private val authTokenStore: AuthTokenStore,
+    /** Inject the app-wide instance so chat and image tools share the same service lease. */
+    private val generationProtectionManager: GenerationProtectionManager =
+        GenerationProtectionManager(context),
 ) {
     /**
      * [prompt] is kept in state so the UI can clear the input box on submit and still show what is
@@ -88,8 +112,8 @@ class ImageGenerationManager(
     val state: StateFlow<State> = _state.asStateFlow()
 
     private var job: Job? = null
-    private val foregroundLeaseMutex = Mutex()
-    private var foregroundTaskCount = 0
+    private val recoveringTaskIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val recoveryMutex = Mutex()
 
     /**
      * Guards retry: once an image is on disk and in the gallery, retrying would duplicate it. Scoped
@@ -100,7 +124,7 @@ class ImageGenerationManager(
     }
 
     fun generate(prompt: String, size: String, numOfImages: Int) {
-        start(prompt, origin = ORIGIN_STANDALONE_GENERATE) { model, provider, traceId ->
+        start(prompt, origin = ORIGIN_STANDALONE_GENERATE) { model, provider, traceId, submitted, failed ->
             providerManager.getProviderByType(provider).generateImage(
                 provider,
                 ImageGenerationParams(
@@ -111,6 +135,8 @@ class ImageGenerationManager(
                     customHeaders = model.customHeaders,
                     customBody = model.customBodies,
                     traceId = traceId,
+                    onTaskSubmitted = submitted,
+                    onTaskFailed = failed,
                 ),
             )
         }
@@ -122,7 +148,7 @@ class ImageGenerationManager(
             sourcePaths = referenceImages.joinToString("\n"),
             editing = true,
             origin = ORIGIN_STANDALONE_EDIT,
-        ) { model, provider, traceId ->
+        ) { model, provider, traceId, submitted, failed ->
             providerManager.getProviderByType(provider).editImage(
                 provider,
                 ImageEditParams(
@@ -134,6 +160,8 @@ class ImageGenerationManager(
                     customHeaders = model.customHeaders,
                     customBody = model.customBodies,
                     traceId = traceId,
+                    onTaskSubmitted = submitted,
+                    onTaskFailed = failed,
                 ),
             )
         }
@@ -154,7 +182,7 @@ class ImageGenerationManager(
             sourcePaths = null,
             origin = ORIGIN_TOOL_GENERATE,
             traceId = traceId,
-            request = { model, provider, requestTraceId ->
+            request = { model, provider, requestTraceId, submitted, failed ->
                 providerManager.getProviderByType(provider).generateImage(
                     provider,
                     ImageGenerationParams(
@@ -165,39 +193,14 @@ class ImageGenerationManager(
                         customHeaders = model.customHeaders,
                         customBody = model.customBodies,
                         traceId = requestTraceId,
+                        onTaskSubmitted = submitted,
+                        onTaskFailed = failed,
                     ),
                 )
             },
         )
         trace(traceId, "tool_complete", "files=${files.size} elapsed_ms=${elapsedSince(startedAt)}")
         return files
-    }
-
-    /**
-     * Protects the complete chat turn that may call the image tool.
-     *
-     * The first model request has to stay alive long enough to emit `generate_image`; protecting only
-     * [generateForTool] leaves a gap where Android can suspend or abort that request in the background.
-     * The nested tool request takes a second lease, so the service cannot stop between the model
-     * response and the billable image POST.
-     */
-    suspend fun <T> withChatGenerationProtection(
-        conversationId: String,
-        block: suspend () -> T,
-    ): T {
-        val traceId = nextTraceId()
-        val startedAt = SystemClock.elapsedRealtime()
-        trace(traceId, "chat_protection_start", "conversation=$conversationId")
-        val foregroundLease = acquireForegroundLease(traceId)
-        check(foregroundLease) { "Unable to protect image generation in the background" }
-        return try {
-            block()
-        } finally {
-            withContext(NonCancellable) {
-                releaseForegroundLease(foregroundLease)
-            }
-            trace(traceId, "chat_protection_stop", "elapsed_ms=${elapsedSince(startedAt)}")
-        }
     }
 
     private fun start(
@@ -209,6 +212,8 @@ class ImageGenerationManager(
             me.rerere.ai.provider.Model,
             me.rerere.ai.provider.ProviderSetting,
             String,
+            suspend (String) -> Unit,
+            suspend (String) -> Unit,
         ) -> Flow<ImageGenerationItem>,
     ) {
         if (prompt.isBlank() || _state.value.generating) return
@@ -220,19 +225,21 @@ class ImageGenerationManager(
             startedAt = SystemClock.elapsedRealtime(),
             editing = editing,
         )
-        job = appScope.launch {
-            // 等旧请求真正断开再发新的: 否则两个请求同时在飞, 上游会各计一次费.
-            previous?.join()
+        job = appScope.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
-                generateAndPersist(
-                    prompt = prompt,
-                    sourcePaths = sourcePaths,
-                    origin = origin,
-                    request = request,
-                    onImagesChanged = { images ->
-                        _state.value = _state.value.copy(images = images)
-                    },
-                )
+                // begin() runs synchronously before previous.join() can suspend. Holding this
+                // provisional lease prevents a background transition in that hand-off window.
+                withStandaloneImageGenerationLease(generationProtectionManager, previous) {
+                    generateAndPersistWhileProtected(
+                        prompt = prompt,
+                        sourcePaths = sourcePaths,
+                        origin = origin,
+                        request = request,
+                        onImagesChanged = { images ->
+                            _state.value = _state.value.copy(images = images)
+                        },
+                    )
+                }
                 _state.value = _state.value.copy(generating = false, startedAt = 0L)
                 appEventBus.tryEmit(
                     AppEvent.ImageGenerationEnded(
@@ -245,7 +252,7 @@ class ImageGenerationManager(
                 // 用户主动取消，不通知。
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to generate image", e)
+                Log.e(TAG, "Failed to generate image: ${e.javaClass.simpleName}")
                 val message = readableError(e)
                 _state.value = _state.value.copy(generating = false, error = message, startedAt = 0L)
                 appEventBus.tryEmit(
@@ -267,6 +274,80 @@ class ImageGenerationManager(
     fun reset() {
         job?.cancel()
         _state.value = State()
+    }
+
+    /** Continues server-side tasks after Android has killed and later recreated this process. */
+    suspend fun recoverPendingTasks(): Unit = recoveryMutex.withLock {
+        val allTasks = authTokenStore.currentPendingImageTasks()
+        val tasks = allTasks.filter { System.currentTimeMillis() - it.createdAt <= PENDING_TASK_MAX_AGE_MS }
+        val expiredIds = allTasks.map { it.taskId } - tasks.map { it.taskId }.toSet()
+        expiredIds.forEach { authTokenStore.removePendingImageTask(it) }
+        if (tasks.isEmpty()) return
+
+        tasks.forEach { task ->
+            if (!recoveringTaskIds.add(task.taskId)) return@forEach
+            appScope.launch {
+                recoverPendingTask(task)
+            }
+        }
+    }
+
+    private suspend fun recoverPendingTask(task: PendingImageTask) {
+        val traceId = nextTraceId()
+        try {
+            generationProtectionManager.withProtection(GenerationKind.IMAGE) {
+                val (model, providerSetting) = resolveImageModel()
+                val provider = providerManager.getProviderByType(providerSetting)
+                val committed = Committed()
+                val files = collectInto(
+                    images = provider.resumeImageTask(
+                        providerSetting = providerSetting,
+                        taskId = task.taskId,
+                        customHeaders = model.customHeaders,
+                        traceId = traceId,
+                        onTaskFailed = { authTokenStore.removePendingImageTask(it) },
+                    ),
+                    prompt = task.prompt,
+                    modelName = task.modelName,
+                    sourcePaths = task.sourcePaths,
+                    committed = committed,
+                    traceId = traceId,
+                    attempt = 1,
+                    onImagesChanged = { images ->
+                        if (task.origin != ORIGIN_TOOL_GENERATE) {
+                            _state.value = State(
+                                generating = true,
+                                prompt = task.prompt,
+                                images = images,
+                                startedAt = SystemClock.elapsedRealtime(),
+                                editing = task.sourcePaths != null,
+                            )
+                        }
+                    },
+                )
+                authTokenStore.removePendingImageTask(task.taskId)
+                if (task.origin != ORIGIN_TOOL_GENERATE) {
+                    _state.value = _state.value.copy(generating = false, startedAt = 0L)
+                }
+                appEventBus.tryEmit(
+                    AppEvent.ImageGenerationEnded(
+                        prompt = task.prompt,
+                        imageCount = files.size,
+                        error = null,
+                    )
+                )
+                trace(traceId, "task_recovered", "task_id=${task.taskId} files=${files.size}")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to recover image task ${task.taskId}; error=${e.javaClass.simpleName}")
+            if (task.origin != ORIGIN_TOOL_GENERATE) {
+                _state.value = _state.value.copy(generating = false, startedAt = 0L)
+            }
+        } finally {
+            recoveringTaskIds.remove(task.taskId)
+        }
     }
 
     /**
@@ -294,121 +375,98 @@ class ImageGenerationManager(
             me.rerere.ai.provider.Model,
             me.rerere.ai.provider.ProviderSetting,
             String,
+            suspend (String) -> Unit,
+            suspend (String) -> Unit,
+        ) -> Flow<ImageGenerationItem>,
+        onImagesChanged: (List<GeneratedFile>) -> Unit = {},
+    ): List<File> = generationProtectionManager.withProtection(GenerationKind.IMAGE) {
+        generateAndPersistWhileProtected(
+            prompt = prompt,
+            sourcePaths = sourcePaths,
+            origin = origin,
+            traceId = traceId,
+            request = request,
+            onImagesChanged = onImagesChanged,
+        )
+    }
+
+    /** Caller holds an active image-generation lease for the complete request and persistence work. */
+    private suspend fun generateAndPersistWhileProtected(
+        prompt: String,
+        sourcePaths: String?,
+        origin: String,
+        traceId: String = nextTraceId(),
+        request: suspend (
+            me.rerere.ai.provider.Model,
+            me.rerere.ai.provider.ProviderSetting,
+            String,
+            suspend (String) -> Unit,
+            suspend (String) -> Unit,
         ) -> Flow<ImageGenerationItem>,
         onImagesChanged: (List<GeneratedFile>) -> Unit = {},
     ): List<File> {
         val startedAt = SystemClock.elapsedRealtime()
         trace(traceId, "manager_start", "origin=$origin prompt_chars=${prompt.length}")
-        val foregroundLease = acquireForegroundLease(traceId)
-        check(foregroundLease) { "Unable to protect image generation in the background" }
-        try {
-            val resolveStartedAt = SystemClock.elapsedRealtime()
-            val (model, provider) = resolveImageModel()
-            trace(
-                traceId,
-                "model_resolved",
-                "origin=$origin elapsed_ms=${elapsedSince(resolveStartedAt)} model=${model.modelId}",
-            )
-            val files = withRetry(traceId) { committed, attempt ->
-                // Retried attempts restart from scratch, so drop anything a failed attempt showed.
-                onImagesChanged(emptyList())
-                collectInto(
-                    images = request(model, provider, traceId),
+        val resolveStartedAt = SystemClock.elapsedRealtime()
+        val (model, provider) = resolveImageModel()
+        trace(
+            traceId,
+            "model_resolved",
+            "origin=$origin elapsed_ms=${elapsedSince(resolveStartedAt)} model=${model.modelId}",
+        )
+        var submittedTaskId: String? = null
+        val onTaskSubmitted: suspend (String) -> Unit = { taskId ->
+            submittedTaskId = taskId
+            authTokenStore.savePendingImageTask(
+                PendingImageTask(
+                    taskId = taskId,
                     prompt = prompt,
-                    modelName = model.displayName,
                     sourcePaths = sourcePaths,
-                    committed = committed,
-                    traceId = traceId,
-                    attempt = attempt,
-                    onImagesChanged = onImagesChanged,
+                    modelName = model.displayName,
+                    origin = origin,
                 )
-            }
-            trace(
-                traceId,
-                "manager_complete",
-                "origin=$origin files=${files.size} elapsed_ms=${elapsedSince(startedAt)}",
             )
-            return files
-        } finally {
-            withContext(NonCancellable) {
-                releaseForegroundLease(foregroundLease)
-            }
+            trace(traceId, "task_persisted", "task_id=$taskId")
         }
-    }
-
-    private suspend fun acquireForegroundLease(traceId: String): Boolean {
-        foregroundLeaseMutex.lock()
-        try {
-            if (foregroundTaskCount > 0) {
-                foregroundTaskCount++
-                return true
-            }
-            if (ImageGenerationForegroundService.startAndAwait(context)) {
-                foregroundTaskCount = 1
-                trace(traceId, "foreground_protection_active", "waited_for_foreground=false")
-                return true
-            }
-        } finally {
-            foregroundLeaseMutex.unlock()
+        val onTaskFailed: suspend (String) -> Unit = { taskId ->
+            authTokenStore.removePendingImageTask(taskId)
+            trace(traceId, "task_removed", "task_id=$taskId reason=terminal_failure")
         }
-
-        // Android can reject a foreground-service start when the model emits the tool call only
-        // after the app is already backgrounded. Do not send an unprotected billable POST.
-        trace(traceId, "foreground_protection_wait", "reason=start_rejected")
-        awaitAppForeground()
-
-        foregroundLeaseMutex.lock()
-        return try {
-            if (foregroundTaskCount > 0) {
-                foregroundTaskCount++
-                true
-            } else if (ImageGenerationForegroundService.startAndAwait(context)) {
-                foregroundTaskCount = 1
-                trace(traceId, "foreground_protection_active", "waited_for_foreground=true")
-                true
-            } else {
-                false
-            }
-        } finally {
-            foregroundLeaseMutex.unlock()
+        val files = withRetry(traceId) { committed, attempt ->
+            // Retried attempts restart from scratch, so drop anything a failed attempt showed.
+            onImagesChanged(emptyList())
+            collectInto(
+                images = request(
+                    model,
+                    provider,
+                    traceId,
+                    { taskId ->
+                        // From this point the gateway may already charge the task. A later poll
+                        // or download failure must never replay the billable POST.
+                        committed.value = true
+                        onTaskSubmitted(taskId)
+                    },
+                    onTaskFailed,
+                ),
+                prompt = prompt,
+                modelName = model.displayName,
+                sourcePaths = sourcePaths,
+                committed = committed,
+                traceId = traceId,
+                attempt = attempt,
+                onImagesChanged = onImagesChanged,
+            )
         }
-    }
-
-    private suspend fun releaseForegroundLease(acquired: Boolean) {
-        if (!acquired) return
-        foregroundLeaseMutex.lock()
-        try {
-            foregroundTaskCount--
-            if (foregroundTaskCount == 0) {
-                ImageGenerationForegroundService.stop(context)
-            }
-        } finally {
-            foregroundLeaseMutex.unlock()
+        submittedTaskId?.let { taskId ->
+            authTokenStore.removePendingImageTask(taskId)
+            trace(traceId, "task_removed", "task_id=$taskId reason=completed")
         }
-    }
-
-    private suspend fun awaitAppForeground() = withContext(Dispatchers.Main.immediate) {
-        val lifecycle = ProcessLifecycleOwner.get().lifecycle
-        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@withContext
-
-        suspendCancellableCoroutine { continuation ->
-            lateinit var observer: LifecycleEventObserver
-            observer = LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_START && continuation.isActive) {
-                    lifecycle.removeObserver(observer)
-                    continuation.resume(Unit)
-                }
-            }
-            lifecycle.addObserver(observer)
-            continuation.invokeOnCancellation {
-                lifecycle.removeObserver(observer)
-            }
-            // Covers a foreground transition between the initial check and observer registration.
-            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) && continuation.isActive) {
-                lifecycle.removeObserver(observer)
-                continuation.resume(Unit)
-            }
-        }
+        trace(
+            traceId,
+            "manager_complete",
+            "origin=$origin files=${files.size} elapsed_ms=${elapsedSince(startedAt)}",
+        )
+        return files
     }
 
     private suspend fun collectInto(
@@ -519,7 +577,10 @@ class ImageGenerationManager(
                     "attempt_failed",
                     "attempt=${attempt + 1}/$MAX_ATTEMPTS error=${e.javaClass.simpleName}",
                 )
-                Log.w(TAG, "Image request failed (attempt ${attempt + 1}/$MAX_ATTEMPTS)", e)
+                Log.w(
+                    TAG,
+                    "Image request failed (attempt ${attempt + 1}/$MAX_ATTEMPTS): ${e.javaClass.simpleName}",
+                )
                 // Re-running after a partial success would insert duplicate gallery rows.
                 if (committed.value) throw e
                 // 上游按次计费: 请求一旦发出, 重试就是再花一次钱, 哪怕响应没读回来.
@@ -561,6 +622,7 @@ class ImageGenerationManager(
         private const val ORIGIN_TOOL_GENERATE = "tool_generate"
         private const val MAX_ATTEMPTS = 3
         private const val BASE_DELAY_MS = 800L
+        private const val PENDING_TASK_MAX_AGE_MS = 24L * 60 * 60 * 1000
         private val traceSequence = AtomicInteger(0)
 
         private fun nextTraceId(): String =

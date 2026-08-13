@@ -9,6 +9,7 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -34,6 +35,7 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.ImageGenerationItem
 import me.rerere.ai.ui.MessageChunk
@@ -63,6 +65,7 @@ import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Clock
 
 private const val TAG = "ClaudeProvider"
@@ -77,6 +80,7 @@ internal sealed interface ClaudeStreamEvent {
 /** Accepts both Anthropic SSE events and compatible gateways that only put the type in JSON. */
 internal fun decodeClaudeStreamEvent(sseType: String?, data: String): ClaudeStreamEvent {
     if (data.trim() == "[DONE]") return ClaudeStreamEvent.Completed
+    if (sseType == "message_stop") return ClaudeStreamEvent.Completed
 
     val payload = json.parseToJsonElement(data).jsonObject
     val eventType = payload["type"]?.jsonPrimitive?.contentOrNull ?: sseType
@@ -91,8 +95,13 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
     private val keyRoulette = if (context != null) KeyRoulette.lru(context) else KeyRoulette.default()
     private val streamingClient = client.newBuilder()
         .connectionPool(ConnectionPool())
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        // 307/308 redirect POSTs retain their request body, so following one would be an
+        // unapproved replay of a billable generation request.
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     override suspend fun listModels(providerSetting: ProviderSetting.Claude): List<Model> =
@@ -147,11 +156,11 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
+        Log.i(TAG, "generateText: model=${params.model.modelId}")
 
         val response = client.newCall(request).await()
         if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body?.string()}")
+            throw Exception("Claude message request failed with HTTP ${response.code}")
         }
 
         val bodyStr = response.body?.string() ?: ""
@@ -184,6 +193,44 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         messages: List<UIMessage>,
         params: TextGenerationParams
     ): Flow<MessageChunk> = callbackFlow {
+        val producer = this
+        val completed = AtomicBoolean(false)
+        val closedByCollector = AtomicBoolean(false)
+
+        fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                producer.close()
+            }
+        }
+
+        fun fail(cause: Throwable) {
+            if (!completed.get() && !closedByCollector.get() && producer.isActive) {
+                producer.close(cause)
+            }
+        }
+
+        fun transportFailure(t: Throwable?, response: Response?): Throwable {
+            val bodyRaw = try {
+                response?.body?.stringSafe()
+            } catch (bodyError: Throwable) {
+                return StreamInterruptedException(
+                    "Claude stream failed before completion and its error response could not be read",
+                    t ?: bodyError,
+                )
+            }
+            if (!bodyRaw.isNullOrBlank()) {
+                return try {
+                    json.parseToJsonElement(bodyRaw).parseErrorDetail()
+                } catch (parseError: Throwable) {
+                    StreamInterruptedException(
+                        "Claude stream failed before completion and its error response was malformed",
+                        parseError,
+                    )
+                }
+            }
+            return StreamInterruptedException("Claude stream failed before completion", t)
+        }
+
         val requestBody = buildMessageRequest(providerSetting, messages, params, stream = true)
         val request = Request.Builder()
             .url("${providerSetting.baseUrl}/messages")
@@ -195,11 +242,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
-
-        requestBody["messages"]!!.jsonArray.forEach {
-            Log.i(TAG, "streamText: $it")
-        }
+        Log.i(TAG, "streamText: starting model=${params.model.modelId}")
 
         val listener = object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
@@ -212,75 +255,64 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                 type: String?,
                 data: String
             ) {
-                Log.d(TAG, "onEvent: type=$type, data=$data")
-                val dataJson = when (val event = decodeClaudeStreamEvent(type, data)) {
-                    ClaudeStreamEvent.Completed -> {
-                        Log.d(TAG, "Stream ended")
-                        close()
-                        return
+                try {
+                    Log.d(TAG, "onEvent: type=$type bytes=${data.toByteArray().size}")
+                    val dataJson = when (val event = decodeClaudeStreamEvent(type, data)) {
+                        ClaudeStreamEvent.Completed -> {
+                            complete()
+                            return
+                        }
+
+                        is ClaudeStreamEvent.Failed -> {
+                            fail(event.cause)
+                            return
+                        }
+
+                        is ClaudeStreamEvent.Payload -> event.data
                     }
 
-                    is ClaudeStreamEvent.Failed -> {
-                        close(event.cause)
-                        return
-                    }
+                    val deltaMessage = parseMessage(buildJsonArray {
+                        val contentBlockObj = dataJson["content_block"]?.jsonObject
+                        val deltaObj = dataJson["delta"]?.jsonObject
+                        if (contentBlockObj != null) {
+                            add(contentBlockObj)
+                        }
+                        if (deltaObj != null) {
+                            add(deltaObj)
+                        }
+                    })
+                    val messageChunk = MessageChunk(
+                        id = id ?: "",
+                        model = "",
+                        choices = listOf(
+                            UIMessageChoice(
+                                index = 0,
+                                delta = deltaMessage,
+                                message = null,
+                                finishReason = null,
+                            )
+                        ),
+                        usage = parseTokenUsage(dataJson),
+                    )
 
-                    is ClaudeStreamEvent.Payload -> event.data
-                }
-
-                val deltaMessage = parseMessage(buildJsonArray {
-                    val contentBlockObj = dataJson["content_block"]?.jsonObject
-                    val deltaObj = dataJson["delta"]?.jsonObject
-                    if (contentBlockObj != null) {
-                        add(contentBlockObj)
+                    producer.trySend(messageChunk).onFailure { e ->
+                        Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
                     }
-                    if (deltaObj != null) {
-                        add(deltaObj)
-                    }
-                })
-                val tokenUsage = parseTokenUsage(dataJson)
-                val messageChunk = MessageChunk(
-                    id = id ?: "",
-                    model = "",
-                    choices = listOf(
-                        UIMessageChoice(
-                            index = 0,
-                            delta = deltaMessage,
-                            message = null,
-                            finishReason = null
-                        )
-                    ),
-                    usage = tokenUsage
-                )
-
-                trySend(messageChunk).onFailure { e ->
-                    Log.w(TAG, "onEvent: chunk dropped (${e?.message})")
+                } catch (e: Throwable) {
+                    fail(StreamInterruptedException("Claude stream received an invalid event", e))
                 }
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                var exception = t
-
-                t?.printStackTrace()
-                Log.e(TAG, "onFailure: ${t?.javaClass?.name} ${t?.message} / $response")
-
-                val bodyRaw = response?.body?.stringSafe()
-                try {
-                    if (!bodyRaw.isNullOrBlank()) {
-                        val bodyElement = Json.parseToJsonElement(bodyRaw)
-                        Log.i(TAG, "Error response: $bodyElement")
-                        exception = bodyElement.parseErrorDetail()
-                    }
-                } catch (e: Throwable) {
-                    Log.w(TAG, "onFailure: failed to parse from $bodyRaw")
-                    e.printStackTrace()
-                } finally {
-                    close(exception)
-                }
+                Log.e(
+                    TAG,
+                    "onFailure: error=${t?.javaClass?.simpleName} status=${response?.code} protocol=${response?.protocol}",
+                )
+                fail(transportFailure(t, response))
             }
 
             override fun onClosed(eventSource: EventSource) {
-                close()
+                fail(StreamInterruptedException("Claude stream closed before completion"))
             }
         }
 
@@ -289,6 +321,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
 
         awaitClose {
             Log.d(TAG, "Closing eventSource")
+            closedByCollector.set(true)
             eventSource.cancel()
         }
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
@@ -514,7 +547,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                     put("data", encoded.base64)
                 })
             }.onFailure {
-                Log.w(TAG, "encode image failed: $url", it)
+                Log.w(TAG, "encode image failed: ${it.javaClass.simpleName}")
                 put("type", "text")
                 put("text", "")
             }
@@ -576,8 +609,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                 }
 
                 "redacted_thinking" -> {
-                    val data = block["data"]?.jsonPrimitiveOrNull?.contentOrNull
-                    println(data)
+                    Log.d(TAG, "Received redacted thinking block")
                 }
 
                 "tool_use" -> {

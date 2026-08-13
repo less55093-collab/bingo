@@ -20,21 +20,27 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.DisplaySetting
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
+import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.ui.theme.CustomColors
+import me.rerere.rikkahub.utils.openBackgroundGenerationSettings
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
 
 @Composable
 fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
+    val context = LocalContext.current
+    val navController = LocalNavController.current
     val settings by vm.settings.collectAsStateWithLifecycle()
     var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
 
@@ -81,6 +87,16 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                             Switch(
                                 checked = createNewConversationOnStart,
                                 onCheckedChange = { createNewConversationOnStart = it }
+                            )
+                        },
+                    )
+                    item(
+                        headlineContent = { Text(stringResource(R.string.setting_model_page_enable_suggestion)) },
+                        supportingContent = { Text(stringResource(R.string.setting_model_page_enable_suggestion_desc)) },
+                        trailingContent = {
+                            Switch(
+                                checked = settings.enableSuggestion,
+                                onCheckedChange = { vm.updateSettings(settings.copy(enableSuggestion = it)) }
                             )
                         },
                     )
@@ -253,6 +269,32 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                             }
                         )
                     }
+                }
+            }
+
+            item {
+                CardGroup(
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                ) {
+                    item(
+                        onClick = {
+                            context.openBackgroundGenerationSettings()
+                        },
+                        headlineContent = { Text(stringResource(R.string.setting_background_generation_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_background_generation_desc)) },
+                    )
+                }
+            }
+
+            item {
+                CardGroup(
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                ) {
+                    item(
+                        onClick = { navController.navigate(Screen.SettingBackup) },
+                        headlineContent = { Text(stringResource(R.string.setting_page_data_backup)) },
+                        supportingContent = { Text(stringResource(R.string.setting_page_data_backup_desc)) },
+                    )
                 }
             }
 

@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import me.rerere.rikkahub.data.model.Conversation
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.Uuid
@@ -29,6 +31,13 @@ class ConversationSession(
 
     // 处理状态（如 OCR 识别中）
     val processingStatus = MutableStateFlow<String?>(null)
+
+    // Loading the durable conversation and starting a new generation must be ordered. Without this
+    // guard, cold-start recovery can release the UI initializer and send coroutine together, and a
+    // placeholder session can overwrite the recovered history.
+    private val initializationMutex = Mutex()
+    @Volatile
+    private var initialized = false
 
     // 生成任务（内聚在 session 中）
     private val _generationJob = MutableStateFlow<Job?>(null)
@@ -73,14 +82,28 @@ class ConversationSession(
         _generationJob.value?.cancel()
         _generationJob.value = job
         job?.invokeOnCompletion {
-            _generationJob.value = null
-            if (refCount.get() <= 0) {
-                scheduleIdleCheck()
+            // A predecessor can finish after a replacement has already been installed. Its
+            // completion callback must not clear the replacement's generation state.
+            if (_generationJob.value === job) {
+                _generationJob.value = null
+                if (refCount.get() <= 0) {
+                    scheduleIdleCheck()
+                }
             }
         }
     }
 
     fun getJob(): Job? = _generationJob.value
+
+    suspend fun initializeOnce(block: suspend () -> Unit) {
+        if (initialized) return
+        initializationMutex.withLock {
+            if (!initialized) {
+                block()
+                initialized = true
+            }
+        }
+    }
 
     private fun scheduleIdleCheck() {
         idleCheckJob?.cancel()

@@ -36,6 +36,7 @@ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV3Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.InjectionPosition
@@ -44,6 +45,7 @@ import me.rerere.rikkahub.data.model.PromptInjection
 import me.rerere.rikkahub.data.model.QuickMessage
 import me.rerere.rikkahub.data.model.Tag
 import me.rerere.rikkahub.data.sync.s3.S3Config
+import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
 import me.rerere.rikkahub.ui.theme.CustomTheme
 import me.rerere.rikkahub.ui.theme.PresetThemes
 import me.rerere.rikkahub.utils.JsonInstant
@@ -64,7 +66,8 @@ private val Context.settingsStore by preferencesDataStore(
             PreferenceStoreV1Migration(),
             PreferenceStoreV2Migration(),
             PreferenceStoreV3Migration(),
-            PreferenceStoreV4Migration()
+            PreferenceStoreV4Migration(),
+            PreferenceStoreV5Migration(S3CredentialStore(context)),
         )
     }
 )
@@ -158,7 +161,7 @@ class SettingsStore(
         val SPONSOR_ALERT_DISMISSED_AT = intPreferencesKey("sponsor_alert_dismissed_at")
     }
 
-    private val dataStore = context.settingsStore
+    private val dataStore = context.applicationContext.settingsStore
 
     val settingsFlowRaw = dataStore.data
         .catch { exception ->
@@ -360,7 +363,12 @@ class SettingsStore(
             Log.w(TAG, "Cannot update dummy settings")
             return
         }
-        settingsFlow.value = settings
+        // OSS credentials are owned by S3CredentialStore. Keep the in-memory state aligned with
+        // the persisted settings so observers can never receive a caller-supplied secret.
+        val sanitizedSettings = settings.copy(
+            s3Config = settings.s3Config.copy(accessKeyId = "", secretAccessKey = ""),
+        )
+        settingsFlow.value = sanitizedSettings
         dataStore.edit { preferences ->
             preferences[THEME_ID] = settings.themeId
             preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
@@ -401,7 +409,11 @@ class SettingsStore(
 
             preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
             preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
-            preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
+            // Access keys are stored separately under noBackupFilesDir. This keeps them out of
+            // settings.preferences_pb, Android backup, and manually generated backup archives.
+            preferences[S3_CONFIG] = JsonInstant.encodeToString(
+                sanitizedSettings.s3Config
+            )
             preferences[TTS_PROVIDERS] = JsonInstant.encodeToString(settings.ttsProviders)
             settings.selectedTTSProviderId?.let {
                 preferences[SELECTED_TTS_PROVIDER] = it.toString()

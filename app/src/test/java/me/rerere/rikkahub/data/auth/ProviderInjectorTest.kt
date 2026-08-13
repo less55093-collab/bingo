@@ -35,7 +35,9 @@ class ProviderInjectorTest {
         assertEquals("sk-claude", (claude.providerOverwrite as ProviderSetting.Claude).apiKey)
 
         val image = container.models.single { it.id == BINGO_IMAGE_MODEL_ID }
-        assertEquals("sk-image", (image.providerOverwrite as ProviderSetting.OpenAI).apiKey)
+        val imageProvider = image.providerOverwrite as ProviderSetting.OpenAI
+        assertEquals("sk-image", imageProvider.apiKey)
+        assertTrue(imageProvider.useAsyncImageTasks)
     }
 
     @Test
@@ -87,5 +89,24 @@ class ProviderInjectorTest {
         }
 
         assertFalse(ProviderInjector.isUpToDate(edited, keys))
+    }
+
+    @Test
+    fun `isUpToDate rejects a stale synchronous image overwrite`() {
+        val injected = inject()
+        val container = injected.container()
+        val editedModels = container.models.map { model ->
+            val overwrite = model.providerOverwrite
+            if (overwrite is ProviderSetting.OpenAI) {
+                model.copy(providerOverwrite = overwrite.copy(useAsyncImageTasks = false))
+            } else model
+        }
+
+        assertFalse(
+            ProviderInjector.isUpToDate(
+                injected.copy(providers = listOf(container.copy(models = editedModels))),
+                keys,
+            )
+        )
     }
 }

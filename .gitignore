@@ -11,3 +11,5 @@ local.properties
 .cursor
 .history
 .kotlin
+.r2-credentials*
+.oss-credentials*

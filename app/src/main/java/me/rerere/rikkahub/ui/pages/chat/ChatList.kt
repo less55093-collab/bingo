@@ -517,7 +517,7 @@ private fun ChatListNormal(
             )
 
             // Suggestion
-            if (conversation.chatSuggestions.isNotEmpty() && !captureProgress) {
+            if (settings.enableSuggestion && conversation.chatSuggestions.isNotEmpty() && !captureProgress) {
                 ChatSuggestionsRow(
                     conversation = conversation,
                     onClickSuggestion = onClickSuggestion,

@@ -338,6 +338,7 @@ fun Route.conversationRoutes(
             val request = call.receive<RegenerateRequest>()
             val messageId = request.messageId.toUuid("message id")
 
+            chatService.initializeConversation(uuid)
             val conversation = chatService.getConversationFlow(uuid).first()
             val node = conversation.getMessageNodeByMessageId(messageId)
             val message = node?.messages?.find { it.id == messageId }

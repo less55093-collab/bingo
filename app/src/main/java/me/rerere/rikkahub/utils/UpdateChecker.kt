@@ -1,21 +1,44 @@
 package me.rerere.rikkahub.utils
 
-import android.app.DownloadManager
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
-import android.os.Environment
-import android.widget.Toast
+import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.rerere.common.http.await
 import me.rerere.rikkahub.BuildConfig
+import me.rerere.rikkahub.R
+import me.rerere.rikkahub.UPDATE_NOTIFICATION_CHANNEL_ID
+import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.sync.forBackup
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.security.MessageDigest
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * 更新检查地址, 由 app/build.gradle.kts 的 buildConfigField("UPDATE_URL") 配置.
@@ -23,9 +46,12 @@ import okhttp3.Request
  */
 private val API_URL: String = BuildConfig.UPDATE_URL
 
-class UpdateChecker(private val client: OkHttpClient) {
-    private val json = Json { ignoreUnknownKeys = true }
-
+class UpdateChecker(
+    private val client: OkHttpClient,
+    private val database: AppDatabase,
+    private val settingsStore: SettingsStore,
+    private val json: Json,
+) {
     /** 是否配置了更新源. 未配置时调用方应直接跳过更新相关的 UI. */
     val isEnabled: Boolean = API_URL.isNotBlank()
 
@@ -63,29 +89,291 @@ class UpdateChecker(private val client: OkHttpClient) {
         emit(UiState.Error(it))
     }.flowOn(Dispatchers.IO)
 
-    fun downloadUpdate(context: Context, download: UpdateDownload) {
-        runCatching {
-            val request = DownloadManager.Request(download.url.toUri()).apply {
-                // 设置下载时通知栏的标题和描述
-                setTitle(download.name)
-                setDescription("正在下载更新包...")
-                // 下载完成后通知栏可见
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                // 允许在移动网络和WiFi下下载
-                setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE)
-                // 设置文件保存路径
-                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, download.name)
-                // 允许下载的文件类型
-                setMimeType("application/vnd.android.package-archive")
-            }
-            // 获取系统的DownloadManager
-            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            dm.enqueue(request)
-            // 你可以保存返回的downloadId到本地，以便后续查询下载进度或状态
-        }.onFailure {
-            Toast.makeText(context, "Failed to update", Toast.LENGTH_SHORT).show()
-            context.openUrl(download.url) // 跳转到下载页面
+    /**
+     * Performs a verified same-package update. A backup is written before the system installer is
+     * launched, so an APK overlay update keeps live app data and a recoverable snapshot exists.
+     */
+    suspend fun downloadAndInstall(context: Context, download: UpdateDownload): Result<Unit> = runCatching {
+        ensureCanRequestPackageInstalls(context)
+        val notification = UpdateProgressNotification(context)
+        val expectedHash = download.sha256?.lowercase()?.takeIf { it.matches(SHA256_PATTERN) }
+            ?: error("更新包缺少有效的 SHA-256 校验值")
+        val apk = downloadApk(context, download.url, notification)
+        try {
+            notification.showPreparingInstall()
+            check(apk.sha256Hex() == expectedHash) { "更新包校验失败" }
+            verifyApk(context, apk)
+            createBackup(context)
+            notification.cancel()
+            launchInstaller(context, apk)
+        } catch (error: Throwable) {
+            apk.delete()
+            throw error
         }
+    }.onFailure { error ->
+        UpdateProgressNotification(context).showFailure(error.message)
+    }
+
+    fun canShowDownloadProgress(context: Context): Boolean =
+        UpdateProgressNotification(context).canShow
+
+    private suspend fun downloadApk(
+        context: Context,
+        url: String,
+        notification: UpdateProgressNotification,
+    ): File = withContext(Dispatchers.IO) {
+        val directory = File(context.cacheDir, "updates").also { it.mkdirs() }
+        val partial = File(directory, "pending.apk.part")
+        val apk = File(directory, "pending.apk")
+        partial.delete()
+        notification.showDownloadProgress(progress = null)
+        try {
+            client.newCall(Request.Builder().url(url).get().build()).await().use { response ->
+                check(response.isSuccessful) { "下载更新包失败：HTTP ${response.code}" }
+                val totalBytes = response.body.contentLength()
+                FileOutputStream(partial).use { output ->
+                    response.body.byteStream().use { input ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var downloadedBytes = 0L
+                        var lastProgress: Int? = null
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                            downloadedBytes += count
+                            val progress = calculateDownloadProgress(downloadedBytes, totalBytes)
+                            if (progress != null && progress != lastProgress) {
+                                notification.showDownloadProgress(progress)
+                                lastProgress = progress
+                            }
+                        }
+                    }
+                    output.fd.sync()
+                }
+            }
+            apk.delete()
+            check(partial.renameTo(apk)) { "无法保存更新包" }
+            apk
+        } catch (error: Throwable) {
+            partial.delete()
+            throw error
+        }
+    }
+
+    private fun verifyApk(context: Context, apk: File) {
+        val manager = context.packageManager
+        val archive = manager.getPackageArchiveInfoCompat(apk.absolutePath)
+            ?: error("更新包不是有效的 Android 安装包")
+        check(archive.packageName == context.packageName) { "更新包不属于当前应用" }
+        check(archive.versionCodeCompat() > BuildConfig.VERSION_CODE.toLong()) { "更新包版本未高于当前版本" }
+        val installed = manager.getPackageInfoCompat(context.packageName)
+        check(archive.signingHashes() == installed.signingHashes()) { "更新包签名不一致" }
+    }
+
+    private suspend fun createBackup(context: Context): File = withContext(Dispatchers.IO) {
+        DatabaseUtil.checkpoint(database)
+        val root = context.getExternalFilesDir("update-backups") ?: context.filesDir.resolve("update-backups")
+        check(root.exists() || root.mkdirs()) { "无法创建更新备份目录" }
+        val output = File(root, "before_update_${System.currentTimeMillis()}.zip")
+        check(!output.exists()) { "更新备份文件已存在" }
+        val partial = File.createTempFile("before_update_", ".zip.part", root)
+        try {
+            FileOutputStream(partial).use { fileOutput ->
+                ZipOutputStream(fileOutput).use { zip ->
+                    zip.writeText("settings.json", json.encodeToString(settingsStore.settingsFlow.value.forBackup()))
+                    context.getDatabasePath("rikka_hub").takeIf(File::isFile)?.let { zip.writeFile(it, "rikka_hub.db") }
+                    listOf("upload", "images", "skills", "fonts").forEach { name ->
+                        File(context.filesDir, name).takeIf(File::isDirectory)?.let { zip.writeDirectory(it, "$name/") }
+                    }
+                }
+                fileOutput.fd.sync()
+            }
+            check(partial.length() > 0L) { "更新备份为空" }
+            check(partial.renameTo(output)) { "无法保存更新备份" }
+        } catch (error: Throwable) {
+            partial.delete()
+            throw error
+        }
+        root.listFiles()?.filter { it.name.startsWith("before_update_") && it.extension == "zip" }
+            ?.sortedByDescending(File::lastModified)?.drop(3)?.forEach(File::delete)
+        output
+    }
+
+    private fun launchInstaller(context: Context, apk: File) {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        )
+    }
+
+    private fun ensureCanRequestPackageInstalls(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()) {
+            return
+        }
+        context.startActivity(
+            Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:${context.packageName}".toUri())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        error("请允许本应用安装更新后重试")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun PackageManager.getPackageInfoCompat(packageName: String): PackageInfo = getPackageInfo(
+        packageName,
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES,
+    )
+
+    @Suppress("DEPRECATION")
+    private fun PackageManager.getPackageArchiveInfoCompat(path: String): PackageInfo? = getPackageArchiveInfo(
+        path,
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES,
+    )
+
+    @Suppress("DEPRECATION")
+    private fun PackageInfo.versionCodeCompat(): Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) longVersionCode else versionCode.toLong()
+
+    @Suppress("DEPRECATION")
+    private fun PackageInfo.signingHashes(): Set<String> {
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            requireNotNull(signingInfo).apkContentsSigners
+        } else {
+            requireNotNull(signatures)
+        }
+        return signatures.map { MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).toHexString() }.toSet()
+    }
+
+    private fun File.sha256Hex(): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(this).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().toHexString()
+    }
+
+    private fun ByteArray.toHexString(): String = joinToString("") {
+        (it.toInt() and 0xff).toString(16).padStart(2, '0')
+    }
+
+    private fun ZipOutputStream.writeText(name: String, content: String) {
+        putNextEntry(ZipEntry(name))
+        write(content.toByteArray())
+        closeEntry()
+    }
+
+    private fun ZipOutputStream.writeFile(file: File, name: String) {
+        putNextEntry(ZipEntry(name))
+        FileInputStream(file).use { it.copyTo(this) }
+        closeEntry()
+    }
+
+    private fun ZipOutputStream.writeDirectory(directory: File, prefix: String) {
+        directory.listFiles()?.forEach { child ->
+            if (child.isDirectory) writeDirectory(child, "$prefix${child.name}/") else if (child.isFile) writeFile(child, "$prefix${child.name}")
+        }
+    }
+
+    companion object {
+        private val SHA256_PATTERN = Regex("[0-9a-f]{64}")
+    }
+}
+
+internal fun calculateDownloadProgress(downloadedBytes: Long, totalBytes: Long): Int? {
+    if (downloadedBytes < 0L || totalBytes <= 0L) return null
+    return ((downloadedBytes.toDouble() / totalBytes.toDouble()) * 100)
+        .toInt()
+        .coerceIn(0, 100)
+}
+
+private class UpdateProgressNotification(private val context: Context) {
+    private val manager = NotificationManagerCompat.from(context)
+
+    val canShow: Boolean
+        get() {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                return false
+            }
+            if (!manager.areNotificationsEnabled()) return false
+            return Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                manager.getNotificationChannel(UPDATE_NOTIFICATION_CHANNEL_ID)?.importance !=
+                NotificationManager.IMPORTANCE_NONE
+        }
+
+    fun showDownloadProgress(progress: Int?) {
+        val content = progress?.let {
+            context.getString(R.string.update_notification_progress, it)
+        } ?: context.getString(R.string.update_notification_connecting)
+        notify(
+            baseBuilder()
+                .setContentText(content)
+                .setProgress(100, progress ?: 0, progress == null)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+        )
+    }
+
+    fun showPreparingInstall() {
+        notify(
+            baseBuilder()
+                .setContentText(context.getString(R.string.update_notification_preparing))
+                .setProgress(0, 0, true)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+        )
+    }
+
+    fun showFailure(message: String?) {
+        val detail = message?.takeIf(String::isNotBlank)
+            ?: context.getString(R.string.update_card_install_failed)
+        val content = context.getString(R.string.update_notification_failed, detail)
+        notify(
+            baseBuilder()
+                .setContentText(content)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+        )
+    }
+
+    fun cancel() {
+        manager.cancel(UPDATE_NOTIFICATION_ID)
+    }
+
+    private fun baseBuilder(): NotificationCompat.Builder =
+        NotificationCompat.Builder(context, UPDATE_NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.small_icon)
+            .setContentTitle(context.getString(R.string.update_notification_title))
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .apply {
+                context.packageManager.getLaunchIntentForPackage(context.packageName)?.let { launchIntent ->
+                    setContentIntent(
+                        PendingIntent.getActivity(
+                            context,
+                            0,
+                            launchIntent,
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                        )
+                    )
+                }
+            }
+
+    @SuppressLint("MissingPermission")
+    private fun notify(builder: NotificationCompat.Builder) {
+        if (canShow) manager.notify(UPDATE_NOTIFICATION_ID, builder.build())
+    }
+
+    companion object {
+        private const val UPDATE_NOTIFICATION_ID = 2003
     }
 }
 
@@ -93,7 +381,8 @@ class UpdateChecker(private val client: OkHttpClient) {
 data class UpdateDownload(
     val name: String,
     val url: String,
-    val size: String
+    val size: String,
+    val sha256: String? = null,
 )
 
 @Serializable

@@ -11,4 +11,9 @@ sealed class UIMessageAnnotation {
         val title: String,
         val url: String
     ) : UIMessageAnnotation()
+
+    /** The stream ended before the provider confirmed a complete response. */
+    @Serializable
+    @SerialName("generation_interrupted")
+    data object GenerationInterrupted : UIMessageAnnotation()
 }

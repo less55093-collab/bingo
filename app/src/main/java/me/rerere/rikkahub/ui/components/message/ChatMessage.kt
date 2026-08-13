@@ -581,10 +581,21 @@ private fun MessagePartsBlock(
     }
 
     // Annotations (always rendered at the end)
-    if (annotations.isNotEmpty()) {
+    val citations = annotations.filterIsInstance<UIMessageAnnotation.UrlCitation>()
+    val generationInterrupted = annotations.any { it is UIMessageAnnotation.GenerationInterrupted }
+    if (generationInterrupted || citations.isNotEmpty()) {
         Column(
             modifier = Modifier.animateContentSize(),
         ) {
+            if (generationInterrupted) {
+                Text(
+                    text = stringResource(R.string.generation_interrupted),
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.extendColors.gray8.copy(alpha = 0.72f),
+                )
+            }
+            if (citations.isEmpty()) return@Column
             var expand by remember { mutableStateOf(false) }
             if (expand) {
                 ProvideTextStyle(
@@ -605,23 +616,19 @@ private fun MessagePartsBlock(
                             .padding(4.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        annotations.fastForEachIndexed { index, annotation ->
-                            when (annotation) {
-                                is UIMessageAnnotation.UrlCitation -> {
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Favicon(annotation.url, modifier = Modifier.size(20.dp))
-                                        Text(
-                                            text = buildAnnotatedString {
-                                                append("${index + 1}. ")
-                                                withLink(LinkAnnotation.Url(annotation.url)) {
-                                                    append(annotation.title.urlDecode())
-                                                }
-                                            }
-                                        )
+                        citations.fastForEachIndexed { index, annotation ->
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Favicon(annotation.url, modifier = Modifier.size(20.dp))
+                                Text(
+                                    text = buildAnnotatedString {
+                                        append("${index + 1}. ")
+                                        withLink(LinkAnnotation.Url(annotation.url)) {
+                                            append(annotation.title.urlDecode())
+                                        }
                                     }
-                                }
+                                )
                             }
                         }
                     }
@@ -632,7 +639,7 @@ private fun MessagePartsBlock(
                     expand = !expand
                 }
             ) {
-                Text(stringResource(R.string.citations_count, annotations.size))
+                Text(stringResource(R.string.citations_count, citations.size))
             }
         }
     }

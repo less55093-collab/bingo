@@ -6,6 +6,10 @@ import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.service.ChatNotificationManager
 import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.BackgroundGenerationInterruptionNotice
+import me.rerere.rikkahub.service.ConversationStreamCheckpoint
+import me.rerere.rikkahub.service.GenerationRecoveryGate
+import me.rerere.rikkahub.service.GenerationProtectionManager
 import me.rerere.rikkahub.service.ImageGenerationManager
 import me.rerere.rikkahub.utils.EmojiData
 import me.rerere.rikkahub.utils.EmojiUtils
@@ -28,7 +32,7 @@ val appModule = module {
     }
 
     single {
-        UpdateChecker(get())
+        UpdateChecker(get(), get(), get(), get())
     }
 
     single {
@@ -47,6 +51,16 @@ val appModule = module {
         SoundEffectPlayer(get())
     }
 
+    // One owner for all long-running model work. Chat and image leases must share the same
+    // foreground-service lifetime so a nested image tool cannot stop protection for its chat turn.
+    single {
+        GenerationProtectionManager(get())
+    }
+
+    single {
+        BackgroundGenerationInterruptionNotice(get())
+    }
+
     // 生成通知与业务解耦：ChatService 只发事件，通知由这里消费；
     // createdAtStart 保证进程启动即订阅，否则后台生成的事件会因无订阅者而丢失
     single(createdAtStart = true) {
@@ -55,6 +69,7 @@ val appModule = module {
             appScope = get(),
             eventBus = get(),
             settingsStore = get(),
+            generationProtectionManager = get(),
         )
     }
 
@@ -68,7 +83,17 @@ val appModule = module {
             filesManager = get(),
             genMediaRepository = get(),
             appEventBus = get(),
+            authTokenStore = get(),
+            generationProtectionManager = get(),
         )
+    }
+
+    single {
+        ConversationStreamCheckpoint(get())
+    }
+
+    single {
+        GenerationRecoveryGate()
     }
 
     single {
@@ -78,12 +103,15 @@ val appModule = module {
             appEventBus = get(),
             settingsStore = get(),
             conversationRepo = get(),
+            streamCheckpoint = get(),
+            generationRecoveryGate = get(),
+            generationProtectionManager = get(),
+            backgroundInterruptionNotice = get(),
             memoryRepository = get(),
             generationHandler = get(),
             templateTransformer = get(),
             providerManager = get(),
             localTools = get(),
-            imageGenerationManager = get(),
             mcpManager = get(),
             filesManager = get(),
             skillManager = get(),

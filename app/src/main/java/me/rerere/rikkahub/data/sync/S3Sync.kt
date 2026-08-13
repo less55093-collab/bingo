@@ -4,16 +4,20 @@ import android.content.Context
 import android.util.Log
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.files.SkillPaths
+import me.rerere.rikkahub.data.auth.AuthTokenStore
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.migration.SettingsJsonMigrator
-import me.rerere.rikkahub.data.auth.ProviderInjector
+import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.sync.s3.S3Client
 import me.rerere.rikkahub.data.sync.s3.S3Config
+import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
+import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.utils.fileSizeToString
 import java.io.File
 import java.io.FileInputStream
@@ -21,6 +25,7 @@ import java.io.FileOutputStream
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -32,44 +37,99 @@ class S3Sync(
     private val json: Json,
     private val context: Context,
     private val httpClient: HttpClient,
+    private val database: AppDatabase,
+    private val authTokenStore: AuthTokenStore,
+    private val credentialStore: S3CredentialStore,
 ) {
     private fun getS3Client(config: S3Config): S3Client {
         return S3Client(config, httpClient)
     }
 
+    private suspend fun resolvedSession(config: S3Config): S3Session {
+        val accountId = currentAccountId()
+        val credentials = credentialStore.load(accountId)
+            ?: throw IllegalStateException("S3 credentials are not configured")
+        return S3Session(
+            accountId = accountId,
+            config = config.copy(
+                accessKeyId = credentials.accessKeyId,
+                secretAccessKey = credentials.secretAccessKey,
+            ),
+        )
+    }
+
     suspend fun testS3(config: S3Config) = withContext(Dispatchers.IO) {
-        val client = getS3Client(config)
-        // Test by listing objects with max 1 result
-        client.listObjects(maxKeys = 1).getOrThrow()
+        val session = resolvedSession(config)
+        val client = getS3Client(session.config)
+        val accountPrefix = session.config.backupPrefixForAccount(session.accountId)
+        val key = "$accountPrefix/connection_test_${UUID.randomUUID()}.txt"
+        val payload = "rikkahub-oss-connection-test".toByteArray(Charsets.UTF_8)
+
+        // Listing alone does not prove that the credentials can actually back up or restore a
+        // file. Use a unique object inside the signed-in account namespace and clean it up.
+        var uploaded = false
+        var primaryFailure: Throwable? = null
+        try {
+            client.listObjects(prefix = "$accountPrefix/", maxKeys = 1).getOrThrow()
+            client.putObject(key, payload, contentType = "text/plain").getOrThrow()
+            uploaded = true
+            val downloaded = client.getObject(key).getOrThrow()
+            check(downloaded.contentEquals(payload)) { "OSS connection test returned different data" }
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            if (uploaded) {
+                runCatching { client.deleteObject(key).getOrThrow() }
+                    .onFailure { cleanupError ->
+                        if (primaryFailure == null) throw cleanupError
+                        primaryFailure.addSuppressed(cleanupError)
+                        Log.w(TAG, "testS3: Failed to clean up connection test object", cleanupError)
+                    }
+            }
+        }
         Log.i(TAG, "testS3: Connection successful")
     }
 
     suspend fun backupToS3(config: S3Config) = withContext(Dispatchers.IO) {
-        val file = prepareBackupFile(config)
-        val client = getS3Client(config)
-        val key = "rikkahub_backups/${file.name}"
+        val session = resolvedSession(config)
+        val file = prepareBackupFile(session.config)
+        try {
+            val client = getS3Client(session.config)
+            val key = session.config.backupKeyForAccount(session.accountId, file.name)
 
-        client.putObject(
-            key = key,
-            file = file,
-            contentType = "application/zip"
-        ).getOrThrow()
+            client.putObject(
+                key = key,
+                file = file,
+                contentType = "application/zip"
+            ).getOrThrow()
 
-        Log.i(TAG, "backupToS3: Uploaded ${file.name} (${file.length().fileSizeToString()})")
-
-        // Clean up temp file
-        file.delete()
+            Log.i(TAG, "backupToS3: Uploaded ${file.name} (${file.length().fileSizeToString()})")
+        } finally {
+            // Clean up the temporary archive on both success and failure.
+            file.delete()
+        }
     }
 
     suspend fun listBackupFiles(config: S3Config): List<S3BackupItem> = withContext(Dispatchers.IO) {
-        val client = getS3Client(config)
-        val result = client.listObjects(
-            prefix = "rikkahub_backups/",
-            maxKeys = 1000
-        ).getOrThrow()
+        val session = resolvedSession(config)
+        val client = getS3Client(session.config)
+        val accountPrefix = session.config.backupPrefixForAccount(session.accountId)
+        val objects = buildList {
+            var continuationToken: String? = null
+            do {
+                val result = client.listObjects(
+                    prefix = "$accountPrefix/",
+                    maxKeys = 1000,
+                    continuationToken = continuationToken,
+                ).getOrThrow()
+                addAll(result.objects)
+                continuationToken = result.nextContinuationToken
+            } while (continuationToken != null)
+        }
 
-        result.objects
-            .filter { it.key.startsWith("rikkahub_backups/backup_") && it.key.endsWith(".zip") }
+        objects
+            .filter { session.config.isBackupKeyForAccount(session.accountId, it.key) }
             .map { obj ->
                 S3BackupItem(
                     key = obj.key,
@@ -81,19 +141,21 @@ class S3Sync(
             .sortedByDescending { it.lastModified }
     }
 
-    suspend fun restoreFromS3(config: S3Config, item: S3BackupItem) = withContext(Dispatchers.IO) {
-        val client = getS3Client(config)
-        val backupFile = File(context.cacheDir, item.displayName)
+    suspend fun restoreFromS3(config: S3Config, item: S3BackupItem): Boolean = withContext(Dispatchers.IO) {
+        val session = resolvedSession(config)
+        val client = getS3Client(session.config)
+        val key = requireAccountBackupKey(session.config, session.accountId, item.key)
+        val backupFile = File.createTempFile("s3_restore_", ".zip", context.cacheDir)
 
         try {
             // Download backup file directly to file to avoid OOM
-            Log.i(TAG, "restoreFromS3: Downloading ${item.displayName}")
-            client.downloadObjectToFile(item.key, backupFile).getOrThrow()
+            Log.i(TAG, "restoreFromS3: Downloading ${backupFile.name}")
+            client.downloadObjectToFile(key, backupFile).getOrThrow()
 
             Log.i(TAG, "restoreFromS3: Downloaded ${backupFile.length().fileSizeToString()}")
 
             // Restore from backup file
-            restoreFromBackupFile(backupFile, config)
+            restoreFromBackupFile(backupFile, session.config)
         } finally {
             // Clean up temp file
             if (backupFile.exists()) {
@@ -104,9 +166,23 @@ class S3Sync(
     }
 
     suspend fun deleteS3BackupFile(config: S3Config, item: S3BackupItem) = withContext(Dispatchers.IO) {
-        val client = getS3Client(config)
-        client.deleteObject(item.key).getOrThrow()
-        Log.i(TAG, "deleteS3BackupFile: Deleted ${item.key}")
+        val session = resolvedSession(config)
+        val client = getS3Client(session.config)
+        val key = requireAccountBackupKey(session.config, session.accountId, item.key)
+        client.deleteObject(key).getOrThrow()
+        Log.i(TAG, "deleteS3BackupFile: Deleted $key")
+    }
+
+    private suspend fun currentAccountId(): Long {
+        return authTokenStore.profileFlow.first()?.id?.takeIf { it > 0 }
+            ?: throw IllegalStateException("A signed-in profile is required for S3 backup")
+    }
+
+    private fun requireAccountBackupKey(config: S3Config, accountId: Long, key: String): String {
+        require(config.isBackupKeyForAccount(accountId, key)) {
+            "Backup object is outside the signed-in account namespace"
+        }
+        return key
     }
 
     suspend fun prepareBackupFile(config: S3Config): File = withContext(Dispatchers.IO) {
@@ -125,26 +201,18 @@ class S3Sync(
                 // Keys are re-provisioned from the gateway on launch, so stripping them here keeps
                 // spendable credentials out of the user's own cloud storage.
                 content = json.encodeToString(
-                    ProviderInjector.clear(settingsStore.settingsFlow.value)
+                    settingsStore.settingsFlow.value.forBackup()
                 )
             )
 
             // Backup database files
             if (config.items.contains(S3Config.BackupItem.DATABASE)) {
+                check(DatabaseUtil.checkpoint(database)) {
+                    "Unable to checkpoint database for backup"
+                }
                 val dbFile = context.getDatabasePath("rikka_hub")
-                if (dbFile.exists()) {
-                    addFileToZip(zipOut, dbFile, "rikka_hub.db")
-                }
-
-                val walFile = File(dbFile.parentFile, "rikka_hub-wal")
-                if (walFile.exists()) {
-                    addFileToZip(zipOut, walFile, "rikka_hub-wal")
-                }
-
-                val shmFile = File(dbFile.parentFile, "rikka_hub-shm")
-                if (shmFile.exists()) {
-                    addFileToZip(zipOut, shmFile, "rikka_hub-shm")
-                }
+                check(dbFile.isFile) { "Database file does not exist" }
+                addFileToZip(zipOut, dbFile, "rikka_hub.db")
             }
 
             // Backup app files
@@ -195,83 +263,93 @@ class S3Sync(
         backupFile
     }
 
-    private suspend fun restoreFromBackupFile(backupFile: File, config: S3Config) = withContext(Dispatchers.IO) {
+    private suspend fun restoreFromBackupFile(backupFile: File, config: S3Config): Boolean = withContext(Dispatchers.IO) {
         Log.i(TAG, "restoreFromBackupFile: Starting restore from ${backupFile.absolutePath}")
 
-        ZipInputStream(FileInputStream(backupFile)).use { zipIn ->
-            var entry: ZipEntry?
-            while (zipIn.nextEntry.also { entry = it } != null) {
-                entry?.let { zipEntry ->
-                    Log.i(TAG, "restoreFromBackupFile: Processing entry ${zipEntry.name}")
+        var stagedDatabase: File? = null
+        try {
+            ZipInputStream(FileInputStream(backupFile)).use { zipIn ->
+                var entry: ZipEntry?
+                while (zipIn.nextEntry.also { entry = it } != null) {
+                    entry?.let { zipEntry ->
+                        Log.i(TAG, "restoreFromBackupFile: Processing entry ${zipEntry.name}")
 
-                    when (zipEntry.name) {
-                        "settings.json" -> {
-                            val settingsJson = zipIn.readBytes().toString(Charsets.UTF_8)
-                            Log.i(TAG, "restoreFromBackupFile: Restoring settings")
-                            try {
-                                val migratedJson = SettingsJsonMigrator.migrate(settingsJson)
-                                val settings = json.decodeFromString<Settings>(migratedJson)
-                                settingsStore.update(settings)
-                                Log.i(TAG, "restoreFromBackupFile: Settings restored successfully")
-                            } catch (e: Exception) {
-                                Log.e(TAG, "restoreFromBackupFile: Failed to restore settings", e)
-                                throw Exception("Failed to restore settings: ${e.message}")
-                            }
-                        }
-
-                        "rikka_hub.db", "rikka_hub-wal", "rikka_hub-shm" -> {
-                            if (config.items.contains(S3Config.BackupItem.DATABASE)) {
-                                val dbFile = when (zipEntry.name) {
-                                    "rikka_hub.db" -> context.getDatabasePath("rikka_hub")
-                                    "rikka_hub-wal" -> File(
-                                        context.getDatabasePath("rikka_hub").parentFile,
-                                        "rikka_hub-wal"
-                                    )
-
-                                    "rikka_hub-shm" -> File(
-                                        context.getDatabasePath("rikka_hub").parentFile,
-                                        "rikka_hub-shm"
-                                    )
-
-                                    else -> null
-                                }
-
-                                dbFile?.let { targetFile ->
-                                    Log.i(
-                                        TAG,
-                                        "restoreFromBackupFile: Restoring ${zipEntry.name} to ${targetFile.absolutePath}"
-                                    )
-                                    targetFile.parentFile?.mkdirs()
-                                    FileOutputStream(targetFile).use { outputStream ->
-                                        zipIn.copyTo(outputStream)
+                        when (zipEntry.name) {
+                            "settings.json" -> {
+                                val settingsJson = zipIn.readBytes().toString(Charsets.UTF_8)
+                                Log.i(TAG, "restoreFromBackupFile: Restoring settings")
+                                try {
+                                    val migratedJson = SettingsJsonMigrator.migrate(settingsJson)
+                                    val settings = json.decodeFromString<Settings>(migratedJson)
+                                    settingsStore.update { current ->
+                                        settings.withLocalSyncConfiguration(current)
                                     }
-                                    Log.i(
-                                        TAG,
-                                        "restoreFromBackupFile: Restored ${zipEntry.name} (${targetFile.length()} bytes)"
-                                    )
+                                    Log.i(TAG, "restoreFromBackupFile: Settings restored successfully")
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "restoreFromBackupFile: Failed to restore settings", e)
+                                    throw Exception("Failed to restore settings: ${e.message}")
                                 }
                             }
-                        }
 
-                        else -> {
-                            if (config.items.contains(S3Config.BackupItem.FILES) &&
-                                zipEntry.name.startsWith("${FileFolders.UPLOAD}/")
-                            ) {
-                                val fileName = zipEntry.name.substringAfter("${FileFolders.UPLOAD}/")
-                                if (fileName.isNotEmpty()) {
-                                    val uploadFolder = File(context.filesDir, FileFolders.UPLOAD)
-                                    if (!uploadFolder.exists()) {
-                                        uploadFolder.mkdirs()
-                                        Log.i(TAG, "restoreFromBackupFile: Created upload directory")
+                            "rikka_hub.db" -> {
+                                if (config.items.contains(S3Config.BackupItem.DATABASE)) {
+                                    check(stagedDatabase == null) { "Backup contains multiple database files" }
+                                    val databaseFile = File.createTempFile("database_restore_", ".db", context.cacheDir)
+                                    FileOutputStream(databaseFile).use { outputStream -> zipIn.copyTo(outputStream) }
+                                    stagedDatabase = databaseFile
+                                }
+                            }
+
+                            // A backup is created after checkpointing, so restoring WAL/SHM would replay
+                            // stale writes against the staged main database on the next launch.
+                            "rikka_hub-wal", "rikka_hub-shm" -> Unit
+
+                            else -> {
+                                if (config.items.contains(S3Config.BackupItem.FILES) &&
+                                    zipEntry.name.startsWith("${FileFolders.UPLOAD}/")
+                                ) {
+                                    val fileName = zipEntry.name.substringAfter("${FileFolders.UPLOAD}/")
+                                    if (fileName.isNotEmpty()) {
+                                        val uploadFolder = File(context.filesDir, FileFolders.UPLOAD)
+                                        if (!uploadFolder.exists()) {
+                                            uploadFolder.mkdirs()
+                                            Log.i(TAG, "restoreFromBackupFile: Created upload directory")
+                                        }
+
+                                        val targetFile = uploadFolder.resolve(fileName).canonicalFile
+                                        val uploadRoot = uploadFolder.canonicalFile
+                                        require(
+                                            targetFile.path.startsWith(uploadRoot.path + File.separator)
+                                        ) { "Invalid upload file path: ${zipEntry.name}" }
+                                        Log.i(
+                                            TAG,
+                                            "restoreFromBackupFile: Restoring file ${zipEntry.name} to ${targetFile.absolutePath}"
+                                        )
+
+                                        try {
+                                            FileOutputStream(targetFile).use { outputStream ->
+                                                zipIn.copyTo(outputStream)
+                                            }
+                                            Log.i(
+                                                TAG,
+                                                "restoreFromBackupFile: Restored ${zipEntry.name} (${targetFile.length()} bytes)"
+                                            )
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "restoreFromBackupFile: Failed to restore file ${zipEntry.name}", e)
+                                            throw Exception("Failed to restore file ${zipEntry.name}: ${e.message}")
+                                        }
                                     }
-
-                                    val targetFile = File(uploadFolder, fileName)
-                                    Log.i(
-                                        TAG,
-                                        "restoreFromBackupFile: Restoring file ${zipEntry.name} to ${targetFile.absolutePath}"
-                                    )
-
-                                    try {
+                                } else if (config.items.contains(S3Config.BackupItem.FILES) &&
+                                    zipEntry.name.startsWith("${FileFolders.SKILLS}/")
+                                ) {
+                                    restoreSkillEntry(zipIn, zipEntry.name)
+                                } else if (config.items.contains(S3Config.BackupItem.FILES) &&
+                                    zipEntry.name.startsWith("${FileFolders.FONTS}/")
+                                ) {
+                                    val fileName = zipEntry.name.substringAfter("${FileFolders.FONTS}/")
+                                    if (fileName.isNotEmpty() && !fileName.contains('/')) {
+                                        val fontsFolder = File(context.filesDir, FileFolders.FONTS).apply { mkdirs() }
+                                        val targetFile = File(fontsFolder, fileName)
                                         FileOutputStream(targetFile).use { outputStream ->
                                             zipIn.copyTo(outputStream)
                                         }
@@ -279,42 +357,27 @@ class S3Sync(
                                             TAG,
                                             "restoreFromBackupFile: Restored ${zipEntry.name} (${targetFile.length()} bytes)"
                                         )
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "restoreFromBackupFile: Failed to restore file ${zipEntry.name}", e)
-                                        throw Exception("Failed to restore file ${zipEntry.name}: ${e.message}")
                                     }
+                                } else {
+                                    Log.i(TAG, "restoreFromBackupFile: Skipping entry ${zipEntry.name}")
                                 }
-                            } else if (config.items.contains(S3Config.BackupItem.FILES) &&
-                                zipEntry.name.startsWith("${FileFolders.SKILLS}/")
-                            ) {
-                                restoreSkillEntry(zipIn, zipEntry.name)
-                            } else if (config.items.contains(S3Config.BackupItem.FILES) &&
-                                zipEntry.name.startsWith("${FileFolders.FONTS}/")
-                            ) {
-                                val fileName = zipEntry.name.substringAfter("${FileFolders.FONTS}/")
-                                if (fileName.isNotEmpty() && !fileName.contains('/')) {
-                                    val fontsFolder = File(context.filesDir, FileFolders.FONTS).apply { mkdirs() }
-                                    val targetFile = File(fontsFolder, fileName)
-                                    FileOutputStream(targetFile).use { outputStream ->
-                                        zipIn.copyTo(outputStream)
-                                    }
-                                    Log.i(
-                                        TAG,
-                                        "restoreFromBackupFile: Restored ${zipEntry.name} (${targetFile.length()} bytes)"
-                                    )
-                                }
-                            } else {
-                                Log.i(TAG, "restoreFromBackupFile: Skipping entry ${zipEntry.name}")
                             }
                         }
-                    }
 
-                    zipIn.closeEntry()
+                        zipIn.closeEntry()
+                    }
                 }
             }
-        }
 
-        Log.i(TAG, "restoreFromBackupFile: Restore completed successfully")
+            stagedDatabase?.let { databaseFile ->
+                DatabaseRestoreCoordinator.stage(context, databaseFile)
+                Log.i(TAG, "restoreFromBackupFile: Staged database for next app start")
+            }
+            Log.i(TAG, "restoreFromBackupFile: Restore completed successfully")
+            stagedDatabase != null
+        } finally {
+            stagedDatabase?.delete()
+        }
     }
 
     private fun addFileToZip(zipOut: ZipOutputStream, file: File, entryName: String) {
@@ -392,4 +455,9 @@ data class S3BackupItem(
     val displayName: String,
     val size: Long,
     val lastModified: Instant,
+)
+
+private data class S3Session(
+    val accountId: Long,
+    val config: S3Config,
 )

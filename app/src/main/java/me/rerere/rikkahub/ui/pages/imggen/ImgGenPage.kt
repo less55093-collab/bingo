@@ -343,6 +343,15 @@ private fun InputBar(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    fun submitGeneration() {
+        if (referenceImages.isEmpty()) {
+            vm.generateImage()
+        } else {
+            vm.editImage()
+        }
+    }
+
     val imagePickerLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selectedUris ->
             if (selectedUris.isNotEmpty()) {
@@ -429,11 +438,7 @@ private fun InputBar(
             Surface(
                 onClick = {
                     if (!isGenerating) {
-                        if (referenceImages.isEmpty()) {
-                            vm.generateImage()
-                        } else {
-                            vm.editImage()
-                        }
+                        submitGeneration()
                     } else {
                         vm.cancelGeneration()
                     }

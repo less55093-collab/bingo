@@ -65,7 +65,7 @@ fun LoginPage(vm: AuthVM = koinViewModel()) {
             enabled = state.canSubmitLogin,
         ) {
             if (state.submitting) {
-                SubmitProgress(modifier = Modifier.height(24.dp))
+                SubmitProgress()
             } else {
                 Text(
                     text = stringResource(R.string.auth_login_title),

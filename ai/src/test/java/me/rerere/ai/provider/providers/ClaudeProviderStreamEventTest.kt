@@ -20,6 +20,13 @@ class ClaudeProviderStreamEventTest {
     }
 
     @Test
+    fun `event header message stop completes stream without a json type`() {
+        val event = decodeClaudeStreamEvent("message_stop", "{}")
+
+        assertSame(ClaudeStreamEvent.Completed, event)
+    }
+
+    @Test
     fun `json-only error fails stream with upstream message`() {
         val event = decodeClaudeStreamEvent(
             sseType = null,

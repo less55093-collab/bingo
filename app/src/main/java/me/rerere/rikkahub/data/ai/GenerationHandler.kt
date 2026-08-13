@@ -97,7 +97,7 @@ class GenerationHandler(
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
             val toolsInternal = buildList {
-                Log.i(TAG, "generateInternal: build tools($assistant)")
+                Log.i(TAG, "generateInternal: build tools for assistant=${assistant.id}")
                 if (assistant?.enableMemory == true) {
                     val memoryAssistantId = if (assistant.useGlobalMemory) {
                         MemoryRepository.GLOBAL_MEMORY_ID
@@ -180,10 +180,12 @@ class GenerationHandler(
                     assistant = assistant,
                     settings = settings
                 )
-                messages = messages.slice(0 until messages.lastIndex) + messages.last().copy(
-                    finishedAt = Clock.System.now()
-                        .toLocalDateTime(TimeZone.currentSystemDefault())
-                )
+                messages = messages.slice(0 until messages.lastIndex) + messages.last()
+                    .copy(
+                        finishedAt = Clock.System.now()
+                            .toLocalDateTime(TimeZone.currentSystemDefault())
+                    )
+                    .finishReasoning()
                 emit(GenerationChunk.Messages(messages))
 
                 val tools = messages.last().getTools().filter { !it.isExecuted }
@@ -429,14 +431,20 @@ class GenerationHandler(
                 }.getOrElse {
                     error("Invalid tool arguments JSON for ${tool.toolName}: ${it.message}")
                 }
-                Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
+                Log.i(
+                    TAG,
+                    "generateText: executing tool=${toolDef.name} inputBytes=${tool.input.toByteArray().size}"
+                )
                 val result = toolDef.execute(args)
                 val hasShellAccess = toolsInternal.any { it.name == "workspace_shell" }
                 tool.copy(output = maybeTruncateToolOutput(tool.toolCallId, result, hasShellAccess))
             }.getOrElse {
                 // 取消必须向上传播，否则停止生成会被误报为工具执行错误
                 if (it is CancellationException) throw it
-                it.printStackTrace()
+                Log.w(
+                    TAG,
+                    "generateText: tool=${tool.toolName} failed error=${it.javaClass.simpleName}"
+                )
                 tool.copy(
                     output = listOf(
                         UIMessagePart.Text(

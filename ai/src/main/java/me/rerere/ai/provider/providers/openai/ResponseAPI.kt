@@ -7,6 +7,7 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArrayBuilder
 import kotlinx.serialization.json.JsonObject
@@ -29,6 +30,7 @@ import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -61,6 +63,7 @@ import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Clock
 
 private const val TAG = "ResponseAPI"
@@ -92,15 +95,15 @@ class ResponseAPI(
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
+        Log.i(TAG, "generateText: model=${params.model.modelId}")
 
         val response = client.newCall(request).await()
         if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body.string()}")
+            throw Exception("OpenAI response request failed with HTTP ${response.code}")
         }
 
         val bodyStr = response.body?.string() ?: ""
-        Log.i(TAG, "generateText: $bodyStr")
+        Log.i(TAG, "generateText: responseBytes=${bodyStr.toByteArray().size}")
         val bodyJson = json.parseToJsonElement(bodyStr).jsonObject
         val output = parseResponseOutput(bodyJson)
 
@@ -112,6 +115,63 @@ class ResponseAPI(
         messages: List<UIMessage>,
         params: TextGenerationParams
     ): Flow<MessageChunk> = callbackFlow {
+        val producer = this
+        val completed = AtomicBoolean(false)
+        val closedByCollector = AtomicBoolean(false)
+
+        fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                producer.close()
+            }
+        }
+
+        fun fail(cause: Throwable) {
+            if (!completed.get() && !closedByCollector.get() && producer.isActive) {
+                producer.close(cause)
+            }
+        }
+
+        fun transportFailure(t: Throwable?, response: Response?): Throwable {
+            val bodyRaw = try {
+                response?.body?.stringSafe()
+            } catch (bodyError: Throwable) {
+                return StreamInterruptedException(
+                    "OpenAI response stream failed before completion and its error response could not be read",
+                    t ?: bodyError,
+                )
+            }
+            if (!bodyRaw.isNullOrBlank()) {
+                return try {
+                    json.parseToJsonElement(bodyRaw).parseErrorDetail()
+                } catch (parseError: Throwable) {
+                    StreamInterruptedException(
+                        "OpenAI response stream failed before completion and its error response was malformed",
+                        parseError,
+                    )
+                }
+            }
+            return StreamInterruptedException("OpenAI response stream failed before completion", t)
+        }
+
+        fun responseEventFailure(payload: JsonObject, sseType: String?): Throwable? {
+            val eventType = payload["type"]?.jsonPrimitive?.contentOrNull ?: sseType
+            if (eventType !in setOf(
+                    "error",
+                    "response.cancelled",
+                    "response.failed",
+                    "response.incomplete",
+                    "response.error",
+                )
+            ) {
+                return null
+            }
+            val detail = payload["error"]
+                ?: payload["response"]?.jsonObject?.get("error")
+                ?: payload["response"]?.jsonObject?.get("incomplete_details")
+                ?: payload
+            return detail.parseErrorDetail()
+        }
+
         val requestBody = buildRequestBody(
             providerSetting = providerSetting,
             messages = messages,
@@ -129,56 +189,80 @@ class ResponseAPI(
             .configureReferHeaders(providerSetting.baseUrl)
             .build()
 
-        Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
+        Log.i(TAG, "streamText: starting model=${params.model.modelId}")
 
         val listener = object : EventSourceListener() {
+            override fun onOpen(eventSource: EventSource, response: Response) {
+                Log.i(
+                    TAG,
+                    "stream_open api=responses status=${response.code} protocol=${response.protocol}",
+                )
+            }
+
             override fun onEvent(
                 eventSource: EventSource,
                 id: String?,
                 type: String?,
                 data: String
             ) {
-                if (data == "[DONE]") {
-                    close()
+                if (data.trim() == "[DONE]") {
+                    complete()
                     return
                 }
-                Log.d(TAG, "onEvent: $id/$type $data")
-                val json = json.parseToJsonElement(data).jsonObject
-                val chunk = parseResponseDelta(json)
-                if (chunk != null) {
-                    trySend(chunk).onFailure { e ->
-                        Log.w(TAG, "onEvent: chunk dropped (${e?.message})")
+
+                try {
+                    Log.d(TAG, "onEvent: type=$type bytes=${data.toByteArray().size}")
+                    val payload = json.parseToJsonElement(data).jsonObject
+                    val eventType = payload["type"]?.jsonPrimitive?.contentOrNull ?: type
+                    responseEventFailure(payload, eventType)?.let {
+                        fail(it)
+                        return
                     }
-                }
-                if (type == "response.completed") {
-                    close()
+
+                    // Some compatible gateways only put the terminal type in the SSE event name.
+                    if (eventType == "response.completed") {
+                        if (payload["type"] != null) {
+                            parseResponseDelta(payload)?.let { chunk ->
+                                producer.trySend(chunk).onFailure { e ->
+                                    Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
+                                }
+                            }
+                        }
+                        complete()
+                        return
+                    }
+
+                    val chunk = parseResponseDelta(payload)
+                    if (chunk != null) {
+                        producer.trySend(chunk).onFailure { e ->
+                            Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    fail(StreamInterruptedException("OpenAI response stream received an invalid event", e))
                 }
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                var exception = t
-
-                t?.printStackTrace()
-                println("[onFailure] 发生错误: ${t?.javaClass?.name} ${t?.message} / $response")
-
-                val bodyRaw = response?.body?.stringSafe()
-                try {
-                    if (!bodyRaw.isNullOrBlank()) {
-                        val bodyElement = Json.parseToJsonElement(bodyRaw)
-                        println(bodyElement)
-                        exception = bodyElement.parseErrorDetail()
-                        Log.i(TAG, "onFailure: $exception")
-                    }
-                } catch (e: Throwable) {
-                    Log.w(TAG, "onFailure: failed to parse from $bodyRaw")
-                    e.printStackTrace()
-                } finally {
-                    close(exception)
+                val terminalCompleted = completed.get()
+                val diagnostic = "stream_terminal api=responses callback=onFailure " +
+                    "error=${t?.javaClass?.simpleName} status=${response?.code} " +
+                    "protocol=${response?.protocol} terminal_completed=$terminalCompleted"
+                if (terminalCompleted) {
+                    Log.i(TAG, "$diagnostic ignored_after_terminal=true")
+                } else {
+                    Log.e(TAG, diagnostic)
+                    fail(transportFailure(t, response))
                 }
             }
 
             override fun onClosed(eventSource: EventSource) {
-                close()
+                if (completed.get()) {
+                    Log.i(TAG, "stream_terminal api=responses callback=onClosed terminal_completed=true ignored_after_terminal=true")
+                } else {
+                    Log.w(TAG, "stream_terminal api=responses callback=onClosed terminal_completed=false")
+                    fail(StreamInterruptedException("OpenAI response stream closed before completion"))
+                }
             }
         }
 
@@ -186,7 +270,7 @@ class ResponseAPI(
             .newEventSource(request, listener)
 
         awaitClose {
-            println("[awaitClose] 关闭eventSource ")
+            closedByCollector.set(true)
             eventSource.cancel()
         }
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
@@ -379,7 +463,7 @@ class ResponseAPI(
                                                     put("type", "input_image")
                                                     put("image_url", encoded.base64)
                                                 }.onFailure {
-                                                    it.printStackTrace()
+                                                    Log.w(TAG, "Failed to encode input image: ${it.javaClass.simpleName}")
                                                     put("type", "input_text")
                                                     put("text", "Error: Failed to encode image to base64")
                                                 }
@@ -443,7 +527,7 @@ class ResponseAPI(
                                         put("type", "input_image")
                                         put("image_url", encodedImage.base64)
                                     }.onFailure {
-                                        it.printStackTrace()
+                                        Log.w(TAG, "Failed to encode input image: ${it.javaClass.simpleName}")
                                         put("type", "input_text")
                                         put("text", "Error: Failed to encode image to base64")
                                     }
@@ -674,7 +758,6 @@ class ResponseAPI(
     }
 
     private fun parseResponseOutput(jsonObject: JsonObject): MessageChunk {
-        println(jsonObject)
         val outputs = jsonObject["output"]?.jsonArray ?: error("output not found")
         val parts = arrayListOf<UIMessagePart>()
 

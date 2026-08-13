@@ -198,7 +198,7 @@
   <string name="backup_page_reminder_no_record">未记录备份时间</string>
   <string name="backup_page_reminder_title">备份提醒</string>
   <string name="backup_page_restart_app">重启应用</string>
-  <string name="backup_page_restart_desc">应用需要重启以使设置生效。</string>
+  <string name="backup_page_restart_desc">应用需要重启以使恢复的数据生效。</string>
   <string name="backup_page_restore">恢复</string>
   <string name="backup_page_restore_failed">恢复失败: %s</string>
   <string name="backup_page_restore_now">恢复</string>
@@ -306,6 +306,7 @@
   <string name="chat_size_dialog_content">当前消息数：%1$d。这可能导致应用崩溃或卡顿，甚至丢失本次对话数据。请尽快新建对话以继续聊天。</string>
   <string name="chat_size_dialog_title">此对话数据过大</string>
   <string name="citations_count">%1$d 条引用</string>
+  <string name="generation_interrupted">生成已中断，已保留已生成内容</string>
   <string name="code_block_collapse">折叠</string>
   <string name="code_block_copy">复制代码</string>
   <string name="code_block_expand">展开</string>
@@ -398,6 +399,16 @@
   <string name="imggen_page_delete">删除</string>
   <string name="imggen_page_gallery">相册</string>
   <string name="imggen_page_generate_image">生成图片</string>
+  <string name="setting_background_generation_title">允许后台持续生成</string>
+  <string name="setting_background_generation_desc">打开应用信息，进入耗电管理后选择“完全允许后台行为”。部分设备的系统优化会中断尚未开始输出的回复。</string>
+  <string name="background_generation_interrupted_dialog_title">后台生成已中断</string>
+  <string name="background_generation_interrupted_dialog_message">已保留已生成内容。设备的后台优化可能中断流式回复；如经常发生，可在耗电管理中选择“完全允许后台行为”。</string>
+  <string name="background_generation_interrupted_dialog_settings">打开耗电管理</string>
+  <string name="background_generation_interrupted_dialog_not_now">暂不设置</string>
+  <string name="background_generation_first_message_dialog_title">允许后台持续生成</string>
+  <string name="background_generation_first_message_dialog_message">为避免切到后台后回复被系统中断，请在应用信息中进入耗电管理，关闭后台优化或选择“完全允许后台行为”。</string>
+  <string name="background_generation_first_message_dialog_settings">打开应用信息</string>
+  <string name="background_generation_first_message_dialog_not_now">暂不设置</string>
   <string name="imggen_page_generation_count">生成数量</string>
   <string name="imggen_page_generation_count_desc">每次生成的图片数量</string>
   <string name="imggen_page_image_saved_success">图片已保存到相册</string>
@@ -440,6 +451,7 @@
   <string name="notification_channel_chat_completed">聊天完成</string>
   <string name="notification_channel_chat_live_update">聊天生成进度</string>
   <string name="notification_channel_image_generation">后台生成任务</string>
+  <string name="notification_channel_app_update">应用更新</string>
   <string name="notification_channel_web_server">Web服务器</string>
   <string name="notification_live_update_chip_thinking">思考中</string>
   <string name="notification_live_update_chip_tool">工具</string>
@@ -1121,7 +1133,14 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="unpin_chat">取消置顶聊天</string>
   <string name="update_card_close">关闭</string>
   <string name="update_card_downloading">正在下载，请在状态栏查看进度</string>
+  <string name="update_card_downloading_without_notification">正在下载更新包；通知未开启，状态栏不会显示进度</string>
+  <string name="update_card_install_failed">更新安装失败</string>
   <string name="update_card_new_version_found">发现新版本 %s</string>
+  <string name="update_notification_title">正在更新 Bingo</string>
+  <string name="update_notification_connecting">正在连接下载服务器</string>
+  <string name="update_notification_progress">已下载 %1$d%%</string>
+  <string name="update_notification_preparing">下载完成，正在校验并备份数据</string>
+  <string name="update_notification_failed">更新失败：%1$s</string>
   <string name="upload_file">上传文件</string>
   <string name="use_web_search">网络搜索</string>
   <string name="user_default_name">用户</string>
@@ -1157,6 +1176,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="setting_model_page_fast_model">快速模型</string>
   <string name="setting_model_page_fast_model_desc">用于快速或后台任务的模型，当未设置时也用作标题和建议模型的后备</string>
   <string name="setting_model_page_enable_suggestion">启用聊天建议</string>
+  <string name="setting_model_page_enable_suggestion_desc">在回复下方显示可直接发送的建议内容</string>
   <string name="assistant_page_gradient_background">渐变背景</string>
   <string name="assistant_page_gradient_background_desc">在聊天页面使用动态渐变背景</string>
   <string name="assistant_page_workspace">工作区</string>

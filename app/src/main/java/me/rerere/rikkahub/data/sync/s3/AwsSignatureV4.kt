@@ -32,6 +32,7 @@ internal object AwsSignatureV4 {
         contentLength: Long? = null,
         contentType: String? = null,
     ): SignedRequest {
+        config.requireSecureEndpoint()
         val now = ZonedDateTime.now(ZoneOffset.UTC)
         val dateStamp = now.format(dateFormatter)
         val amzDate = now.format(timestampFormatter)
@@ -115,7 +116,8 @@ internal object AwsSignatureV4 {
                     else -> "${config.bucket}.$host"
                 }
             )
-            append(canonicalUri)
+            // The canonical request and the actual URL must use the same encoded path.
+            append(canonicalUri.urlEncodePath())
             if (canonicalQueryString.isNotEmpty()) {
                 append("?$canonicalQueryString")
             }

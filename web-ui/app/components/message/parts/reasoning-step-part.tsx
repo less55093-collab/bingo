@@ -46,13 +46,15 @@ export function ReasoningStepPart({ reasoning, collapsedAdaptiveWidth = false, i
   const [expandState, setExpandState] = React.useState<ReasoningCardState>(
     ReasoningCardState.Collapsed,
   );
+  const initiallyLoadingRef = React.useRef(loading);
+  const userCollapsedRef = React.useRef(false);
   const contentRef = React.useRef<HTMLDivElement>(null);
   const thinkingTitle = React.useMemo(() => extractThinkingTitle(reasoning.reasoning), [reasoning.reasoning]);
   const showThinkingTitle = loading && thinkingTitle != null;
 
   React.useEffect(() => {
     if (loading) {
-      if (displaySetting?.showThinkingContent) {
+      if (displaySetting?.showThinkingContent && !userCollapsedRef.current) {
         setExpandState((state) =>
           state === ReasoningCardState.Collapsed ? ReasoningCardState.Preview : state,
         );
@@ -60,13 +62,14 @@ export function ReasoningStepPart({ reasoning, collapsedAdaptiveWidth = false, i
       return;
     }
 
-    setExpandState((state) => {
-      if (state === ReasoningCardState.Collapsed) return state;
-      return (displaySetting?.autoCloseThinking ?? true)
-        ? ReasoningCardState.Collapsed
-        : ReasoningCardState.Expanded;
-    });
-  }, [loading, reasoning.reasoning, displaySetting?.showThinkingContent, displaySetting?.autoCloseThinking]);
+    if (initiallyLoadingRef.current) {
+      setExpandState(
+        (displaySetting?.autoCloseThinking ?? true) || userCollapsedRef.current
+          ? ReasoningCardState.Collapsed
+          : ReasoningCardState.Expanded,
+      );
+    }
+  }, [loading, displaySetting?.showThinkingContent, displaySetting?.autoCloseThinking]);
 
   React.useEffect(() => {
     if (loading && expandState === ReasoningCardState.Preview && contentRef.current) {
@@ -75,11 +78,7 @@ export function ReasoningStepPart({ reasoning, collapsedAdaptiveWidth = false, i
   }, [loading, expandState, reasoning.reasoning]);
 
   const onExpandedChange = (nextExpanded: boolean) => {
-    if (loading) {
-      setExpandState(nextExpanded ? ReasoningCardState.Expanded : ReasoningCardState.Preview);
-      return;
-    }
-
+    userCollapsedRef.current = !nextExpanded;
     setExpandState(nextExpanded ? ReasoningCardState.Expanded : ReasoningCardState.Collapsed);
   };
 

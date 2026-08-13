@@ -19,16 +19,30 @@ sealed class AppEvent {
         val conversationId: Uuid,
         val lastMessage: UIMessage,
         val senderName: String,
+        val runToken: Long,
     ) : AppEvent()
 
+    /** The terminal result of one chat generation attempt. */
+    enum class ChatGenerationResult {
+        /** The provider sent its protocol-level completion event. */
+        COMPLETED,
+
+        /** The stream or local foreground protection ended unexpectedly. */
+        INTERRUPTED,
+
+        /** The user explicitly stopped the generation. */
+        CANCELLED,
+    }
+
     /**
-     * 聊天生成结束（完成、失败或取消）。
-     * [contentPreview] 为 null 时仅取消 Live Update 通知，不发送完成通知。
+     * 聊天生成结束。只有 [ChatGenerationResult.COMPLETED] 可产生完成通知或后续生成。
+     * 中断和取消仍会清理 Live Update 通知，但不得被当作模型成功回复。
      */
     data class ChatGenerationEnded(
         val conversationId: Uuid,
         val senderName: String,
-        val contentPreview: String?,
+        val result: ChatGenerationResult,
+        val contentPreview: String? = null,
     ) : AppEvent()
 
     /**
