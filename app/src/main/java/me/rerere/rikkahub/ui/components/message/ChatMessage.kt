@@ -321,15 +321,16 @@ private fun MessagePartsBlock(
                     val isReasoningOnlyBlock = block.steps.fastAll { it is ThinkingStep.ReasoningStep }
                     ChainOfThought(
                         modifier = Modifier.animateContentSize(),
-                        steps = block.steps,
+                        steps = block.steps.withIndex().toList(),
                         collapsedAdaptiveWidth = isReasoningOnlyBlock,
                         cardColors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = settings.displaySetting.bubbleOpacity),
                         ),
-                    ) { step ->
+                    ) { indexedStep ->
+                        val step = indexedStep.value
                         when (step) {
                             is ThinkingStep.ReasoningStep -> {
-                                key(step.reasoning.createdAt) {
+                                key(indexedStep.index) {
                                     ChatMessageReasoningStep(
                                         reasoning = step.reasoning,
                                         model = model,

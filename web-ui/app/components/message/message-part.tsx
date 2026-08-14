@@ -131,7 +131,7 @@ export const MessageParts = React.memo(({
               steps={block.steps}
               renderStep={(step, stepIndex, { isFirst, isLast }) => {
                 if (step.type === "reasoning") {
-                  const stepKey = step.reasoning.createdAt ?? `${blockIndex}-${stepIndex}`;
+                  const stepKey = `${blockIndex}-reasoning-${stepIndex}`;
                   return (
                     <ReasoningStepPart
                       key={stepKey}
