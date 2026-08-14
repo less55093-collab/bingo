@@ -1,6 +1,8 @@
 package me.rerere.ai.ui
 
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -8,6 +10,51 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MessageTest {
+
+    private fun toolChunk(id: String = "", name: String = "", input: String = "") = MessageChunk(
+        id = "test",
+        model = "test-model",
+        choices = listOf(
+            UIMessageChoice(
+                index = 0,
+                delta = UIMessage(
+                    role = MessageRole.ASSISTANT,
+                    parts = listOf(UIMessagePart.Tool(id, name, input))
+                ),
+                message = null,
+                finishReason = null,
+            )
+        ),
+    )
+
+    @Test
+    fun `tool call should promote pending chunk when id arrives later`() {
+        var message = UIMessage(role = MessageRole.ASSISTANT, parts = emptyList())
+
+        message += toolChunk(name = "search_web", input = "{\"query\":\"七")
+        message += toolChunk(id = "call-1", input = "政四余\"}")
+
+        val tools = message.getTools()
+        assertEquals(1, tools.size)
+        assertEquals("call-1", tools.single().toolCallId)
+        assertEquals("search_web", tools.single().toolName)
+        assertEquals("七政四余", tools.single().inputAsJson().jsonObject["query"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `tool call should preserve chinese input when id arrives first`() {
+        var message = UIMessage(role = MessageRole.ASSISTANT, parts = emptyList())
+
+        message += toolChunk(id = "call-1", name = "search_web", input = "{\"query\":\"")
+        "七政四余".forEach { character ->
+            message += toolChunk(input = character.toString())
+        }
+        message += toolChunk(input = "\"}")
+
+        val tools = message.getTools()
+        assertEquals(1, tools.size)
+        assertEquals("七政四余", tools.single().inputAsJson().jsonObject["query"]?.jsonPrimitive?.content)
+    }
 
     // ==================== limitContext Tests ====================
 

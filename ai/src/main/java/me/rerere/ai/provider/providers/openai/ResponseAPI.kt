@@ -118,6 +118,7 @@ class ResponseAPI(
         val producer = this
         val completed = AtomicBoolean(false)
         val closedByCollector = AtomicBoolean(false)
+        val functionCallsWithArgumentDeltas = mutableSetOf<String>()
 
         fun complete() {
             if (completed.compareAndSet(false, true)) {
@@ -217,6 +218,17 @@ class ResponseAPI(
                     responseEventFailure(payload, eventType)?.let {
                         fail(it)
                         return
+                    }
+
+                    if (eventType == "response.function_call_arguments.delta") {
+                        payload["item_id"]?.jsonPrimitive?.contentOrNull?.let {
+                            functionCallsWithArgumentDeltas += it
+                        }
+                    } else if (eventType == "response.function_call_arguments.done") {
+                        val itemId = payload["item_id"]?.jsonPrimitive?.contentOrNull
+                        if (itemId in functionCallsWithArgumentDeltas) {
+                            return
+                        }
                     }
 
                     // Some compatible gateways only put the terminal type in the SSE event name.
@@ -713,6 +725,35 @@ class ResponseAPI(
                         )
                     )
                 }
+            }
+
+            "response.function_call_arguments.delta" -> {
+                val toolCallId =
+                    jsonObject["item_id"]?.jsonPrimitive?.content ?: error("item_id not found")
+                val argumentsDelta =
+                    jsonObject["delta"]?.jsonPrimitive?.content ?: error("delta not found")
+                return MessageChunk(
+                    id = toolCallId,
+                    model = "",
+                    choices = listOf(
+                        UIMessageChoice(
+                            index = 0,
+                            delta = UIMessage(
+                                role = MessageRole.ASSISTANT,
+                                parts = listOf(
+                                    UIMessagePart.Tool(
+                                        toolCallId = toolCallId,
+                                        toolName = "",
+                                        input = argumentsDelta,
+                                        output = emptyList()
+                                    )
+                                )
+                            ),
+                            message = null,
+                            finishReason = null
+                        )
+                    ),
+                )
             }
 
             "response.function_call_arguments.done" -> {

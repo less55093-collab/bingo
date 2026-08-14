@@ -160,7 +160,7 @@ sealed class UIMessagePart {
 
         fun merge(other: Tool): Tool {
             return Tool(
-                toolCallId = toolCallId,
+                toolCallId = other.toolCallId.ifBlank { toolCallId },
                 toolName = toolName + other.toolName,
                 input = input + other.input,
                 output = output + other.output,

@@ -110,12 +110,23 @@ data class UIMessage(
                                 acc + deltaPart.copy()
                             }
                         } else {
-                            // Has ID - find and update by ID, or insert new
+                            // Some compatible APIs stream name/arguments before the call ID.
+                            // Promote that pending Tool once its ID arrives instead of creating
+                            // a second, incomplete call that could be executed on its own.
                             val existsPart = acc.find {
                                 it is UIMessagePart.Tool && it.toolCallId == deltaPart.toolCallId
                             } as? UIMessagePart.Tool
                             if (existsPart == null) {
-                                acc + deltaPart.copy()
+                                val pendingPart = acc.lastOrNull {
+                                    it is UIMessagePart.Tool && it.toolCallId.isBlank()
+                                } as? UIMessagePart.Tool
+                                if (pendingPart == null) {
+                                    acc + deltaPart.copy()
+                                } else {
+                                    acc.map { part ->
+                                        if (part === pendingPart) part.merge(deltaPart) else part
+                                    }
+                                }
                             } else {
                                 acc.map { part ->
                                     if (part is UIMessagePart.Tool && part.toolCallId == deltaPart.toolCallId) {

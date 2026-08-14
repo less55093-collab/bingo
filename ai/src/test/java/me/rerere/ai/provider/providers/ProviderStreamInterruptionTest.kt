@@ -4,6 +4,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.StreamInterruptedException
@@ -11,6 +13,7 @@ import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.providers.openai.ChatCompletionsAPI
 import me.rerere.ai.provider.providers.openai.ResponseAPI
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.handleMessageChunk
 import me.rerere.ai.util.KeyRoulette
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -178,6 +181,35 @@ class ProviderStreamInterruptionTest {
 
         assertTrue(failure == null)
         assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun `responses assembles streamed chinese tool arguments without duplicating done snapshot`() = runBlocking {
+        enqueuePartial(
+            listOf(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"call-1\",\"name\":\"search_web\",\"arguments\":\"\"}}",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call-1\",\"delta\":\"{\\\"query\\\":\\\"七\"}",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call-1\",\"delta\":\"政四余\\\"}\"}",
+                "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call-1\",\"arguments\":\"{\\\"query\\\":\\\"七政四余\\\"}\"}",
+                "data: {\"type\":\"response.completed\",\"response\":{}}",
+            ).joinToString("\n\n", postfix = "\n\n")
+        )
+        val api = ResponseAPI(OkHttpClient(), KeyRoulette.default())
+
+        val chunks = withTimeout(2_000) {
+            api.streamText(
+                providerSetting = openAISetting(),
+                messages = listOf(UIMessage.user("查一下")),
+                params = TextGenerationParams(model = Model(modelId = "test")),
+            ).toList()
+        }
+        val messages = chunks.fold(listOf(UIMessage.user("查一下"))) { messages, chunk ->
+            messages.handleMessageChunk(chunk)
+        }
+        val tool = messages.last().getTools().single()
+
+        assertEquals("search_web", tool.toolName)
+        assertEquals("七政四余", tool.inputAsJson().jsonObject["query"]?.jsonPrimitive?.content)
     }
 
     @Test
