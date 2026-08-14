@@ -47,6 +47,12 @@ class DefaultProvidersTest {
     }
 
     @Test
+    fun `fresh installs default to gpt 5 6 sol`() {
+        assertEquals(BingoModelIds.GPT_5_6_SOL, BINGO_DEFAULT_MODEL_ID)
+        assertEquals("gpt-5.6-sol", provider.models.single { it.id == BINGO_DEFAULT_MODEL_ID }.modelId)
+    }
+
+    @Test
     fun `claude models carry a claude provider overwrite`() {
         val claudeModels = provider.models.filter { it.modelId.startsWith("claude-") }
 

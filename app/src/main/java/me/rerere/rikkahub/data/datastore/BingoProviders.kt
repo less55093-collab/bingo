@@ -125,7 +125,7 @@ val BINGO_MODELS: List<Model> = listOf(
 val BINGO_IMAGE_MODEL_ID: Uuid = BingoModelIds.GPT_IMAGE_2
 
 /** Default chat model for a fresh install. */
-val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.CLAUDE_SONNET_5
+val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.GPT_5_6_SOL
 
 /** Cheapest capable model, used for titles/suggestions/translation background calls. */
 val BINGO_FAST_MODEL_ID: Uuid = BingoModelIds.CLAUDE_HAIKU_4_5

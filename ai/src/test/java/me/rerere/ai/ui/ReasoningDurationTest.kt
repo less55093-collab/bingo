@@ -53,6 +53,16 @@ class ReasoningDurationTest {
     }
 
     @Test
+    fun `empty stream events must not finish reasoning`() {
+        var messages = assistantSeed()
+
+        messages = messages.handleMessageChunk(chunk(reasoning("思考中")))
+        messages = messages.handleMessageChunk(chunk())
+
+        assertNull("空流事件不代表正文开始", messages.lastReasoning().finishedAt)
+    }
+
+    @Test
     fun `reasoning interleaved with tool deltas keeps the original start time`() {
         var messages = assistantSeed()
 

@@ -147,11 +147,19 @@ data class UIMessage(
             // 工具调用分片不代表思考结束: 模型常在思考中间流式吐出 tool call,
             // 之后还会继续思考, 本轮思考直到工具执行完毕才由 finishReasoning() 收尾.
             // 若在此处就盖上 finishedAt, 搜索等工具场景的思考耗时会被算成 0 秒.
-            val deltaOnlyHasTools = delta.parts.isNotEmpty() &&
-                delta.parts.all { it is UIMessagePart.Tool }
+            val deltaStartsAnswer = delta.parts.any { part ->
+                when (part) {
+                    is UIMessagePart.Text -> part.text.isNotEmpty()
+                    is UIMessagePart.Image,
+                    is UIMessagePart.Video,
+                    is UIMessagePart.Audio,
+                    is UIMessagePart.Document -> true
+
+                    else -> false
+                }
+            }
             if (parts.filterIsInstance<UIMessagePart.Reasoning>()
-                    .isNotEmpty() && delta.parts.filterIsInstance<UIMessagePart.Reasoning>()
-                    .isEmpty() && !deltaOnlyHasTools
+                    .isNotEmpty() && deltaStartsAnswer
             ) {
                 newParts = newParts.map { part ->
                     if (part is UIMessagePart.Reasoning && part.finishedAt == null) {

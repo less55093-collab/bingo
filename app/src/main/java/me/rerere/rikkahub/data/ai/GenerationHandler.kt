@@ -180,15 +180,15 @@ class GenerationHandler(
                     assistant = assistant,
                     settings = settings
                 )
-                messages = messages.slice(0 until messages.lastIndex) + messages.last()
-                    .copy(
-                        finishedAt = Clock.System.now()
-                            .toLocalDateTime(TimeZone.currentSystemDefault())
-                    )
-                    .finishReasoning()
+                val completedMessage = messages.last().copy(
+                    finishedAt = Clock.System.now()
+                        .toLocalDateTime(TimeZone.currentSystemDefault())
+                )
+                val tools = completedMessage.getTools().filter { !it.isExecuted }
+                val finalizedMessage = if (tools.isEmpty()) completedMessage.finishReasoning() else completedMessage
+                messages = messages.slice(0 until messages.lastIndex) + finalizedMessage
                 emit(GenerationChunk.Messages(messages))
 
-                val tools = messages.last().getTools().filter { !it.isExecuted }
                 if (tools.isEmpty()) {
                     // no tool calls, break
                     break
