@@ -11,6 +11,7 @@ import androidx.paging.PagingData
 import androidx.paging.cachedIn
 import androidx.paging.map
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -242,23 +243,33 @@ class ImgGenVM(
         imageGenerationManager.cancel()
     }
 
-    fun startFromImage(image: GeneratedImage) {
+    fun startFromImage(image: GeneratedImage, onFailure: () -> Unit = {}) {
         if (imageGenerationManager.state.value.generating) return
         viewModelScope.launch {
-            val referencePath = withContext(Dispatchers.IO) {
-                val source = File(image.filePath)
-                if (!source.isFile) return@withContext null
-                val target = File(
-                    getApplication<Application>().imageGenerationInputFolder,
-                    "imggen_ref_${Uuid.random()}.${source.extension.ifBlank { "png" }}",
-                )
-                source.copyTo(target, overwrite = true)
-                target.absolutePath
-            } ?: return@launch
-            clearReferenceImages()
-            _referenceImages.value = listOf(referencePath)
-            _prompt.value = image.prompt
-            _mode.value = ImageCreationMode.REFERENCE
+            try {
+                val referencePath = withContext(Dispatchers.IO) {
+                    val source = File(image.filePath)
+                    if (!source.isFile) return@withContext null
+                    val target = File(
+                        getApplication<Application>().imageGenerationInputFolder,
+                        "imggen_ref_${Uuid.random()}.${source.extension.ifBlank { "png" }}",
+                    )
+                    source.copyTo(target, overwrite = true)
+                    target.absolutePath
+                } ?: run {
+                    onFailure()
+                    return@launch
+                }
+                clearReferenceImages()
+                _referenceImages.value = listOf(referencePath)
+                _prompt.value = image.prompt
+                _mode.value = ImageCreationMode.REFERENCE
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to prepare generated image for editing", error)
+                onFailure()
+            }
         }
     }
 

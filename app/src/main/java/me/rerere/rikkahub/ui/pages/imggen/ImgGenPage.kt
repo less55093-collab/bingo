@@ -231,6 +231,7 @@ private fun ImageGenScreen(vm: ImgGenVM) {
     val referenceImageFailedMessage = stringResource(R.string.imggen_page_reference_image_failed)
     val imagesSavedSuccessMessage = stringResource(R.string.imggen_page_images_saved_success)
     val saveFailedPrefix = stringResource(R.string.imggen_page_save_failed, "")
+    val scrollState = rememberScrollState()
     var showSettingsSheet by remember { mutableStateOf(false) }
     var showBalanceDialog by remember { mutableStateOf(false) }
     var showCancelDialog by remember { mutableStateOf(false) }
@@ -324,7 +325,7 @@ private fun ImageGenScreen(vm: ImgGenVM) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(scrollState)
             .padding(16.dp)
             .imePadding(),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -459,7 +460,18 @@ private fun ImageGenScreen(vm: ImgGenVM) {
                             }
                         }
                     },
-                    onContinue = { vm.startFromImage(currentGeneratedImages.first()) },
+                    onContinue = {
+                        vm.startFromImage(
+                            currentGeneratedImages.first(),
+                            onFailure = {
+                                toaster.show(
+                                    message = referenceImageFailedMessage,
+                                    type = ToastType.Error,
+                                )
+                            },
+                        )
+                        scope.launch { scrollState.animateScrollTo(0) }
+                    },
                 )
             }
 
