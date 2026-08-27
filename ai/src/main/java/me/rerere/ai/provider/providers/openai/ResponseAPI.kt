@@ -27,6 +27,7 @@ import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
@@ -316,7 +317,13 @@ class ResponseAPI(
             }
 
             // messages
-            put("input", buildMessages(messages))
+            put(
+                "input",
+                buildMessages(
+                    messages,
+                    includeGeneratedImages = Modality.IMAGE in params.model.inputModalities,
+                )
+            )
 
             // reasoning
             if (params.model.abilities.contains(ModelAbility.REASONING)) {
@@ -382,19 +389,28 @@ class ResponseAPI(
         }.mergeCustomBody(params.customBody)
     }
 
-    internal fun buildMessages(messages: List<UIMessage>) = buildJsonArray {
+    internal fun buildMessages(
+        messages: List<UIMessage>,
+        includeGeneratedImages: Boolean = false,
+    ) = buildJsonArray {
         messages
             .filter { it.isValidToUpload() && it.role != MessageRole.SYSTEM }
             .forEach { message ->
                 if (message.role == MessageRole.ASSISTANT) {
-                    addAssistantItems(message)
+                    addAssistantItems(
+                        message,
+                        includeGeneratedImages = includeGeneratedImages,
+                    )
                 } else {
                     addUserItems(message)
                 }
             }
     }
 
-    private fun JsonArrayBuilder.addAssistantItems(message: UIMessage) {
+    private fun JsonArrayBuilder.addAssistantItems(
+        message: UIMessage,
+        includeGeneratedImages: Boolean,
+    ) {
         val groups = groupPartsByToolBoundary(message.parts)
         val contentBuffer = mutableListOf<UIMessagePart>()
 
@@ -464,7 +480,7 @@ class ResponseAPI(
                         add(buildJsonObject {
                             put("type", "function_call_output")
                             put("call_id", tool.toolCallId)
-                            val modelOutput = tool.outputForModel()
+                            val modelOutput = tool.outputForModel(includeGeneratedImages)
                             val hasImage = modelOutput.any { it is UIMessagePart.Image }
                             if (hasImage) {
                                 putJsonArray("output") {

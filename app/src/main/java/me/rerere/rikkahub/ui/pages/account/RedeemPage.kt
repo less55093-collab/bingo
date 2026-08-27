@@ -38,10 +38,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.dokar.sonner.ToastType
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import me.rerere.rikkahub.ui.components.nav.BackButton
-import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.pages.account.components.RedeemHistoryList
 import me.rerere.rikkahub.ui.theme.CustomColors
@@ -54,7 +52,6 @@ fun RedeemPage(vm: RedeemVM = koinViewModel()) {
     val state by vm.uiState.collectAsStateWithLifecycle()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val context = LocalContext.current
-    val navController = LocalNavController.current
     val toaster = LocalToaster.current
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
@@ -139,13 +136,6 @@ fun RedeemPage(vm: RedeemVM = koinViewModel()) {
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(stringResource(R.string.redeem_buy_prompt))
-            }
-
-            TextButton(
-                onClick = { navController.navigate(Screen.Tutorial) },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.redeem_view_tutorial))
             }
 
             Row(

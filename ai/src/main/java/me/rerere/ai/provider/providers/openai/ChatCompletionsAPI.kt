@@ -733,7 +733,7 @@ class ChatCompletionsAPI(
     }
 
     private fun UIMessagePart.Tool.toToolResultContent(supportInputModalities: List<Modality>): JsonElement {
-        val modelOutput = outputForModel()
+        val modelOutput = outputForModel(includeGeneratedImages = Modality.IMAGE in supportInputModalities)
         // 只考虑文字和图片;只有模型支持图片输入时,图片才作为多模态内容回传,否则以文本占位,避免发给不支持的模型报错
         val supportsImageInput = Modality.IMAGE in supportInputModalities
         val hasImageToSend = modelOutput.any { it is UIMessagePart.Image && supportsImageInput }

@@ -1,25 +1,20 @@
 package me.rerere.rikkahub.ui.pages.tutorial
 
 import androidx.annotation.StringRes
-import androidx.compose.ui.graphics.vector.ImageVector
-import me.rerere.hugeicons.HugeIcons
-import me.rerere.hugeicons.stroke.Bulb
-import me.rerere.hugeicons.stroke.Copy01
-import me.rerere.hugeicons.stroke.MoneyBag02
-import me.rerere.hugeicons.stroke.ShoppingBag02
-import me.rerere.hugeicons.stroke.Message01
 import me.rerere.rikkahub.R
 
 /**
  * What the step's primary button does. Kept as a sealed type rather than a lambda so the content
  * list stays a plain value that can be declared at the top level.
  */
-enum class TutorialAction { None, OpenShop, GoRedeem }
+enum class TutorialAction { None }
+
+enum class TutorialPreview { Idea, Plan, Result }
 
 data class TutorialStep(
     @StringRes val title: Int,
     @StringRes val body: Int,
-    val icon: ImageVector,
+    val preview: TutorialPreview,
     val action: TutorialAction = TutorialAction.None,
     @StringRes val actionLabel: Int? = null,
 )
@@ -30,32 +25,18 @@ data class TutorialStep(
  */
 val TutorialSteps: List<TutorialStep> = listOf(
     TutorialStep(
-        title = R.string.tutorial_step_credit_title,
-        body = R.string.tutorial_step_credit_body,
-        icon = HugeIcons.MoneyBag02,
+        title = R.string.tutorial_step_idea_title,
+        body = R.string.tutorial_step_idea_body,
+        preview = TutorialPreview.Idea,
     ),
     TutorialStep(
-        title = R.string.tutorial_step_buy_title,
-        body = R.string.tutorial_step_buy_body,
-        icon = HugeIcons.ShoppingBag02,
-        action = TutorialAction.OpenShop,
-        actionLabel = R.string.tutorial_step_buy_action,
+        title = R.string.tutorial_step_plan_title,
+        body = R.string.tutorial_step_plan_body,
+        preview = TutorialPreview.Plan,
     ),
     TutorialStep(
-        title = R.string.tutorial_step_copy_title,
-        body = R.string.tutorial_step_copy_body,
-        icon = HugeIcons.Copy01,
-    ),
-    TutorialStep(
-        title = R.string.tutorial_step_redeem_title,
-        body = R.string.tutorial_step_redeem_body,
-        icon = HugeIcons.Bulb,
-        action = TutorialAction.GoRedeem,
-        actionLabel = R.string.account_topup,
-    ),
-    TutorialStep(
-        title = R.string.tutorial_step_chat_title,
-        body = R.string.tutorial_step_chat_body,
-        icon = HugeIcons.Message01,
+        title = R.string.tutorial_step_approve_title,
+        body = R.string.tutorial_step_approve_body,
+        preview = TutorialPreview.Result,
     ),
 )

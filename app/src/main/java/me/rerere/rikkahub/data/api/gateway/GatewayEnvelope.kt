@@ -53,9 +53,6 @@ object GatewayReasons {
 
 /** Group ids on api.bingoapi.top. Not discoverable at runtime: `/admin/groups` is admin-only. */
 object GatewayGroups {
-    /** anthropic platform, rate multiplier 1.5 — serves the claude-* models. */
-    const val CLAUDE = 17
-
     /** openai platform, rate multiplier 0.6 — serves the gpt-* models. */
     const val GPT = 16
 
@@ -65,7 +62,6 @@ object GatewayGroups {
 
 /** Reserved API-key names so provisioning is idempotent across reinstalls. */
 object GatewayKeyNames {
-    const val CLAUDE = "app-claude"
     const val GPT = "app-gpt"
     const val IMAGE = "app-image"
 }

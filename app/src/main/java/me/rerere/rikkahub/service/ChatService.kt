@@ -32,6 +32,7 @@ import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
+import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderManager
@@ -104,6 +105,9 @@ internal fun backgroundTextGenerationParams(
     customHeaders = model.customHeaders,
     customBody = model.customBodies,
 )
+
+internal fun shouldAttachAppSearchTools(assistant: Assistant, model: Model): Boolean =
+    assistant.enableWebSearch && BuiltInTools.Search !in model.tools
 
 data class ChatError(
     val id: Uuid = Uuid.random(),
@@ -477,6 +481,7 @@ class ChatService(
         approved: Boolean,
         reason: String = "",
         answer: String? = null,
+        inputOverride: String? = null,
     ) {
         val session = getOrCreateSession(conversationId)
         val previousJob = session.getJob()
@@ -500,7 +505,10 @@ class ChatService(
                                 parts = msg.parts.map { part ->
                                     when {
                                         part is UIMessagePart.Tool && part.toolCallId == toolCallId -> {
-                                            part.copy(approvalState = newApprovalState)
+                                            part.copy(
+                                                input = inputOverride ?: part.input,
+                                                approvalState = newApprovalState,
+                                            )
                                         }
 
                                         else -> part
@@ -569,7 +577,7 @@ class ChatService(
 
             // memory tool
             if (!model.abilities.contains(ModelAbility.TOOL)) {
-                if (assistant.enableWebSearch || mcpManager.getAllAvailableTools().isNotEmpty()) {
+                if (shouldAttachAppSearchTools(assistant, model) || mcpManager.getAllAvailableTools().isNotEmpty()) {
                     addError(
                         IllegalStateException(context.getString(R.string.tools_warning)),
                         conversationId,
@@ -620,7 +628,7 @@ class ChatService(
                 },
                 outputTransformers = outputTransformers,
                 tools = buildList {
-                    if (assistant.enableWebSearch) {
+                    if (shouldAttachAppSearchTools(assistant, model)) {
                         addAll(createSearchTools(settings))
                     }
                     addAll(localTools.getTools(assistant.localTools))

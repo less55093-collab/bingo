@@ -6,6 +6,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.provider.CustomBody
+import me.rerere.ai.provider.ImageEditParams
 import me.rerere.ai.provider.ImageGenerationParams
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelType
@@ -22,6 +23,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.io.File
 import kotlin.uuid.Uuid
 
 /**
@@ -69,6 +71,7 @@ class OpenAIProviderImageRequestBodyTest {
         modelId: String,
         customBody: List<CustomBody> = emptyList(),
         baseUrlOverride: String? = null,
+        size: String = "1024x1024",
     ): JsonObject {
         server.enqueue(
             MockResponse.Builder()
@@ -81,7 +84,7 @@ class OpenAIProviderImageRequestBodyTest {
             model = model(modelId),
             prompt = "a red circle",
             numOfImages = 1,
-            size = "1024x1024",
+            size = size,
             customBody = customBody,
         )
         runBlocking {
@@ -101,6 +104,44 @@ class OpenAIProviderImageRequestBodyTest {
         assertEquals("b64_json", body["response_format"]?.jsonPrimitive?.content)
         assertEquals("gpt-image-2", body["model"]?.jsonPrimitive?.content)
         assertEquals("1024x1024", body["size"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `auto size is converted to an explicit target`() {
+        val body = capture("gpt-image-2", size = "auto")
+
+        assertEquals("1024x1024", body["size"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `auto edit size is converted to an explicit multipart target`() {
+        val image = File.createTempFile("image-edit-", ".png")
+        image.writeBytes(byteArrayOf(0, 1, 2))
+        try {
+            server.enqueue(
+                MockResponse.Builder()
+                    .code(200)
+                    .body("""{"data":[{"b64_json":"AAAA"}]}""")
+                    .build()
+            )
+            runBlocking {
+                provider.editImage(
+                    setting(),
+                    ImageEditParams(
+                        model = model("gpt-image-2"),
+                        prompt = "edit",
+                        images = listOf(image.absolutePath),
+                        size = "auto",
+                    ),
+                ).toList()
+            }
+
+            val body = server.takeRequest().body!!.utf8()
+            assertTrue(body.contains("name=\"size\""))
+            assertTrue(body.contains("1024x1024"))
+        } finally {
+            image.delete()
+        }
     }
 
     @Test

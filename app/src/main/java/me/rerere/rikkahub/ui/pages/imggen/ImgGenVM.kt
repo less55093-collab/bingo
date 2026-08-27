@@ -11,6 +11,7 @@ import androidx.paging.PagingData
 import androidx.paging.cachedIn
 import androidx.paging.map
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -21,8 +22,10 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import me.rerere.ai.ui.ImageGenSize
+import me.rerere.common.android.imageGenerationInputFolder
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.entity.GenMediaEntity
 import me.rerere.rikkahub.data.files.FilesManager
@@ -32,6 +35,18 @@ import me.rerere.rikkahub.ui.components.ai.IMAGE_GENERATION_PROGRESS_TICK_MS
 import me.rerere.rikkahub.ui.components.ai.IMAGE_GENERATION_SLOW_HINT_MS
 import me.rerere.rikkahub.ui.components.ai.estimateImageGenerationProgress
 import java.io.File
+import kotlin.uuid.Uuid
+
+enum class ImageCreationMode {
+    TEXT,
+    REFERENCE,
+}
+
+internal fun canSubmitImageGeneration(
+    mode: ImageCreationMode,
+    prompt: String,
+    referenceImageCount: Int,
+): Boolean = prompt.isNotBlank() && (mode == ImageCreationMode.TEXT || referenceImageCount > 0)
 
 @Serializable
 data class GeneratedImage(
@@ -70,6 +85,9 @@ class ImgGenVM(
 
     private val _size = MutableStateFlow(ImageGenSize.AUTO.value)
     val size: StateFlow<String> = _size
+
+    private val _mode = MutableStateFlow(ImageCreationMode.TEXT)
+    val mode: StateFlow<ImageCreationMode> = _mode
 
     // 生成状态来自 ImageGenerationManager（AppScope），页面销毁不再中断生成
     val isGenerating: StateFlow<Boolean> = imageGenerationManager.state
@@ -161,16 +179,23 @@ class ImgGenVM(
         _size.value = size
     }
 
+    fun updateMode(mode: ImageCreationMode) {
+        if (imageGenerationManager.state.value.generating) return
+        _mode.value = mode
+    }
+
     fun addReferenceImages(paths: List<String>) {
         _referenceImages.value = (_referenceImages.value + paths).distinct().take(MAX_REFERENCE_IMAGES)
     }
 
     fun removeReferenceImage(path: String) {
+        if (imageGenerationManager.state.value.generating) return
         _referenceImages.value = _referenceImages.value.filterNot { it == path }
         deleteReferenceFiles(listOf(path))
     }
 
     fun clearReferenceImages() {
+        if (imageGenerationManager.state.value.generating) return
         deleteReferenceFiles(_referenceImages.value)
         _referenceImages.value = emptyList()
     }
@@ -180,9 +205,19 @@ class ImgGenVM(
     }
 
     fun startNewSession() {
+        if (imageGenerationManager.state.value.generating) return
         imageGenerationManager.reset()
         clearReferenceImages()
         _prompt.value = ""
+        _mode.value = ImageCreationMode.TEXT
+    }
+
+    fun submitGeneration() {
+        if (!canSubmitImageGeneration(_mode.value, _prompt.value, _referenceImages.value.size)) return
+        when (_mode.value) {
+            ImageCreationMode.TEXT -> generateImage()
+            ImageCreationMode.REFERENCE -> editImage()
+        }
     }
 
     fun generateImage() {
@@ -205,6 +240,26 @@ class ImgGenVM(
 
     fun cancelGeneration() {
         imageGenerationManager.cancel()
+    }
+
+    fun startFromImage(image: GeneratedImage) {
+        if (imageGenerationManager.state.value.generating) return
+        viewModelScope.launch {
+            val referencePath = withContext(Dispatchers.IO) {
+                val source = File(image.filePath)
+                if (!source.isFile) return@withContext null
+                val target = File(
+                    getApplication<Application>().imageGenerationInputFolder,
+                    "imggen_ref_${Uuid.random()}.${source.extension.ifBlank { "png" }}",
+                )
+                source.copyTo(target, overwrite = true)
+                target.absolutePath
+            } ?: return@launch
+            clearReferenceImages()
+            _referenceImages.value = listOf(referencePath)
+            _prompt.value = image.prompt
+            _mode.value = ImageCreationMode.REFERENCE
+        }
     }
 
     fun deleteImage(image: GeneratedImage) {

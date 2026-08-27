@@ -13,8 +13,12 @@ internal const val IMAGE_GENERATION_TOOL_SUCCESS_MESSAGE =
  * but re-uploading their local files as Base64 makes the follow-up model request unnecessarily
  * large. The model already has the tool call's prompt, so a compact completion marker is enough.
  */
-internal fun UIMessagePart.Tool.outputForModel(): List<UIMessagePart> =
-    if (toolName == IMAGE_GENERATION_TOOL_NAME && output.any { it is UIMessagePart.Image }) {
+internal fun UIMessagePart.Tool.outputForModel(includeGeneratedImages: Boolean = false): List<UIMessagePart> =
+    if (
+        toolName == IMAGE_GENERATION_TOOL_NAME &&
+        output.any { it is UIMessagePart.Image } &&
+        !includeGeneratedImages
+    ) {
         listOf(UIMessagePart.Text(IMAGE_GENERATION_TOOL_SUCCESS_MESSAGE))
     } else {
         output

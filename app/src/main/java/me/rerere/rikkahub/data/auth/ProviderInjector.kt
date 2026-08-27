@@ -19,9 +19,15 @@ object ProviderInjector {
 
     /** Rebuilds the bingo provider from code with [keys] applied, dropping every other provider. */
     fun inject(settings: Settings, keys: ProviderKeys): Settings {
+        val existingModels = settings.providers
+            .flatMap { it.models }
+            .associateBy { it.id }
         val provider = BINGO_PROVIDER.copy(
             apiKey = keys.gptKey,
-            models = BINGO_MODELS.map { it.withOverwriteKey(keys) },
+            models = BINGO_MODELS.map { baseline ->
+                baseline.copy(tools = existingModels[baseline.id]?.tools ?: baseline.tools)
+                    .withOverwriteKey(keys)
+            },
         )
         return settings.copy(providers = listOf(provider))
     }
@@ -37,7 +43,6 @@ object ProviderInjector {
      * flat provider-free picker. Contained here so rotation stays a single call.
      */
     private fun Model.withOverwriteKey(keys: ProviderKeys): Model = when (val o = providerOverwrite) {
-        is ProviderSetting.Claude -> copy(providerOverwrite = o.copy(apiKey = keys.claudeKey))
         is ProviderSetting.OpenAI -> copy(providerOverwrite = o.copy(apiKey = keys.imageKey))
         else -> this
     }
@@ -48,11 +53,11 @@ object ProviderInjector {
         if (provider.id != BINGO_PROVIDER_ID) return false
         if (provider.apiKey != keys.gptKey) return false
         if (provider.baseUrl != BINGO_PROVIDER.baseUrl) return false
+        if (provider.useResponseApi != BINGO_PROVIDER.useResponseApi) return false
         if (provider.models.map { it.modelId } != BINGO_MODELS.map { it.modelId }) return false
         return provider.models.all { model ->
             val expected = BINGO_MODELS.firstOrNull { it.id == model.id }?.providerOverwrite
             when (val o = model.providerOverwrite) {
-                is ProviderSetting.Claude -> o.apiKey == keys.claudeKey
                 is ProviderSetting.OpenAI ->
                     o.apiKey == keys.imageKey && o.useAsyncImageTasks ==
                         (expected as? ProviderSetting.OpenAI)?.useAsyncImageTasks

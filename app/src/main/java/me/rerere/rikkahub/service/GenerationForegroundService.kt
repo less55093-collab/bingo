@@ -406,7 +406,7 @@ class GenerationForegroundService : Service() {
                     this,
                     NOTIFICATION_ID,
                     notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
                 )
             } else {
                 startForeground(NOTIFICATION_ID, notification)
@@ -580,8 +580,9 @@ class GenerationForegroundService : Service() {
             PowerManager.PARTIAL_WAKE_LOCK,
             "$packageName:generation",
         ).apply {
-            // Safety cap for a lost stop signal. Normal completion releases this immediately.
-            acquire(MAX_WAKE_LOCK_MILLIS)
+            // The foreground service is the bounded owner of this lock. WorkManager retains the
+            // durable task if Android destroys the service, so an arbitrary time cap is unnecessary.
+            acquire()
         }
     }
 
@@ -646,8 +647,6 @@ class GenerationForegroundService : Service() {
         private const val EXTRA_PROGRESS_CONTENT = "generationProgressContent"
         private const val EXTRA_PROGRESS_CHIP = "generationProgressChip"
         private const val NOTIFICATION_ID = 2002
-        private const val MAX_WAKE_LOCK_MILLIS = 60 * 60 * 1000L
-
         @Volatile
         internal var appContext: Context? = null
             private set

@@ -50,7 +50,8 @@ import me.rerere.hugeicons.stroke.BubbleChatQuestion
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Tick01
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.ui.components.message.tools.IMAGE_GENERATION_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.local.IMAGE_GENERATION_PLAN_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.local.IMAGE_GENERATION_TOOL_NAME
 import me.rerere.rikkahub.ui.components.message.tools.ImageGenerationToolStep
 import me.rerere.rikkahub.ui.components.message.tools.ToolUIContext
 import me.rerere.rikkahub.ui.components.message.tools.ToolUIRegistry
@@ -66,7 +67,7 @@ private const val ASK_USER_TOOL_NAME = "ask_user"
 fun ChainOfThoughtScope.ChatMessageToolStep(
     tool: UIMessagePart.Tool,
     loading: Boolean = false,
-    onToolApproval: ((toolCallId: String, approved: Boolean, reason: String) -> Unit)? = null,
+    onToolApproval: ((toolCallId: String, approved: Boolean, reason: String, inputOverride: String?) -> Unit)? = null,
     onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
 ) {
     // ask_user 是交互式问答流程, 不走注册式渲染框架
@@ -75,9 +76,18 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
         return
     }
 
-    // 生图不显示工具调用卡片, 直接在对话流里给出占位动效并原地出图
-    if (tool.toolName == IMAGE_GENERATION_TOOL_NAME) {
-        ImageGenerationToolStep(tool = tool, loading = loading)
+    // 生图使用专用渲染: 单图显示占位动效, 多变体显示一次计划审批卡
+    if (tool.toolName == IMAGE_GENERATION_TOOL_NAME || tool.toolName == IMAGE_GENERATION_PLAN_TOOL_NAME) {
+        ImageGenerationToolStep(
+            tool = tool,
+            loading = loading,
+            onApprove = onToolApproval?.let { callback ->
+                { inputOverride -> callback(tool.toolCallId, true, "", inputOverride) }
+            },
+            onDeny = onToolApproval?.let { callback ->
+                { reason -> callback(tool.toolCallId, false, reason, null) }
+            },
+        )
         return
     }
 
@@ -152,7 +162,7 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
                         )
                     }
                     FilledTonalIconButton(
-                        onClick = { onToolApproval(tool.toolCallId, true, "") },
+                        onClick = { onToolApproval(tool.toolCallId, true, "", null) },
                         modifier = Modifier.size(28.dp),
                     ) {
                         Icon(
@@ -212,7 +222,7 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
             onDismiss = { showDenyDialog = false },
             onConfirm = { reason ->
                 showDenyDialog = false
-                onToolApproval(tool.toolCallId, false, reason)
+                onToolApproval(tool.toolCallId, false, reason, null)
             }
         )
     }

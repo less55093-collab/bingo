@@ -4,9 +4,14 @@ import android.content.Context
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.security.MessageDigest
 
 interface KeyRoulette {
     fun next(keys: String, providerId: String = ""): String
+
+    /** Returns the configured key matching a persisted, non-reversible fingerprint. */
+    fun findByFingerprint(keys: String, fingerprint: String): String? =
+        splitKey(keys).firstOrNull { keyFingerprint(it) == fingerprint }
 
     companion object {
         fun default(): KeyRoulette = DefaultKeyRoulette()
@@ -18,6 +23,22 @@ interface KeyRoulette {
         fun lru(context: Context): KeyRoulette = LruKeyRoulette(context)
     }
 }
+
+/** Stable identity for a configured API key without persisting the secret itself. */
+fun keyFingerprint(key: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8))
+    return buildString(digest.size * 2) {
+        digest.forEach { byte ->
+            append(HEX[(byte.toInt() ushr 4) and 0x0f])
+            append(HEX[byte.toInt() and 0x0f])
+        }
+    }
+}
+
+/** Returns the distinct configured keys in the same order used by the roulette. */
+fun keyCandidates(keys: String): List<String> = splitKey(keys)
+
+private const val HEX = "0123456789abcdef"
 
 private val SPLIT_KEY_REGEX = "[\\s,]+".toRegex() // 空格换行和逗号
 

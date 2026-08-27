@@ -26,6 +26,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import me.rerere.common.android.appTempFolder
+import me.rerere.common.android.imageGenerationInputFolder
 import com.whl.quickjs.android.QuickJSLoader
 import me.rerere.rikkahub.di.appModule
 import me.rerere.rikkahub.di.dataSourceModule
@@ -47,6 +48,7 @@ import me.rerere.rikkahub.data.sync.DatabaseRestoreCoordinator
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.service.GenerationProtectionManager
 import me.rerere.rikkahub.service.GenerationRecoveryGate
+import me.rerere.rikkahub.service.ImageGenerationRecoveryScheduler
 import me.rerere.workspace.WorkspaceManager
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
@@ -55,6 +57,7 @@ import org.koin.androidx.workmanager.koin.workManagerFactory
 import org.koin.core.context.startKoin
 
 private const val TAG = "RikkaHubApp"
+private const val IMAGE_GENERATION_INPUT_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
 
 const val CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID = "chat_completed"
 const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update"
@@ -74,6 +77,9 @@ class RikkaHubApp : Application() {
             modules(appModule, viewModelModule, dataSourceModule, repositoryModule)
         }
         this.createNotificationChannel()
+        // WorkManager persists this reconciliation job across reboot/process death. The worker
+        // itself waits for the authenticated route to provision keys before submitting anything.
+        ImageGenerationRecoveryScheduler.enqueue(this)
 
         // set cursor window size to 32MB
         DatabaseUtil.setCursorWindowSize(32 * 1024 * 1024)
@@ -86,6 +92,10 @@ class RikkaHubApp : Application() {
 
         // delete temp files
         deleteTempFiles()
+
+        // Keep copied edit sources durable until their pending task is resolved. The old cache
+        // directory is still cleared above, but these files must survive process death and reboot.
+        cleanupStaleImageGenerationInputs()
 
         // cleanup stale tool output files
         cleanupToolOutputs()
@@ -195,6 +205,39 @@ class RikkaHubApp : Application() {
             val dir = appTempFolder
             if (dir.exists()) {
                 dir.deleteRecursively()
+            }
+        }
+    }
+
+    private fun cleanupStaleImageGenerationInputs() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                // Source images are also retained by completed edit records so users can inspect
+                // the provenance later. Only old, unreferenced files are eligible for cleanup.
+                val referencedPaths = buildSet {
+                    get<AuthTokenStore>().currentPendingImageTasks()
+                        .flatMap { it.sourcePaths.orEmpty().split("\n") }
+                        .filter(String::isNotBlank)
+                        .forEach { path -> runCatching { add(File(path).canonicalPath) } }
+                    get<AppDatabase>().genMediaDao().getAllMedia()
+                        .flatMap { it.sourcePaths.orEmpty().split("\n") }
+                        .filter(String::isNotBlank)
+                        .forEach { path -> runCatching { add(File(path).canonicalPath) } }
+                }
+                val cutoff = System.currentTimeMillis() - IMAGE_GENERATION_INPUT_RETENTION_MS
+                imageGenerationInputFolder.listFiles().orEmpty().forEach { file ->
+                    if (!file.isFile) return@forEach
+                    val canonicalPath = runCatching { file.canonicalPath }.getOrNull()
+                        ?: return@forEach
+                    val lastModified = file.lastModified()
+                    if (canonicalPath !in referencedPaths &&
+                        lastModified > 0L && lastModified < cutoff
+                    ) {
+                        file.delete()
+                    }
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "image generation input cleanup failed", error)
             }
         }
     }

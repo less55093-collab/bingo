@@ -173,14 +173,16 @@ class UpdateChecker(
 
     private suspend fun createBackup(context: Context): File = withContext(Dispatchers.IO) {
         DatabaseUtil.checkpoint(database)
-        val root = context.getExternalFilesDir("update-backups") ?: context.filesDir.resolve("update-backups")
+        // Keep the safety backup in app-internal storage so it survives an in-place update.
+        val root = context.filesDir.resolve("update-backups")
         check(root.exists() || root.mkdirs()) { "无法创建更新备份目录" }
         val output = File(root, "before_update_${System.currentTimeMillis()}.zip")
         check(!output.exists()) { "更新备份文件已存在" }
         val partial = File.createTempFile("before_update_", ".zip.part", root)
         try {
             FileOutputStream(partial).use { fileOutput ->
-                ZipOutputStream(fileOutput).use { zip ->
+                val zip = ZipOutputStream(fileOutput)
+                try {
                     zip.writeText("settings.json", json.encodeToString(settingsStore.settingsFlow.value.forBackup()))
                     context.getDatabasePath(AccountDatabaseManager.currentDatabaseName(context))
                         .takeIf(File::isFile)
@@ -188,8 +190,12 @@ class UpdateChecker(
                     listOf("upload", "images", "skills", "fonts").forEach { name ->
                         File(context.filesDir, name).takeIf(File::isDirectory)?.let { zip.writeDirectory(it, "$name/") }
                     }
+                    zip.finish()
+                    zip.flush()
+                    fileOutput.fd.sync()
+                } finally {
+                    zip.close()
                 }
-                fileOutput.fd.sync()
             }
             check(partial.length() > 0L) { "更新备份为空" }
             check(partial.renameTo(output)) { "无法保存更新备份" }

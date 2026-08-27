@@ -12,9 +12,8 @@ import me.rerere.rikkahub.data.model.gateway.ApiKeyDto
 import me.rerere.rikkahub.data.model.gateway.CreateKeyRequest
 
 /**
- * A gateway key belongs to exactly one group, and one group serves exactly one platform. Serving
- * Claude chat, GPT chat and GPT image generation therefore needs three keys, provisioned
- * transparently so the user never sees an API key at all.
+ * A gateway key belongs to exactly one group. Chat and image generation use separate keys,
+ * provisioned transparently so the user never sees an API key at all.
  */
 class KeyProvisioner(
     private val api: BingoGatewayAPI,
@@ -31,12 +30,6 @@ class KeyProvisioner(
         val remote = api.listKeys().requireData().items
         val stored = tokenStore.currentProviderKeys()
 
-        val claude = reconcile(
-            remote = remote,
-            name = GatewayKeyNames.CLAUDE,
-            groupId = GatewayGroups.CLAUDE,
-            storedSecret = stored.claudeKey,
-        )
         val gpt = reconcile(
             remote = remote,
             name = GatewayKeyNames.GPT,
@@ -50,7 +43,7 @@ class KeyProvisioner(
             storedSecret = stored.imageKey,
         )
 
-        ProviderKeys(claudeKey = claude, gptKey = gpt, imageKey = image).also {
+        ProviderKeys(gptKey = gpt, imageKey = image).also {
             tokenStore.saveProviderKeys(it)
             applyToSettings(it)
         }

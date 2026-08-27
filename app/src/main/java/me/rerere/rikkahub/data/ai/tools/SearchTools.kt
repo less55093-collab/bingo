@@ -25,6 +25,10 @@ fun createSearchTools(settings: Settings): Set<Tool> {
                     Search the web for up-to-date or specific information.
                     Use this when the user asks for the latest news, current facts, or needs verification.
                     Generate focused keywords and run multiple searches if needed.
+                    Keep each query short. For Chinese institution searches, use exactly one full
+                    institution name and one core qualifier per call (for example, "东北财经大学 复试线"
+                    or "东北财经大学 金融"). Use separate calls for other institutions,
+                    qualifiers, and years. If a search reports low relevance, retry with a shorter query.
                     Today is ${LocalDate.now().toLocalString(true)}.
 
                     Response format:

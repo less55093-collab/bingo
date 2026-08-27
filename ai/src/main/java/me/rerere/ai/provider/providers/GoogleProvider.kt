@@ -469,7 +469,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         // Contents (user messages)
         put(
             "contents",
-            buildContents(messages)
+            buildContents(
+                messages,
+                includeGeneratedImages = Modality.IMAGE in params.model.inputModalities,
+            )
         )
 
         // Tools
@@ -655,13 +658,22 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         }
     }
 
-    private fun buildContents(messages: List<UIMessage>): JsonArray {
+    private fun buildContents(messages: List<UIMessage>): JsonArray =
+        buildContents(messages, includeGeneratedImages = false)
+
+    private fun buildContents(
+        messages: List<UIMessage>,
+        includeGeneratedImages: Boolean,
+    ): JsonArray {
         return buildJsonArray {
             messages
                 .filter { it.role != MessageRole.SYSTEM && it.isValidToUpload() }
                 .forEach { message ->
                     if (message.role == MessageRole.ASSISTANT) {
-                        addModelMessage(message)
+                        addModelMessage(
+                            message,
+                            includeGeneratedImages = includeGeneratedImages,
+                        )
                     } else {
                         addUserMessage(message)
                     }
@@ -669,7 +681,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         }
     }
 
-    private fun JsonArrayBuilder.addModelMessage(message: UIMessage) {
+    private fun JsonArrayBuilder.addModelMessage(
+        message: UIMessage,
+        includeGeneratedImages: Boolean,
+    ) {
         val groups = groupPartsByToolBoundary(message.parts)
         val partsBuffer = mutableListOf<JsonObject>()
 
@@ -694,7 +709,9 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                     add(buildJsonObject {
                         put("role", "user")
                         putJsonArray("parts") {
-                            group.tools.forEach { add(it.toFunctionResponsePart()) }
+                            group.tools.forEach {
+                                add(it.toFunctionResponsePart(includeGeneratedImages))
+                            }
                         }
                     })
                 }
@@ -773,10 +790,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         }
     }
 
-    private fun UIMessagePart.Tool.toFunctionResponsePart() = buildJsonObject {
+    private fun UIMessagePart.Tool.toFunctionResponsePart(includeGeneratedImages: Boolean) = buildJsonObject {
             put("functionResponse", buildJsonObject {
                 put("name", toolName)
-                val modelOutput = outputForModel()
+                val modelOutput = outputForModel(includeGeneratedImages)
 
                 // 1. 拆分出纯文本部分
                 val textParts = modelOutput.filterIsInstance<UIMessagePart.Text>()

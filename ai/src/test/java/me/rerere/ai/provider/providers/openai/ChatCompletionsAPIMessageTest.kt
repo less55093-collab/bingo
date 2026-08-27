@@ -35,7 +35,8 @@ class ChatCompletionsAPIMessageTest {
     // Helper to invoke private buildMessages method via reflection
     private fun invokeBuildMessages(
         messages: List<UIMessage>,
-        includeHistoryReasoning: Boolean = true
+        includeHistoryReasoning: Boolean = true,
+        supportInputModalities: List<Modality> = listOf(Modality.TEXT, Modality.IMAGE),
     ): JsonArray {
         val method = ChatCompletionsAPI::class.java.getDeclaredMethod(
             "buildMessages",
@@ -48,7 +49,7 @@ class ChatCompletionsAPIMessageTest {
             api,
             messages,
             includeHistoryReasoning,
-            listOf(Modality.TEXT, Modality.IMAGE)
+            supportInputModalities
         ) as JsonArray
     }
 
@@ -395,7 +396,10 @@ class ChatCompletionsAPIMessageTest {
             output = listOf(UIMessagePart.Image("file:///generated-image.png")),
         )
 
-        val result = invokeBuildMessages(listOf(UIMessage(role = MessageRole.ASSISTANT, parts = listOf(tool))))
+        val result = invokeBuildMessages(
+            listOf(UIMessage(role = MessageRole.ASSISTANT, parts = listOf(tool))),
+            supportInputModalities = listOf(Modality.TEXT),
+        )
         val toolResult = result.first { it.jsonObject["role"]?.jsonPrimitive?.content == "tool" }.jsonObject
 
         assertEquals(IMAGE_GENERATION_TOOL_SUCCESS_MESSAGE, toolResult["content"]?.jsonPrimitive?.content)

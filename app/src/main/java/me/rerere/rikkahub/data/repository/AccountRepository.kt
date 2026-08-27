@@ -100,9 +100,10 @@ class AccountRepository(
     }
 
     /** Called on cold start when already authenticated, to self-heal missing or revoked keys. */
-    suspend fun ensureKeysProvisioned() {
-        runCatching { keyProvisioner.ensureProvisioned() }
+    suspend fun ensureKeysProvisioned(): Boolean {
+        return runCatching { keyProvisioner.ensureProvisioned() }
             .onFailure { Log.w(TAG, "key provisioning failed on startup", it) }
+            .isSuccess
     }
 
     suspend fun refreshProfile(): UserProfile {

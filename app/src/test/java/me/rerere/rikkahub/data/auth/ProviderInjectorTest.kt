@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.data.auth
 
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.BuiltInTools
 import me.rerere.rikkahub.data.datastore.BINGO_IMAGE_MODEL_ID
 import me.rerere.rikkahub.data.datastore.BINGO_PROVIDER_ID
 import me.rerere.rikkahub.data.datastore.Settings
@@ -10,13 +11,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The injector is the only writer of API keys, so these tests pin the routing that makes three
- * gateway groups look like one flat model list: chat on the container key, Claude on a per-model
- * overwrite, image generation on its own overwrite because it is billed separately.
+ * The injector is the only writer of API keys, so these tests pin the routing that makes chat and
+ * image gateway groups look like one flat model list. Image generation keeps its own overwrite
+ * because it is billed separately.
  */
 class ProviderInjectorTest {
     private val keys = ProviderKeys(
-        claudeKey = "sk-claude",
         gptKey = "sk-gpt",
         imageKey = "sk-image",
     )
@@ -30,9 +30,7 @@ class ProviderInjectorTest {
         val container = inject().container()
 
         assertEquals("sk-gpt", container.apiKey)
-
-        val claude = container.models.first { it.modelId.startsWith("claude-") }
-        assertEquals("sk-claude", (claude.providerOverwrite as ProviderSetting.Claude).apiKey)
+        assertTrue(container.useResponseApi)
 
         val image = container.models.single { it.id == BINGO_IMAGE_MODEL_ID }
         val imageProvider = image.providerOverwrite as ProviderSetting.OpenAI
@@ -59,7 +57,6 @@ class ProviderInjectorTest {
         assertTrue(container.models.isNotEmpty())
         container.models.forEach { model ->
             when (val overwrite = model.providerOverwrite) {
-                is ProviderSetting.Claude -> assertEquals("", overwrite.apiKey)
                 is ProviderSetting.OpenAI -> assertEquals("", overwrite.apiKey)
                 else -> Unit
             }
@@ -76,7 +73,6 @@ class ProviderInjectorTest {
         val injected = inject()
 
         assertFalse(ProviderInjector.isUpToDate(injected, keys.copy(gptKey = "sk-rotated")))
-        assertFalse(ProviderInjector.isUpToDate(injected, keys.copy(claudeKey = "sk-rotated")))
         // Regression guard: an image key rotated server-side must trigger a rewrite, otherwise
         // drawing silently 401s while chat keeps working.
         assertFalse(ProviderInjector.isUpToDate(injected, keys.copy(imageKey = "sk-rotated")))
@@ -89,6 +85,16 @@ class ProviderInjectorTest {
         }
 
         assertFalse(ProviderInjector.isUpToDate(edited, keys))
+    }
+
+    @Test
+    fun `isUpToDate rejects legacy Chat Completions routing`() {
+        val injected = inject()
+        val legacy = injected.copy(
+            providers = listOf(injected.container().copy(useResponseApi = false))
+        )
+
+        assertFalse(ProviderInjector.isUpToDate(legacy, keys))
     }
 
     @Test
@@ -108,5 +114,26 @@ class ProviderInjectorTest {
                 keys,
             )
         )
+    }
+
+    @Test
+    fun `key reinjection preserves user selected built-in tools`() {
+        val injected = inject()
+        val container = injected.container()
+        val gpt = container.models.first { it.modelId.startsWith("gpt-") }
+        val withSearch = injected.copy(
+            providers = listOf(
+                container.copy(
+                    models = container.models.map { model ->
+                        if (model.id == gpt.id) model.copy(tools = setOf(BuiltInTools.Search)) else model
+                    }
+                )
+            )
+        )
+
+        val reinjected = ProviderInjector.inject(withSearch, keys.copy(gptKey = "sk-rotated"))
+        val updatedGpt = reinjected.container().models.first { it.id == gpt.id }
+
+        assertEquals(setOf(BuiltInTools.Search), updatedGpt.tools)
     }
 }

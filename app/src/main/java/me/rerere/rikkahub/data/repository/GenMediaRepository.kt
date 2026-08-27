@@ -9,5 +9,7 @@ class GenMediaRepository(private val dao: GenMediaDAO) {
 
     suspend fun insertMedia(media: GenMediaEntity) = dao.insert(media)
 
+    suspend fun insertMediaIfAbsent(media: GenMediaEntity): Boolean = dao.insertIfAbsent(media)
+
     suspend fun deleteMedia(id: Int) = dao.delete(id)
 }

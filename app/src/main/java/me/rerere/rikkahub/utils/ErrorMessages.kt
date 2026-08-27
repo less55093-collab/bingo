@@ -32,9 +32,7 @@ internal fun Throwable.chatErrorResId(): Int? {
         this is SocketTimeoutException -> R.string.chat_error_timeout
         this is SSLException -> R.string.chat_error_ssl
 
-        hay.containsAny("insufficient_quota", "insufficient quota", "insufficient balance",
-            "insufficient_user_quota", "quota exceeded", "exceeded your current quota",
-            "余额不足", "额度不足") -> R.string.chat_error_insufficient_balance
+        raw.isInsufficientBalanceError() -> R.string.chat_error_insufficient_balance
 
         hay.containsAny("rate_limit", "rate limit", "too many requests", "429") ->
             R.string.chat_error_rate_limited
@@ -63,6 +61,22 @@ internal fun Throwable.chatErrorResId(): Int? {
 
         else -> null
     }
+}
+
+internal fun String.isInsufficientBalanceError(): Boolean {
+    val hay = lowercase()
+    return hay.containsAny(
+        "insufficient_balance",
+        "insufficient account balance",
+        "insufficient balance",
+        "insufficient_quota",
+        "insufficient quota",
+        "insufficient_user_quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "余额不足",
+        "额度不足",
+    )
 }
 
 private fun String.containsAny(vararg needles: String): Boolean =

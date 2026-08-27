@@ -31,6 +31,7 @@ import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.provider.ClaudePromptCacheTtl
 import me.rerere.ai.provider.ImageGenerationParams
+import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.Provider
@@ -337,7 +338,12 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             put("model", params.model.modelId)
             put(
                 "messages",
-                buildMessages(messages, providerSetting.promptCaching, providerSetting.promptCacheTtl)
+                buildMessages(
+                    messages,
+                    providerSetting.promptCaching,
+                    providerSetting.promptCacheTtl,
+                    includeGeneratedImages = Modality.IMAGE in params.model.inputModalities,
+                )
             )
             put("max_tokens", params.maxTokens ?: 64_000)
 
@@ -425,13 +431,28 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
     private fun buildMessages(
         messages: List<UIMessage>,
         promptCaching: Boolean,
-        promptCacheTtl: ClaudePromptCacheTtl
+        promptCacheTtl: ClaudePromptCacheTtl,
+    ): JsonArray = buildMessages(
+        messages = messages,
+        promptCaching = promptCaching,
+        promptCacheTtl = promptCacheTtl,
+        includeGeneratedImages = false,
+    )
+
+    private fun buildMessages(
+        messages: List<UIMessage>,
+        promptCaching: Boolean,
+        promptCacheTtl: ClaudePromptCacheTtl,
+        includeGeneratedImages: Boolean,
     ) = buildJsonArray {
         messages
             .filter { it.isValidToUpload() && it.role != MessageRole.SYSTEM }
             .forEach { message ->
                 if (message.role == MessageRole.ASSISTANT) {
-                    addAssistantMessage(message)
+                    addAssistantMessage(
+                        message,
+                        includeGeneratedImages = includeGeneratedImages,
+                    )
                 } else {
                     addUserMessage(message)
                 }
@@ -482,7 +503,10 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         })
     }
 
-    private fun JsonArrayBuilder.addAssistantMessage(message: UIMessage) {
+    private fun JsonArrayBuilder.addAssistantMessage(
+        message: UIMessage,
+        includeGeneratedImages: Boolean,
+    ) {
         val groups = groupPartsByToolBoundary(message.parts)
         val contentBuffer = mutableListOf<JsonObject>()
 
@@ -507,7 +531,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                     add(buildJsonObject {
                         put("role", "user")
                         putJsonArray("content") {
-                            group.tools.forEach { add(it.toToolResultBlock()) }
+                            group.tools.forEach { add(it.toToolResultBlock(includeGeneratedImages)) }
                         }
                     })
                 }
@@ -569,11 +593,11 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         put("input", inputAsJson())
     }
 
-    private fun UIMessagePart.Tool.toToolResultBlock() = buildJsonObject {
+    private fun UIMessagePart.Tool.toToolResultBlock(includeGeneratedImages: Boolean) = buildJsonObject {
         put("type", "tool_result")
         put("tool_use_id", toolCallId)
         putJsonArray("content") {
-            outputForModel().mapNotNull { it.toContentBlock() }.forEach { add(it) }
+            outputForModel(includeGeneratedImages).mapNotNull { it.toContentBlock() }.forEach { add(it) }
         }
     }
 

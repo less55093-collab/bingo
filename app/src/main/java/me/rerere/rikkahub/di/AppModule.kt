@@ -19,6 +19,7 @@ import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.data.sync.ChatBackupScheduler
 import me.rerere.rikkahub.data.sync.ChatBackupSync
 import me.rerere.rikkahub.data.sync.ChatBackupWorker
+import me.rerere.rikkahub.service.ImageGenerationRecoveryWorker
 import org.koin.androidx.workmanager.dsl.worker
 import org.koin.core.qualifier.named
 import me.rerere.rikkahub.di.GATEWAY_RAW_CLIENT
@@ -65,6 +66,7 @@ val appModule = module {
     }
 
     worker { ChatBackupWorker(get(), get(), get()) }
+    worker { ImageGenerationRecoveryWorker(get(), get(), get(), get()) }
 
     single<EmojiData> {
         EmojiUtils.loadEmoji(get())

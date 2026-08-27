@@ -2,7 +2,9 @@ package me.rerere.rikkahub.utils
 
 import me.rerere.rikkahub.R
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -89,5 +91,12 @@ class ErrorMessagesTest {
     fun `空白错误信息不映射并交由调用方回退`() {
         assertNull(RuntimeException("   ").chatErrorResId())
         assertNull(RuntimeException().chatErrorResId())
+    }
+
+    @Test
+    fun `只有已知余额错误触发充值分类`() {
+        assertTrue("INSUFFICIENT_BALANCE: Insufficient account balance".isInsufficientBalanceError())
+        assertTrue("余额不足".isInsufficientBalanceError())
+        assertFalse("insufficient image detail".isInsufficientBalanceError())
     }
 }

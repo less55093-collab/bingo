@@ -31,6 +31,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,6 +58,7 @@ import coil3.request.crossfade
 import coil3.svg.SvgDecoder
 import com.dokar.sonner.Toaster
 import com.dokar.sonner.rememberToasterState
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.Serializable
 import me.rerere.rikkahub.data.datastore.SettingsStore
@@ -264,7 +266,7 @@ class RouteActivity : ComponentActivity() {
         }
         val startScreen = remember(notificationConversationId) {
             if (!authTokenStore.tokensBlocking().isPresent) {
-                Screen.Login
+                if (authTokenStore.tutorialShownBlocking()) Screen.Login else Screen.Tutorial
             } else {
                 Screen.Chat(
                     id = notificationConversationId ?: if (readBooleanPreference("create_new_conversation_on_start", true)) {
@@ -298,7 +300,8 @@ class RouteActivity : ComponentActivity() {
         LaunchedEffect(authState) {
             if (authState is AuthState.Unauthenticated &&
                 backStack.lastOrNull() !is Screen.Login &&
-                backStack.lastOrNull() !is Screen.Register
+                backStack.lastOrNull() !is Screen.Register &&
+                backStack.lastOrNull() !is Screen.Tutorial
             ) {
                 backStack.clear()
                 backStack.add(Screen.Login)
@@ -309,11 +312,10 @@ class RouteActivity : ComponentActivity() {
             if (authState is AuthState.Authenticated) {
                 accountRepository.ensureKeysProvisioned()
                 imageGenerationManager.recoverPendingTasks()
-                // Show the top-up walkthrough once, after the first successful login.
-                // Gated on a persisted flag so it never reappears on later launches.
+                // The walkthrough now runs before login. Existing authenticated users should not
+                // be interrupted by it after upgrading.
                 if (!authTokenStore.tutorialShownFlow.first()) {
                     authTokenStore.setTutorialShown(true)
-                    backStack.add(Screen.Tutorial)
                 }
             }
         }
@@ -382,7 +384,20 @@ class RouteActivity : ComponentActivity() {
                             }
 
                             entry<Screen.Tutorial> {
-                                TutorialPage()
+                                val scope = rememberCoroutineScope()
+                                TutorialPage(
+                                    onComplete = {
+                                        scope.launch {
+                                            authTokenStore.setTutorialShown(true)
+                                            if (authState is AuthState.Authenticated) {
+                                                backStack.removeLastOrNull()
+                                            } else {
+                                                backStack.clear()
+                                                backStack.add(Screen.Login)
+                                            }
+                                        }
+                                    },
+                                )
                             }
 
                             entry<Screen.Chat>(

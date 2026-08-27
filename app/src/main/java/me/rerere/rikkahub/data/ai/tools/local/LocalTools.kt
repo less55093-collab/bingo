@@ -32,6 +32,8 @@ class LocalTools(
 
     val imageGenerationTool by lazy { buildImageGenerationTool(imageGenerationManager) }
 
+    val imageGenerationPlanTool by lazy { buildPlanImageGenerationTool(imageGenerationManager) }
+
     fun getTools(options: List<LocalToolOption>): List<Tool> {
         val tools = mutableListOf<Tool>()
         if (options.contains(LocalToolOption.JavascriptEngine)) {
@@ -58,6 +60,7 @@ class LocalTools(
         }
         if (options.contains(LocalToolOption.ImageGeneration)) {
             tools.add(imageGenerationTool)
+            tools.add(imageGenerationPlanTool)
         }
         return tools
     }

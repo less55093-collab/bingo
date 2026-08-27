@@ -1,10 +1,10 @@
 package me.rerere.rikkahub.ui.pages.tutorial
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -13,8 +13,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -26,32 +26,29 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.Screen
-import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import me.rerere.rikkahub.ui.components.nav.BackButton
-import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.theme.CustomColors
-import me.rerere.rikkahub.utils.openUrl
 
 @Composable
-fun TutorialPage() {
+fun TutorialPage(onComplete: () -> Unit) {
     val steps = TutorialSteps
     val pagerState = rememberPagerState { steps.size }
     val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-    val navController = LocalNavController.current
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.tutorial_page_title)) },
                 navigationIcon = { BackButton() },
+                actions = {
+                    TextButton(onClick = onComplete) { Text(stringResource(R.string.tutorial_skip)) }
+                },
                 colors = CustomColors.topBarColors,
             )
         },
@@ -68,13 +65,7 @@ fun TutorialPage() {
             ) { page ->
                 TutorialStepContent(
                     step = steps[page],
-                    onAction = { action ->
-                        when (action) {
-                            TutorialAction.OpenShop -> context.openUrl(BingoGatewayAPI.SHOP_URL)
-                            TutorialAction.GoRedeem -> navController.navigate(Screen.Redeem)
-                            TutorialAction.None -> Unit
-                        }
-                    },
+                        onAction = {},
                 )
             }
 
@@ -133,7 +124,7 @@ fun TutorialPage() {
                     }
                 } else {
                     Button(
-                        onClick = { navController.popBackStack() },
+                        onClick = onComplete,
                         modifier = Modifier.weight(1f),
                     ) {
                         Text(stringResource(R.string.tutorial_done))
@@ -156,22 +147,9 @@ private fun TutorialStepContent(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Surface(
-            shape = CircleShape,
-            color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            modifier = Modifier.size(96.dp),
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    imageVector = step.icon,
-                    contentDescription = null,
-                    modifier = Modifier.size(40.dp),
-                    tint = MaterialTheme.colorScheme.primary,
-                )
-            }
-        }
+        TutorialChatPreview(step.preview)
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         Text(
             text = stringResource(step.title),
@@ -194,4 +172,107 @@ private fun TutorialStepContent(
             }
         }
     }
+}
+
+@Composable
+private fun TutorialChatPreview(preview: TutorialPreview) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 312.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        tonalElevation = 2.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "新对话",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            TutorialBubble(
+                text = when (preview) {
+                    TutorialPreview.Idea -> "我想做一张咖啡店开业海报，感觉温暖一点"
+                    TutorialPreview.Plan -> "先给我 3 个不同风格的方案，我选好后再生成"
+                    TutorialPreview.Result -> "就用温暖手作风，生成吧"
+                },
+                mine = true,
+            )
+            when (preview) {
+                TutorialPreview.Idea -> {
+                    TutorialBubble(
+                        text = "收到。我会帮你确定主体、风格和画面比例。",
+                        mine = false,
+                    )
+                    TutorialDetail("温暖色调  ·  咖啡香气  ·  开业信息区")
+                }
+                TutorialPreview.Plan -> {
+                    Text("为你准备了 3 个画面方向", style = MaterialTheme.typography.labelLarge)
+                    TutorialPlanRow("温暖手作风", "咖啡、木质和手写感", selected = true)
+                    TutorialPlanRow("极简现代风", "留白、几何和清晰信息", selected = false)
+                    TutorialPlanRow("夜间霓虹风", "城市感和明亮灯光", selected = false)
+                }
+                TutorialPreview.Result -> {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(136.dp),
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(18.dp),
+                            verticalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text("COFFEE OPENING", style = MaterialTheme.typography.titleMedium)
+                            Text("Warm. Fresh. Yours.", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                    TutorialDetail("已按温暖手作风生成")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TutorialBubble(text: String, mine: Boolean) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(10.dp),
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun TutorialPlanRow(title: String, detail: String, selected: Boolean) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(6.dp),
+        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Column(modifier = Modifier.padding(9.dp)) {
+            Text(title, style = MaterialTheme.typography.labelLarge)
+            Text(detail, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+@Composable
+private fun TutorialDetail(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }

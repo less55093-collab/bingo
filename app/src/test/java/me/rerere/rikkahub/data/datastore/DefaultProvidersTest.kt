@@ -4,7 +4,6 @@ import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderSetting
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,6 +23,7 @@ class DefaultProvidersTest {
         assertEquals("https://api.bingoapi.top/v1", provider.baseUrl)
         assertTrue(provider.enabled)
         assertTrue(provider.builtIn)
+        assertTrue(provider.useResponseApi)
     }
 
     @Test
@@ -53,18 +53,10 @@ class DefaultProvidersTest {
     }
 
     @Test
-    fun `claude models carry a claude provider overwrite`() {
+    fun `no Claude models ship in the Bingo provider`() {
         val claudeModels = provider.models.filter { it.modelId.startsWith("claude-") }
 
-        assertTrue(claudeModels.isNotEmpty())
-        claudeModels.forEach { model ->
-            val overwrite = model.providerOverwrite
-            assertNotNull("${model.modelId} needs an overwrite to reach /v1/messages", overwrite)
-            assertTrue(
-                "${model.modelId} must overwrite with a Claude provider",
-                overwrite is ProviderSetting.Claude,
-            )
-        }
+        assertTrue(claudeModels.isEmpty())
     }
 
     @Test

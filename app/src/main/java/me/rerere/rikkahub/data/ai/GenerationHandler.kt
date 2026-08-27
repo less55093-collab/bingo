@@ -59,6 +59,15 @@ private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 
+internal fun validateExecutableToolCalls(tools: List<UIMessagePart.Tool>) {
+    require(tools.all { it.toolCallId.isNotBlank() }) {
+        "Model returned an incomplete tool call without an id"
+    }
+    require(tools.all { it.toolName.isNotBlank() }) {
+        "Model returned an incomplete tool call without a name"
+    }
+}
+
 @Serializable
 sealed interface GenerationChunk {
     data class Messages(
@@ -243,10 +252,12 @@ class GenerationHandler(
             }
 
             // Handle tools (execute approved tools, handle denied tools)
+            validateExecutableToolCalls(toolsToProcess)
+
             // 同一轮里的多个工具调用并发执行，否则生成多张图片时会串行排队，等待时间成倍增加
             val executedTools = coroutineScope {
                 toolsToProcess.map { tool ->
-                    async { executeTool(tool, toolsInternal) }
+                    async { executeTool(tool, toolsInternal, messages) }
                 }.awaitAll().filterNotNull()
             }
 
@@ -399,6 +410,7 @@ class GenerationHandler(
     private suspend fun executeTool(
         tool: UIMessagePart.Tool,
         toolsInternal: List<Tool>,
+        messages: List<UIMessage>,
     ): UIMessagePart.Tool? {
         return when (val approvalState = tool.approvalState) {
             is ToolApprovalState.Denied -> tool.copy(
@@ -435,7 +447,7 @@ class GenerationHandler(
                     TAG,
                     "generateText: executing tool=${toolDef.name} inputBytes=${tool.input.toByteArray().size}"
                 )
-                val result = toolDef.execute(args)
+                val result = toolDef.executeWithContext(args, messages)
                 val hasShellAccess = toolsInternal.any { it.name == "workspace_shell" }
                 tool.copy(output = maybeTruncateToolOutput(tool.toolCallId, result, hasShellAccess))
             }.getOrElse {

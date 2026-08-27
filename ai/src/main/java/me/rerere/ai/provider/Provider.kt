@@ -11,6 +11,15 @@ import me.rerere.ai.ui.ImageGenerationItem
 import me.rerere.ai.ui.MessageChunk
 import me.rerere.ai.ui.UIMessage
 
+/**
+ * A durable image request reached a state that cannot become successful by polling or replaying it.
+ * Callers must remove their local recovery record and surface the failure to the user.
+ */
+open class ImageGenerationTerminalException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
+
 // 提供商实现
 // 采用无状态设计，使用时除了需要传入需要的参数外，还需要传入provider setting作为参数
 interface Provider<T : ProviderSetting> {
@@ -58,6 +67,7 @@ interface Provider<T : ProviderSetting> {
         taskId: String,
         customHeaders: List<CustomHeader> = emptyList(),
         traceId: String = "",
+        apiKeyFingerprint: String = "",
         onTaskFailed: suspend (String) -> Unit = {},
     ): Flow<ImageGenerationItem> {
         error("Asynchronous image tasks are not supported")
@@ -86,10 +96,24 @@ data class ImageGenerationParams(
     val customBody: List<CustomBody> = emptyList(),
     /** Internal-only correlation ID for performance logs. It is never sent to an API. */
     @Transient val traceId: String = "",
+    /** Stable key used by asynchronous gateways to make a lost submit response retry-safe. */
+    @Transient val idempotencyKey: String = "",
     /** Called after the gateway has durably accepted an asynchronous task. */
     @Transient val onTaskSubmitted: suspend (String) -> Unit = {},
-    /** Called only when the gateway reports a terminal failed task. */
+    /** Called after selecting the outbound API key, before sending the billable request. */
+    @Transient val onImageKeySelected: suspend (String) -> Unit = {},
+    /** Called only when an explicitly unsupported async endpoint is downgraded to sync. */
+    @Transient val onAsyncFallback: suspend () -> Unit = {},
+    /** Recovery must never downgrade to sync because an earlier async POST may already be billed. */
+    @Transient val allowSynchronousFallback: Boolean = true,
+    /** Called when the gateway reports a terminal task failure or rejects async submission. */
     @Transient val onTaskFailed: suspend (String) -> Unit = {},
+    /**
+     * Recovery-only key binding. `null` means a new request may use the normal roulette; any
+     * non-null value requires the exact previously persisted key and must fail before POST when
+     * that key is no longer configured.
+     */
+    @Transient val requiredApiKeyFingerprint: String? = null,
 )
 
 @Serializable
@@ -103,10 +127,20 @@ data class ImageEditParams(
     val customBody: List<CustomBody> = emptyList(),
     /** Internal-only correlation ID for performance logs. It is never sent to an API. */
     @Transient val traceId: String = "",
+    /** Stable key used by asynchronous gateways to make a lost submit response retry-safe. */
+    @Transient val idempotencyKey: String = "",
     /** Called after the gateway has durably accepted an asynchronous task. */
     @Transient val onTaskSubmitted: suspend (String) -> Unit = {},
-    /** Called only when the gateway reports a terminal failed task. */
+    /** Called after selecting the outbound API key, before sending the billable request. */
+    @Transient val onImageKeySelected: suspend (String) -> Unit = {},
+    /** Called only when an explicitly unsupported async endpoint is downgraded to sync. */
+    @Transient val onAsyncFallback: suspend () -> Unit = {},
+    /** See [ImageGenerationParams.allowSynchronousFallback]. */
+    @Transient val allowSynchronousFallback: Boolean = true,
+    /** Called when the gateway reports a terminal task failure or rejects async submission. */
     @Transient val onTaskFailed: suspend (String) -> Unit = {},
+    /** See [ImageGenerationParams.requiredApiKeyFingerprint]. */
+    @Transient val requiredApiKeyFingerprint: String? = null,
 )
 
 @Serializable

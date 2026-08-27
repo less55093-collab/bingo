@@ -1,0 +1,12 @@
+Image prompt recipes
+
+This application includes compact, model-neutral composition rules adapted from
+the category taxonomy and prompt patterns in Awesome Nano Banana Pro Prompts.
+
+Source: https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts
+Pinned source revision: f94024d3aacceb08a497656ee1d66f8fbfbe49e7
+License: CC BY 4.0
+
+The bundled rules are independently condensed for on-device, token-bounded use
+with the application's image-generation models. They are not a copy of the
+upstream prompt catalogue.

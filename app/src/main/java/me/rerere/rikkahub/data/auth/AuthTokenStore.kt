@@ -14,6 +14,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.Serializable
 import me.rerere.rikkahub.data.model.gateway.UserProfile
 import me.rerere.rikkahub.utils.JsonInstant
+import java.util.UUID
 
 /**
  * Deliberately a **separate** DataStore from `settings`: that one is serialized wholesale into
@@ -67,7 +68,6 @@ class AuthTokenStore(private val context: Context) {
 
     val providerKeysFlow: Flow<ProviderKeys> = dataStore.data.map { prefs ->
         ProviderKeys(
-            claudeKey = prefs[CLAUDE_KEY].orEmpty(),
             gptKey = prefs[GPT_KEY].orEmpty(),
             imageKey = prefs[IMAGE_KEY].orEmpty(),
         )
@@ -77,7 +77,10 @@ class AuthTokenStore(private val context: Context) {
 
     val pendingImageTasksFlow: Flow<List<PendingImageTask>> = dataStore.data.map { prefs ->
         prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-            runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+            runCatching {
+                JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                    .map(PendingImageTask::normalized)
+            }.getOrNull()
         } ?: emptyList()
     }
 
@@ -92,6 +95,8 @@ class AuthTokenStore(private val context: Context) {
      * route, so an authenticated user never sees a login screen flash before being redirected.
      */
     fun tokensBlocking(): AuthTokens = runBlocking { currentTokens() }
+
+    fun tutorialShownBlocking(): Boolean = runBlocking { tutorialShownFlow.first() }
 
     fun profileBlocking(): UserProfile? = runBlocking { profileFlow.first() }
 
@@ -110,7 +115,8 @@ class AuthTokenStore(private val context: Context) {
 
     suspend fun saveProviderKeys(keys: ProviderKeys) {
         dataStore.edit { prefs ->
-            prefs[CLAUDE_KEY] = keys.claudeKey
+            // Clear the legacy Claude secret rather than retaining an unused key on disk.
+            prefs[CLAUDE_KEY] = ""
             prefs[GPT_KEY] = keys.gptKey
             prefs[IMAGE_KEY] = keys.imageKey
         }
@@ -121,12 +127,19 @@ class AuthTokenStore(private val context: Context) {
     }
 
     suspend fun savePendingImageTask(task: PendingImageTask) {
+        val normalized = task.normalized()
         dataStore.edit { prefs ->
             val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+                runCatching {
+                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                        .map(PendingImageTask::normalized)
+                }.getOrNull()
             }.orEmpty()
             prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(
-                tasks.filterNot { it.taskId == task.taskId } + task
+                tasks.filterNot {
+                    it.requestId == normalized.requestId ||
+                        (normalized.taskId != null && it.taskId == normalized.taskId)
+                } + normalized
             )
         }
     }
@@ -134,8 +147,57 @@ class AuthTokenStore(private val context: Context) {
     suspend fun removePendingImageTask(taskId: String) {
         dataStore.edit { prefs ->
             val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching { JsonInstant.decodeFromString<List<PendingImageTask>>(encoded) }.getOrNull()
+                runCatching {
+                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                        .map(PendingImageTask::normalized)
+                }.getOrNull()
             }.orEmpty().filterNot { it.taskId == taskId }
+            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
+            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        }
+    }
+
+    suspend fun removePendingImageTaskByRequestId(requestId: String) {
+        dataStore.edit { prefs ->
+            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+                runCatching {
+                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                        .map(PendingImageTask::normalized)
+                }.getOrNull()
+            }.orEmpty().filterNot { it.requestId == requestId }
+            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
+            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        }
+    }
+
+    suspend fun setPendingImageTaskId(requestId: String, taskId: String) {
+        if (requestId.isBlank() || taskId.isBlank()) return
+        dataStore.edit { prefs ->
+            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+                runCatching {
+                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                        .map(PendingImageTask::normalized)
+                }.getOrNull()
+            }.orEmpty().map { task ->
+                if (task.requestId == requestId) task.copy(taskId = taskId) else task
+            }
+            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
+            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        }
+    }
+
+    /** Binds recovery polling to the same configured API key used for submission. */
+    suspend fun setPendingImageTaskKeyFingerprint(requestId: String, fingerprint: String) {
+        if (requestId.isBlank() || fingerprint.isBlank()) return
+        dataStore.edit { prefs ->
+            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
+                runCatching {
+                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
+                        .map(PendingImageTask::normalized)
+                }.getOrNull()
+            }.orEmpty().map { task ->
+                if (task.requestId == requestId) task.copy(apiKeyFingerprint = fingerprint) else task
+            }
             if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
             else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
         }
@@ -149,19 +211,38 @@ class AuthTokenStore(private val context: Context) {
 
 @Serializable
 data class PendingImageTask(
-    val taskId: String,
-    val prompt: String,
+    val taskId: String? = null,
+    val prompt: String = "",
     val sourcePaths: String? = null,
-    val modelName: String,
-    val origin: String,
+    val modelName: String = "",
+    val origin: String = "",
     val createdAt: Long = System.currentTimeMillis(),
-)
+    val requestId: String = "",
+    val modelId: String = "",
+    val providerId: String = "",
+    /** Gateway identity used by the original async POST; retained across provider edits. */
+    val providerBaseUrl: String = "",
+    val size: String = "",
+    val numOfImages: Int = 1,
+    val editing: Boolean = false,
+    /** SHA-256 identity of the key used for the original async submission. */
+    val apiKeyFingerprint: String = "",
+) {
+    fun normalized(): PendingImageTask = if (requestId.isNotBlank()) {
+        this
+    } else {
+        copy(requestId = taskId?.takeIf(String::isNotBlank) ?: UUID.randomUUID().toString())
+    }
+}
+
+/** An empty fingerprint means key selection had not happened before the process stopped. */
+internal fun PendingImageTask.recoveryApiKeyFingerprint(): String? =
+    apiKeyFingerprint.takeIf(String::isNotBlank)
 
 data class ProviderKeys(
-    val claudeKey: String = "",
     val gptKey: String = "",
     val imageKey: String = "",
 ) {
     val isComplete: Boolean
-        get() = claudeKey.isNotBlank() && gptKey.isNotBlank() && imageKey.isNotBlank()
+        get() = gptKey.isNotBlank() && imageKey.isNotBlank()
 }

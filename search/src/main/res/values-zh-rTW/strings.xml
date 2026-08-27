@@ -1,9 +1,8 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <resources>
-  <string name="bing_desc">注意Bing搜尋目前基於爬蟲，很容易被風控攔截，不推薦使用</string>
+  <string name="bing_desc">非官方 Bing 網頁擷取，無需 API Key。已啟用查詢拆分、相關性過濾和去重；仍可能受 Bing 風控或地區策略影響。</string>
   <string name="click_to_get_api_key">點擊獲取API Key</string>
   <string name="searxng_desc_1">settings.yml內需要開啟json format支援:</string>
   <string name="searxng_desc_2">search:\n  formats:\n    - html\n    - json</string>
   <string name="custom_js_desc">由 QuickJS 驅動的自訂搜尋提供者。實作 search(query, resultSize) 函式，並可選擇實作 scrape(urls) 函式。使用 fetch(url, options?) 進行 HTTP 請求。</string>
 </resources>
-

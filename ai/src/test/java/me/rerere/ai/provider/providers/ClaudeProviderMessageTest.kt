@@ -351,6 +351,36 @@ class ClaudeProviderMessageTest {
     }
 
     @Test
+    fun `search continuation preserves the original user question`() {
+        val question = "东北财经大学和山东财经大学的金融专硕哪个更好上岸？"
+        val messages = listOf(
+            UIMessage.user(question),
+            UIMessage(
+                role = MessageRole.ASSISTANT,
+                parts = listOf(
+                    createExecutedTool(
+                        "call-search",
+                        "search_web",
+                        """{"query":"山东财经大学 金融专硕 分数线"}""",
+                        "search results",
+                    )
+                ),
+            ),
+        )
+
+        val result = invokeBuildMessages(messages)
+        val firstUserText = result.first().jsonObject["content"]
+            ?.jsonArray
+            ?.first()
+            ?.jsonObject
+            ?.get("text")
+            ?.jsonPrimitive
+            ?.content
+
+        assertEquals(question, firstUserText)
+    }
+
+    @Test
     fun `image generation tool result is summarized without uploading its image`() {
         val tool = UIMessagePart.Tool(
             toolCallId = "image-call",

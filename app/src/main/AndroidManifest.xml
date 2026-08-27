@@ -115,11 +115,25 @@
       android:name="com.yalantis.ucrop.UCropActivity"
       android:theme="@style/Theme.AppCompat.Light.NoActionBar" />
 
-    <service
+  <service
       android:name=".service.GenerationForegroundService"
       android:exported="false"
-      android:foregroundServiceType="dataSync"
-      android:stopWithTask="false" />
+      android:foregroundServiceType="specialUse"
+      android:stopWithTask="false">
+      <property
+        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        android:value="user initiated long running AI image generation" />
+    </service>
+
+    <service
+      android:name="androidx.work.impl.foreground.SystemForegroundService"
+      android:exported="false"
+      android:foregroundServiceType="specialUse"
+      tools:node="merge">
+      <property
+        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        android:value="durable user initiated AI image task recovery" />
+    </service>
 
     <service
       android:name=".service.WebServerService"

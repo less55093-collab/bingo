@@ -7,8 +7,15 @@ import android.util.Log
 import androidx.core.net.toFile
 import androidx.core.net.toUri
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -292,16 +299,8 @@ class FilesManager(
      * 再走一遍 base64. 同一分区内 [File.renameTo] 是元数据操作, 几 MB 的图也是瞬时完成;
      * 跨分区会失败, 那时才退回拷贝.
      */
-    fun moveImageFileTo(source: File, filePath: String): File {
-        val file = File(filePath)
-        file.parentFile?.mkdirs()
-        if (source.renameTo(file)) return file
-        source.inputStream().use { input ->
-            file.outputStream().use { output -> input.copyTo(output) }
-        }
-        source.delete()
-        return file
-    }
+    fun moveImageFileTo(source: File, filePath: String): File =
+        moveImageFileDurably(source, File(filePath))
 
     fun listImageFiles(): List<File> {
         val imagesDir = getImagesDir()
@@ -508,6 +507,157 @@ class FilesManager(
 
     private fun guessMimeType(file: File, fileName: String): String =
         FileUtils.guessMimeType(file, fileName)
+}
+
+/**
+ * Installs a downloaded image without ever streaming bytes into the final path.
+ *
+ * A non-empty target is treated as an already committed result. A zero-byte target can only be
+ * replaced after the source has been copied and synchronised in a sibling temporary file.
+ */
+private val imageMoveLocks = ConcurrentHashMap<String, Any>()
+
+internal fun moveImageFileDurably(source: File, target: File): File {
+    val sourcePath = source.absoluteFile.toPath().normalize()
+    val targetPath = target.absoluteFile.toPath().normalize()
+    val lockKey = targetPath.toString()
+    val lock = imageMoveLocks.computeIfAbsent(lockKey) { Any() }
+    return synchronized(lock) {
+        try {
+            moveImageFileDurablyLocked(source, target, sourcePath, targetPath)
+        } finally {
+            imageMoveLocks.remove(lockKey, lock)
+        }
+    }
+}
+
+private fun moveImageFileDurablyLocked(
+    source: File,
+    target: File,
+    sourcePath: java.nio.file.Path,
+    targetPath: java.nio.file.Path,
+): File {
+    if (sourcePath == targetPath) return target
+
+    val parent = target.absoluteFile.parentFile
+        ?: throw IOException("Image target has no parent: ${target.absolutePath}")
+    if (!parent.exists() && !parent.mkdirs() && !parent.isDirectory) {
+        throw IOException("Unable to create image target directory: ${parent.absolutePath}")
+    }
+    if (!parent.isDirectory) {
+        throw IOException("Image target parent is not a directory: ${parent.absolutePath}")
+    }
+
+    // A prior successful attempt wins. In particular, never truncate a valid result while
+    // retrying a task after process death.
+    if (target.isFile && target.length() > 0L) return target
+    if (target.exists() && !target.isFile) {
+        throw IOException("Image target exists and is not a regular file: ${target.absolutePath}")
+    }
+    check(source.isFile) { "Image source does not exist: ${source.absolutePath}" }
+
+    var directMoveFailure: IOException? = null
+    if (!target.exists()) {
+        try {
+            syncFile(source)
+            movePath(sourcePath, targetPath, replaceExisting = false)
+            syncDirectory(parent)
+            return target
+        } catch (e: FileAlreadyExistsException) {
+            // Another recovery attempt may have committed the same result meanwhile. Preserve it.
+            if (target.isFile && target.length() > 0L) return target
+            directMoveFailure = e
+        } catch (e: IOException) {
+            // Cross-device moves and providers without atomic rename support use the durable copy
+            // path below. The source is still present when a move fails.
+            if (target.isFile && target.length() > 0L) return target
+            directMoveFailure = e
+        }
+    }
+
+    try {
+        return copyImageToSiblingAndInstall(source, target, parent)
+    } catch (e: IOException) {
+        directMoveFailure?.let(e::addSuppressed)
+        throw e
+    }
+}
+
+private fun copyImageToSiblingAndInstall(source: File, target: File, parent: File): File {
+    var temporary: java.nio.file.Path? = null
+    try {
+        val prefix = ".${target.name.take(48).ifEmpty { "image" }}-"
+        temporary = Files.createTempFile(parent.toPath(), prefix, ".tmp")
+        FileInputStream(source).use { input ->
+            FileOutputStream(temporary.toFile()).use { output ->
+                input.copyTo(output)
+                output.flush()
+                output.fd.sync()
+            }
+        }
+
+        // Do the check again after the potentially slow copy. If another worker committed a
+        // non-empty result, discard only our temporary file and keep that result untouched.
+        if (target.isFile && target.length() > 0L) return target
+        if (target.exists() && !target.isFile) {
+            throw IOException("Image target exists and is not a regular file: ${target.absolutePath}")
+        }
+
+        // REPLACE_EXISTING is intentional only for the stale zero-byte target case. The check
+        // above protects a previously committed non-empty result from being overwritten.
+        movePath(temporary, target.toPath(), replaceExisting = target.exists())
+        temporary = null
+        syncDirectory(parent)
+        runCatching { source.delete() }
+        return target
+    } finally {
+        temporary?.let { path -> runCatching { Files.deleteIfExists(path) } }
+    }
+}
+
+private fun movePath(
+    source: java.nio.file.Path,
+    target: java.nio.file.Path,
+    replaceExisting: Boolean,
+) {
+    try {
+        if (replaceExisting) {
+            Files.move(
+                source,
+                target,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
+        } else {
+            Files.move(source, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+        }
+    } catch (_: AtomicMoveNotSupportedException) {
+        // The temporary file is in the destination directory, so the ordinary rename remains
+        // atomic on the local filesystem even when the provider does not expose ATOMIC_MOVE.
+        if (replaceExisting) {
+            Files.move(source, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } else {
+            Files.move(source, target)
+        }
+    } catch (_: UnsupportedOperationException) {
+        // A few Android file-system providers use UnsupportedOperationException instead of the
+        // JDK-specific AtomicMoveNotSupportedException for the same capability gap.
+        if (replaceExisting) {
+            Files.move(source, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } else {
+            Files.move(source, target)
+        }
+    }
+}
+
+private fun syncFile(file: File) {
+    FileInputStream(file).use { input -> input.fd.sync() }
+}
+
+private fun syncDirectory(directory: File) {
+    // Directory fsync is not available on every Android filesystem. The file data is already
+    // synced; best-effort directory sync closes the rename durability window where supported.
+    runCatching { FileInputStream(directory).use { input -> input.fd.sync() } }
 }
 
 data class SyncResult(
