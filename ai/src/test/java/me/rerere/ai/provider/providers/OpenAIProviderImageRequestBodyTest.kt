@@ -18,7 +18,6 @@ import okhttp3.OkHttpClient
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -220,7 +219,7 @@ class OpenAIProviderImageRequestBodyTest {
     }
 
     @Test
-    fun `image posts never reuse pooled connections`() {
+    fun `image posts reuse a healthy pooled connection`() {
         repeat(2) {
             server.enqueue(
                 MockResponse.Builder()
@@ -244,7 +243,7 @@ class OpenAIProviderImageRequestBodyTest {
 
         val first = server.takeRequest()
         val second = server.takeRequest()
-        assertNotEquals(first.connectionIndex, second.connectionIndex)
+        assertEquals(first.connectionIndex, second.connectionIndex)
     }
 
     @Test

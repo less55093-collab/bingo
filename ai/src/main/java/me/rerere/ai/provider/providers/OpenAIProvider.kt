@@ -107,18 +107,20 @@ class OpenAIProvider(
     private val chatCompletionsAPI = ChatCompletionsAPI(client = streamingClient, keyRoulette = keyRoulette)
     private val responseAPI = ResponseAPI(client = streamingClient, keyRoulette = keyRoulette)
     private val imageRequestClient = client.newBuilder()
-        // Image POSTs are long-lived and billable. Never reuse a chat socket that an OEM may have
-        // silently killed in the background; keep a negotiated HTTP/2 call alive while it waits.
-        .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
-        // A slow image provider is not a failed request. Keep transport read/write/call limits
-        // disabled; cancellation (user action, process teardown, or an explicit retry boundary)
-        // remains the only lifecycle stop for image generation and task polling.
-        .callTimeout(0, TimeUnit.MILLISECONDS)
-        .connectTimeout(0, TimeUnit.MILLISECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .writeTimeout(0, TimeUnit.MILLISECONDS)
-        // A provider may legitimately remain silent for an arbitrary amount of time. A client
-        // ping is itself a liveness deadline and can tear down a valid long-running generation.
+        // Reuse healthy TLS/HTTP2 connections between the submit and poll requests. A zero-sized
+        // pool forces a new handshake for every 3-second poll and is especially fragile after a
+        // mobile network hand-off.
+        .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
+        // A task may run for minutes, but one HTTP exchange must still have a liveness boundary.
+        // Without these limits a half-dead socket can suspend the coroutine forever and prevent
+        // WorkManager recovery from taking over. The durable task idempotency key makes a retry of
+        // an async submit safe; synchronous fallbacks keep retryOnConnectionFailure disabled.
+        .callTimeout(3, TimeUnit.MINUTES)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(2, TimeUnit.MINUTES)
+        // A provider may legitimately remain silent while processing. Polling has its own
+        // deadline, so an HTTP/2 ping is unnecessary and can tear down a valid long-running call.
         .pingInterval(0, TimeUnit.MILLISECONDS)
         .retryOnConnectionFailure(false)
         .build()
@@ -736,7 +738,12 @@ class OpenAIProvider(
             response.use { resp ->
                 if (!resp.isSuccessful) {
                     if (resp.code >= 500 || resp.code == 408 || resp.code == 429) {
-                        delay(imageTaskPollIntervalMillis)
+                        val retryDelay = pollRetryDelay(resp)
+                        // Release the socket before waiting. Keeping a response body open during
+                        // a Retry-After delay can exhaust the small image connection pool when a
+                        // gateway is rate limiting several tasks at once.
+                        resp.close()
+                        delay(retryDelay)
                         return@use
                     }
                     if (resp.code == 410) {
@@ -783,13 +790,17 @@ class OpenAIProvider(
                     )
                 }
                 val status = body["status"]?.jsonPrimitive?.contentOrNull
+                    ?.trim()
+                    ?.lowercase()
                 when (status) {
-                "processing" -> {
+                in PROCESSING_IMAGE_TASK_STATUSES -> {
                     trace(traceId, "async_task_processing", "task_id=$taskId poll=$pollCount")
-                    delay(imageTaskPollIntervalMillis)
+                    val retryDelay = pollRetryDelay(resp)
+                    resp.close()
+                    delay(retryDelay)
                 }
 
-                "completed" -> {
+                in COMPLETED_IMAGE_TASK_STATUSES -> {
                     val result = body["result"] ?: run {
                         notifyTaskFailureBestEffort(onTaskFailed, taskId)
                         throw ImageGenerationTerminalException(
@@ -845,6 +856,15 @@ class OpenAIProvider(
         }
         @Suppress("UNREACHABLE_CODE")
         error("image task polling loop exited unexpectedly")
+    }
+
+    /** Prefer the gateway's backoff hint, while keeping a broken header from stalling recovery. */
+    private fun pollRetryDelay(response: Response): Long {
+        val retryAfterSeconds = response.header("Retry-After")?.trim()?.toLongOrNull()
+        return retryAfterSeconds
+            ?.coerceIn(1L, MAX_POLL_RETRY_DELAY_SECONDS)
+            ?.times(1_000L)
+            ?: imageTaskPollIntervalMillis
     }
 
     private suspend fun notifyTaskFailureBestEffort(
@@ -1003,19 +1023,19 @@ class OpenAIProvider(
     }
 
     /**
-     * Image URLs are downloaded without a total or idle-read deadline. A transport failure or
+     * Image URLs are downloaded with a generous per-exchange deadline. A transport failure or
      * process restart resumes from the durable `.part` file, so a slow CDN cannot turn a transient
      * connection problem into a second billable image request.
      */
     private val imageDownloadClient by lazy {
         client.newBuilder()
-            .callTimeout(0, TimeUnit.MILLISECONDS)
-            .connectTimeout(0, TimeUnit.MILLISECONDS)
-            // Do not turn a slow CDN into a false image-generation failure. A transport error,
-            // coroutine cancellation, or a process restart still leaves the durable .part file
-            // available for the next Range request.
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .writeTimeout(0, TimeUnit.MILLISECONDS)
+            // Keep a slow CDN usable, but make a dead socket observable so the resumable `.part`
+            // file can be retried. Infinite OkHttp timeouts otherwise defeat process-death and
+            // WorkManager recovery because the coroutine never returns to its retry loop.
+            .callTimeout(10, TimeUnit.MINUTES)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(2, TimeUnit.MINUTES)
+            .writeTimeout(2, TimeUnit.MINUTES)
             .pingInterval(0, TimeUnit.MILLISECONDS)
             .build()
     }
@@ -1416,12 +1436,24 @@ class OpenAIProvider(
         private const val IMAGE_DOWNLOAD_RETRY_DELAY_MS = 500L
         private const val CHAT_HTTP2_PING_INTERVAL_SECONDS = 15L
         private const val IMAGE_TASK_POLL_INTERVAL_MS = 3_000L
+        private const val MAX_POLL_RETRY_DELAY_SECONDS = 30L
         private const val ASYNC_IMAGE_UNSUPPORTED_HEADER = "X-Sub2-Async-Image"
         private const val ASYNC_IMAGE_UNSUPPORTED_VALUE = "unsupported"
         private const val LEGACY_ASYNC_DISABLED_MESSAGE = "async image tasks are not enabled"
         private const val ASYNC_IMAGE_ERROR_PEEK_BYTES = 16 * 1024L
         private val ASYNC_SUBMIT_REJECTION_STATUSES = setOf(400, 401, 403, 410, 413, 415, 422)
         private val TERMINAL_IMAGE_TASK_ERROR_CODES = setOf("IMAGE_TASK_IDEMPOTENCY_CONFLICT")
+        private val PROCESSING_IMAGE_TASK_STATUSES = setOf(
+            "created",
+            "queued",
+            "pending",
+            "submitted",
+            "processing",
+            "running",
+            "in_progress",
+            "in-progress",
+        )
+        private val COMPLETED_IMAGE_TASK_STATUSES = setOf("completed", "succeeded", "success", "done", "finished")
 
         private fun traceId(value: String): String = value.ifBlank { "provider-untracked" }
 

@@ -78,6 +78,22 @@ class OpenAIProviderAsyncImageTaskTest {
     }
 
     @Test
+    fun `queued and running statuses remain retryable until completion`() = runBlocking {
+        server.enqueue(jsonResponse(202, TASK_SUBMITTED))
+        server.enqueue(jsonResponse(200, """{"status":"queued"}"""))
+        server.enqueue(jsonResponse(200, """{"status":"running"}"""))
+        server.enqueue(jsonResponse(200, TASK_COMPLETED))
+
+        val images = provider.generateImage(
+            setting(),
+            ImageGenerationParams(model = model(), prompt = "circle"),
+        ).toList()
+
+        assertEquals("AAAA", images.single().data)
+        assertEquals(4, server.requestCount)
+    }
+
+    @Test
     fun `recovered generation submit uses persisted API key fingerprint`() = runBlocking {
         server.enqueue(jsonResponse(202, TASK_SUBMITTED))
         server.enqueue(jsonResponse(200, TASK_COMPLETED))
