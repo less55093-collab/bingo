@@ -1,278 +1,239 @@
 package me.rerere.rikkahub.ui.pages.tutorial
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.ui.components.nav.BackButton
-import me.rerere.rikkahub.ui.theme.CustomColors
 
 @Composable
-fun TutorialPage(onComplete: () -> Unit) {
+fun TutorialPage(isLoggedIn: Boolean = false, onComplete: () -> Unit) {
     val steps = TutorialSteps
     val pagerState = rememberPagerState { steps.size }
     val scope = rememberCoroutineScope()
+    var detail by remember { mutableStateOf<TutorialImage?>(null) }
+
+    BackHandler {
+        if (pagerState.currentPage > 0) {
+            scope.launch { pagerState.animateScrollToPage(pagerState.currentPage - 1) }
+        } else {
+            onComplete()
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.tutorial_page_title)) },
-                navigationIcon = { BackButton() },
                 actions = {
-                    TextButton(onClick = onComplete) { Text(stringResource(R.string.tutorial_skip)) }
+                    TextButton(onClick = onComplete) {
+                        Text(stringResource(if (isLoggedIn) R.string.tutorial_close else R.string.tutorial_skip))
+                    }
                 },
-                colors = CustomColors.topBarColors,
             )
         },
-        containerColor = CustomColors.topBarColors.containerColor,
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
-        ) {
-            HorizontalPager(
-                state = pagerState,
-                modifier = Modifier.weight(1f),
-            ) { page ->
-                TutorialStepContent(
-                    step = steps[page],
-                        onAction = {},
-                )
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 12.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
+        bottomBar = {
+            Column(
+                modifier = Modifier.fillMaxWidth().navigationBarsPadding()
+                    .padding(horizontal = 24.dp).padding(top = 8.dp, bottom = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                steps.indices.forEach { index ->
-                    val selected = index == pagerState.currentPage
-                    Surface(
-                        modifier = Modifier
-                            .padding(horizontal = 4.dp)
-                            .size(if (selected) 9.dp else 7.dp),
-                        shape = CircleShape,
-                        color = if (selected) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.outlineVariant
-                        },
-                    ) {}
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp)
-                    .padding(bottom = 24.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                if (pagerState.currentPage > 0) {
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                pagerState.animateScrollToPage(pagerState.currentPage - 1)
-                            }
-                        },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.tutorial_prev))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clearAndSetSemantics {},
+                ) {
+                    steps.indices.forEach { index ->
+                        Surface(
+                            modifier = Modifier.size(if (index == pagerState.currentPage) 9.dp else 7.dp),
+                            shape = CircleShape,
+                            color = if (index == pagerState.currentPage) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.outlineVariant,
+                        ) {}
                     }
                 }
-                if (pagerState.currentPage < steps.lastIndex) {
+                Row(
+                    modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (pagerState.currentPage > 0) {
+                        OutlinedButton(
+                            onClick = { scope.launch { pagerState.animateScrollToPage(pagerState.currentPage - 1) } },
+                            enabled = !pagerState.isScrollInProgress,
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        ) { Text(stringResource(R.string.tutorial_prev)) }
+                    }
                     Button(
                         onClick = {
-                            scope.launch {
-                                pagerState.animateScrollToPage(pagerState.currentPage + 1)
-                            }
+                            if (pagerState.currentPage == steps.lastIndex) onComplete()
+                            else scope.launch { pagerState.animateScrollToPage(pagerState.currentPage + 1) }
                         },
-                        modifier = Modifier.weight(1f),
+                        enabled = !pagerState.isScrollInProgress,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                     ) {
-                        Text(stringResource(R.string.tutorial_next))
-                    }
-                } else {
-                    Button(
-                        onClick = onComplete,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.tutorial_done))
+                        Text(stringResource(
+                            if (pagerState.currentPage != steps.lastIndex) R.string.tutorial_next
+                            else if (isLoggedIn) R.string.tutorial_return
+                            else R.string.tutorial_done,
+                        ))
                     }
                 }
             }
+        },
+    ) { padding ->
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize().padding(padding),
+            verticalAlignment = Alignment.Top,
+        ) { page ->
+            TutorialStepContent(steps[page], page, steps.size, onImageClick = { detail = it })
         }
     }
+
+    detail?.let { image -> TutorialImageDetail(image, onDismiss = { detail = null }) }
 }
 
 @Composable
 private fun TutorialStepContent(
     step: TutorialStep,
-    onAction: (TutorialAction) -> Unit,
+    index: Int,
+    count: Int,
+    onImageClick: (TutorialImage) -> Unit,
 ) {
+    var selectedImage by rememberSaveable(step.title) { mutableIntStateOf(0) }
+    val image = step.images[selectedImage]
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 28.dp),
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        TutorialChatPreview(step.preview)
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Text(
-            text = stringResource(step.title),
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold,
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Text(
-            text = stringResource(step.body),
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        if (step.action != TutorialAction.None && step.actionLabel != null) {
-            Spacer(modifier = Modifier.height(24.dp))
-            TextButton(onClick = { onAction(step.action) }) {
-                Text(stringResource(step.actionLabel), fontWeight = FontWeight.SemiBold)
-            }
-        }
-    }
-}
-
-@Composable
-private fun TutorialChatPreview(preview: TutorialPreview) {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .defaultMinSize(minHeight = 312.dp),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        tonalElevation = 2.dp,
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth().padding(top = 12.dp, bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "新对话",
+                stringResource(R.string.tutorial_shop_progress, index + 1, count),
                 style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
             )
-            TutorialBubble(
-                text = when (preview) {
-                    TutorialPreview.Idea -> "我想做一张咖啡店开业海报，感觉温暖一点"
-                    TutorialPreview.Plan -> "先给我 3 个不同风格的方案，我选好后再生成"
-                    TutorialPreview.Result -> "就用温暖手作风，生成吧"
-                },
-                mine = true,
+            Text(stringResource(step.title), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                stringResource(step.body),
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            when (preview) {
-                TutorialPreview.Idea -> {
-                    TutorialBubble(
-                        text = "收到。我会帮你确定主体、风格和画面比例。",
-                        mine = false,
+        }
+
+        Image(
+            painter = painterResource(image.preview),
+            contentDescription = stringResource(image.label),
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.widthIn(max = 460.dp).fillMaxWidth().heightIn(max = 390.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = stringResource(R.string.tutorial_view_image),
+                ) { onImageClick(image) },
+        )
+
+        if (step.images.size > 1) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                step.images.forEachIndexed { imageIndex, item ->
+                    FilterChip(
+                        selected = selectedImage == imageIndex,
+                        onClick = { selectedImage = imageIndex },
+                        label = { Text(stringResource(item.label)) },
                     )
-                    TutorialDetail("温暖色调  ·  咖啡香气  ·  开业信息区")
-                }
-                TutorialPreview.Plan -> {
-                    Text("为你准备了 3 个画面方向", style = MaterialTheme.typography.labelLarge)
-                    TutorialPlanRow("温暖手作风", "咖啡、木质和手写感", selected = true)
-                    TutorialPlanRow("极简现代风", "留白、几何和清晰信息", selected = false)
-                    TutorialPlanRow("夜间霓虹风", "城市感和明亮灯光", selected = false)
-                }
-                TutorialPreview.Result -> {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(136.dp),
-                        shape = RoundedCornerShape(6.dp),
-                        color = MaterialTheme.colorScheme.tertiaryContainer,
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(18.dp),
-                            verticalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text("COFFEE OPENING", style = MaterialTheme.typography.titleMedium)
-                            Text("Warm. Fresh. Yours.", style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                    TutorialDetail("已按温暖手作风生成")
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun TutorialBubble(text: String, mine: Boolean) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
-    ) {
+        TextButton(onClick = { onImageClick(image) }) { Text(stringResource(R.string.tutorial_view_image)) }
         Text(
-            text = text,
-            modifier = Modifier.padding(10.dp),
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis,
+            stringResource(step.instruction),
+            modifier = Modifier.widthIn(max = 560.dp).fillMaxWidth().padding(bottom = 24.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
 @Composable
-private fun TutorialPlanRow(title: String, detail: String, selected: Boolean) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(6.dp),
-        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+private fun TutorialImageDetail(image: TutorialImage, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Column(modifier = Modifier.padding(9.dp)) {
-            Text(title, style = MaterialTheme.typography.labelLarge)
-            Text(detail, style = MaterialTheme.typography.labelSmall)
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(stringResource(image.label)) },
+                    actions = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.tutorial_close)) } },
+                )
+            },
+        ) { padding ->
+            Box(
+                modifier = Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()),
+                contentAlignment = Alignment.TopCenter,
+            ) {
+                Image(
+                    painter = painterResource(image.detail),
+                    contentDescription = stringResource(image.label),
+                    contentScale = ContentScale.FillWidth,
+                    modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth(),
+                )
+            }
         }
     }
-}
-
-@Composable
-private fun TutorialDetail(text: String) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
 }

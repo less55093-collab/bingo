@@ -15,7 +15,8 @@ import java.net.URL
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
-import java.util.concurrent.ConcurrentHashMap
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -287,11 +288,31 @@ class FilesManager(
             base64Data
         }
 
-        val byteArray = Base64.decode(data.toByteArray())
+        val byteArray = try {
+            Base64.decode(data.toByteArray())
+        } catch (error: IllegalArgumentException) {
+            throw IOException("图片结果编码不完整，将保留任务等待恢复", error)
+        }
         val file = File(filePath)
-        file.parentFile?.mkdirs()
-        file.writeBytes(byteArray)
-        return file
+        return writeImageBytesDurably(byteArray, file) { isValidImageFile(it) }
+    }
+
+    /** Full container validation plus bounded Android decoding before treating a file as done. */
+    fun isValidImageFile(file: File): Boolean {
+        if (!isStructurallyValidImageFile(file)) return false
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching false
+            var sample = 1
+            while (bounds.outWidth / sample > 1024 || bounds.outHeight / sample > 1024) sample *= 2
+            val bitmap = BitmapFactory.decodeFile(
+                file.absolutePath,
+                BitmapFactory.Options().apply { inSampleSize = sample },
+            ) ?: return@runCatching false
+            bitmap.recycle()
+            true
+        }.getOrDefault(false)
     }
 
     /**
@@ -299,8 +320,12 @@ class FilesManager(
      * 再走一遍 base64. 同一分区内 [File.renameTo] 是元数据操作, 几 MB 的图也是瞬时完成;
      * 跨分区会失败, 那时才退回拷贝.
      */
-    fun moveImageFileTo(source: File, filePath: String): File =
-        moveImageFileDurably(source, File(filePath))
+    fun moveImageFileTo(source: File, filePath: String): File {
+        val target = File(filePath)
+        if (isValidImageFile(target)) return target
+        if (!isValidImageFile(source)) throw IOException("图片结果不完整或无法解码，将保留任务等待恢复")
+        return moveImageFileDurably(source, target)
+    }
 
     fun listImageFiles(): List<File> {
         val imagesDir = getImagesDir()
@@ -512,22 +537,39 @@ class FilesManager(
 /**
  * Installs a downloaded image without ever streaming bytes into the final path.
  *
- * A non-empty target is treated as an already committed result. A zero-byte target can only be
- * replaced after the source has been copied and synchronised in a sibling temporary file.
+ * Only a validated target is treated as committed. A partial target is replaced only after the
+ * complete source has been validated and synchronised. Striped locks also cover concurrent retries.
  */
-private val imageMoveLocks = ConcurrentHashMap<String, Any>()
+private val imageMoveLocks = Array(64) { Any() }
+
+internal fun writeImageBytesDurably(
+    bytes: ByteArray,
+    target: File,
+    validator: (File) -> Boolean = ::isStructurallyValidImageFile,
+): File {
+    if (validator(target)) return target
+    val parent = target.absoluteFile.parentFile ?: throw IOException("图片保存目录无效")
+    if (!parent.isDirectory && !parent.mkdirs()) throw IOException("无法创建图片保存目录")
+    val temporary = Files.createTempFile(parent.toPath(), ".image-", ".tmp").toFile()
+    try {
+        FileOutputStream(temporary).use { output ->
+            output.write(bytes)
+            output.flush()
+            output.fd.sync()
+        }
+        if (!validator(temporary)) throw IOException("图片结果不完整或无法解码，将保留任务等待恢复")
+        return moveImageFileDurably(temporary, target)
+    } finally {
+        temporary.delete()
+    }
+}
 
 internal fun moveImageFileDurably(source: File, target: File): File {
     val sourcePath = source.absoluteFile.toPath().normalize()
     val targetPath = target.absoluteFile.toPath().normalize()
-    val lockKey = targetPath.toString()
-    val lock = imageMoveLocks.computeIfAbsent(lockKey) { Any() }
+    val lock = imageMoveLocks[(targetPath.toString().hashCode() and Int.MAX_VALUE) % imageMoveLocks.size]
     return synchronized(lock) {
-        try {
-            moveImageFileDurablyLocked(source, target, sourcePath, targetPath)
-        } finally {
-            imageMoveLocks.remove(lockKey, lock)
-        }
+        moveImageFileDurablyLocked(source, target, sourcePath, targetPath)
     }
 }
 
@@ -537,7 +579,10 @@ private fun moveImageFileDurablyLocked(
     sourcePath: java.nio.file.Path,
     targetPath: java.nio.file.Path,
 ): File {
-    if (sourcePath == targetPath) return target
+    if (sourcePath == targetPath) {
+        if (!isStructurallyValidImageFile(target)) throw IOException("图片结果不完整，等待恢复")
+        return target
+    }
 
     val parent = target.absoluteFile.parentFile
         ?: throw IOException("Image target has no parent: ${target.absolutePath}")
@@ -550,11 +595,12 @@ private fun moveImageFileDurablyLocked(
 
     // A prior successful attempt wins. In particular, never truncate a valid result while
     // retrying a task after process death.
-    if (target.isFile && target.length() > 0L) return target
+    if (isStructurallyValidImageFile(target)) return target
     if (target.exists() && !target.isFile) {
         throw IOException("Image target exists and is not a regular file: ${target.absolutePath}")
     }
     check(source.isFile) { "Image source does not exist: ${source.absolutePath}" }
+    if (!isStructurallyValidImageFile(source)) throw IOException("图片结果不完整，等待恢复")
 
     var directMoveFailure: IOException? = null
     if (!target.exists()) {
@@ -565,12 +611,12 @@ private fun moveImageFileDurablyLocked(
             return target
         } catch (e: FileAlreadyExistsException) {
             // Another recovery attempt may have committed the same result meanwhile. Preserve it.
-            if (target.isFile && target.length() > 0L) return target
+            if (isStructurallyValidImageFile(target)) return target
             directMoveFailure = e
         } catch (e: IOException) {
             // Cross-device moves and providers without atomic rename support use the durable copy
             // path below. The source is still present when a move fails.
-            if (target.isFile && target.length() > 0L) return target
+            if (isStructurallyValidImageFile(target)) return target
             directMoveFailure = e
         }
     }
@@ -596,15 +642,16 @@ private fun copyImageToSiblingAndInstall(source: File, target: File, parent: Fil
             }
         }
 
+        if (!isStructurallyValidImageFile(temporary.toFile())) throw IOException("图片复制不完整，等待恢复")
+
         // Do the check again after the potentially slow copy. If another worker committed a
-        // non-empty result, discard only our temporary file and keep that result untouched.
-        if (target.isFile && target.length() > 0L) return target
+        // valid result, discard only our temporary file and keep that result untouched.
+        if (isStructurallyValidImageFile(target)) return target
         if (target.exists() && !target.isFile) {
             throw IOException("Image target exists and is not a regular file: ${target.absolutePath}")
         }
 
-        // REPLACE_EXISTING is intentional only for the stale zero-byte target case. The check
-        // above protects a previously committed non-empty result from being overwritten.
+        // REPLACE_EXISTING only replaces a corrupt or partial target; a validated result wins.
         movePath(temporary, target.toPath(), replaceExisting = target.exists())
         temporary = null
         syncDirectory(parent)
@@ -657,7 +704,7 @@ private fun syncFile(file: File) {
 private fun syncDirectory(directory: File) {
     // Directory fsync is not available on every Android filesystem. The file data is already
     // synced; best-effort directory sync closes the rename durability window where supported.
-    runCatching { FileInputStream(directory).use { input -> input.fd.sync() } }
+    runCatching { FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) } }
 }
 
 data class SyncResult(

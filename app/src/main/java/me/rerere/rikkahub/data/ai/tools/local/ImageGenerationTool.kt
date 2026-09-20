@@ -17,6 +17,8 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.ImageGenSize
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.service.ImageGenerationManager
+import me.rerere.rikkahub.service.ImageGenerationPendingException
+import me.rerere.rikkahub.service.ImageGenerationBatchException
 
 const val IMAGE_GENERATION_TOOL_NAME = "generate_image"
 const val IMAGE_GENERATION_PLAN_TOOL_NAME = "plan_image_generation"
@@ -36,6 +38,7 @@ data class ImageGenerationVariant(
 
 internal fun parseImageGenerationVariants(args: JsonElement): List<ImageGenerationVariant> {
     val variants = args.jsonObject["variants"] ?: return emptyList()
+    require(variants.jsonArray.size in 1..3) { "生图方案需包含 1 至 3 项" }
     return variants.jsonArray.mapIndexed { index, element ->
         val variant = element.jsonObject
         val prompt = variant["prompt"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
@@ -75,6 +78,8 @@ private fun imageProperties(includeVariants: Boolean): kotlinx.serialization.jso
 
 private fun variantsSchema() = buildJsonObject {
     put("type", "array")
+    put("minItems", 1)
+    put("maxItems", 3)
     put(
         "description",
         "Two or more alternative image directions. Use only for multiple subjects, styles, versions, or images."
@@ -138,25 +143,45 @@ private suspend fun generateImageParts(
     prompt: String,
     size: String,
     referenceImages: List<String> = emptyList(),
-): List<UIMessagePart> {
+): List<UIMessagePart> = withPendingImageResult {
     val files = if (referenceImages.isEmpty()) {
         manager.generateForTool(prompt = prompt, size = size)
     } else {
         manager.editForTool(prompt = prompt, size = size, referenceImages = referenceImages)
     }
     if (files.isEmpty()) error("image generation returned no image")
-    return files.map { UIMessagePart.Image(url = it.toUri().toString()) }
+    files.map { UIMessagePart.Image(url = it.toUri().toString()) }
 }
+
+private suspend fun withPendingImageResult(block: suspend () -> List<UIMessagePart>): List<UIMessagePart> = try {
+    block()
+} catch (batch: ImageGenerationBatchException) {
+    batch.files.map { UIMessagePart.Image(it.toUri().toString()) } + batch.failures.map { error ->
+        if (error is ImageGenerationPendingException) pendingImageResult(error)
+        else UIMessagePart.Text(buildJsonObject {
+            put("status", "failed")
+            put("message", error.message ?: "图片生成失败")
+        }.toString())
+    }
+} catch (pending: ImageGenerationPendingException) {
+    listOf(pendingImageResult(pending))
+}
+
+private fun pendingImageResult(pending: ImageGenerationPendingException) = UIMessagePart.Text(buildJsonObject {
+        put("status", "waiting_for_recovery")
+        put("request_id", pending.requestId)
+        put("message", "图片任务已保留，恢复连接后会继续获取结果，并更新到本条消息和作品中。请勿重复提交。")
+    }.toString())
 
 private suspend fun executePlanImageGeneration(
     manager: ImageGenerationManager,
     args: JsonElement,
     referenceImages: List<String> = emptyList(),
-): List<UIMessagePart> {
+): List<UIMessagePart> = withPendingImageResult {
     val obj = args.jsonObject
     val request = obj["request"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
-    val parsedVariants = runCatching { parseImageGenerationVariants(args) }.getOrNull().orEmpty()
-    return when {
+    val parsedVariants = parseImageGenerationVariants(args)
+    when {
         parsedVariants.size > 1 -> {
             val files = if (referenceImages.isEmpty()) {
                 manager.generateForToolBatch(parsedVariants)
@@ -185,7 +210,11 @@ fun buildImageGenerationTool(manager: ImageGenerationManager): Tool = Tool(
         Always call this tool for one image. Do not add variants. Use concise Chinese prompts and preserve
         confirmed requirements. Choose a size that matches the use case. Do not retry completed calls.
     """.trimIndent(),
-    systemPrompt = { _, messages -> ImagePromptRecipes.instructionFor(messages) },
+    systemPrompt = { _, messages ->
+        "用户要求实际生成或编辑图片时，必须调用 generate_image 或 plan_image_generation。" +
+            "只写文字不会创建图片；调用前不得声称已开始生成，工具失败时必须如实说明，不能自动重试生图。\n" +
+            ImagePromptRecipes.instructionFor(messages)
+    },
     parameters = {
         InputSchema.Obj(
             properties = imageProperties(includeVariants = false),

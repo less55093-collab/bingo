@@ -82,7 +82,7 @@ fun ReasoningButton(
             ) {
                 ReasoningIcon(reasoningLevel)
             }
-            if (!onlyIcon) Text(stringResource(R.string.setting_provider_page_reasoning))
+            if (!onlyIcon) Text("思考 · ${reasoningLevel.label()}")
         }
     }
 }

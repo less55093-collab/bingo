@@ -42,7 +42,7 @@
 - 官网固定下载：`https://download.bingoapi.top/releases/Bingo.apk`
 - R2 存储桶：`bingoapp`；上传凭证只在 `.r2-credentials`，该文件已忽略，绝不提交或输出。
 - `app/build.gradle.kts` 的 `BuildConfig.UPDATE_URL` 必须保持为更新清单地址。
-- 当前基线：`1.0.5 / versionCode 7`；下次发布至少使用 `versionCode 8`。
+- 当前基线：`1.0.17 / versionCode 19`；下次发布至少使用 `versionCode 20`。
 
 ### 官网下载地址约定
 

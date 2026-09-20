@@ -308,7 +308,11 @@ val dataSourceModule = module {
         get<Retrofit>(named(GATEWAY_RETROFIT)).create(BingoGatewayAPI::class.java)
     }
 
-    single { KeyProvisioner(api = get(), tokenStore = get(), settingsStore = get()) }
+    single { me.rerere.rikkahub.data.api.gateway.GatewayModelAPI(get(named(GATEWAY_RAW_CLIENT))) }
+    single<me.rerere.rikkahub.data.auth.GatewayCatalogStore> {
+        me.rerere.rikkahub.data.auth.AccountGatewayCatalogStore(tokenStore = get(), settingsStore = get())
+    }
+    single { KeyProvisioner(api = get(), store = get(), modelAPI = get()) }
 }
 
 const val GATEWAY_CLIENT = "gatewayClient"

@@ -9,23 +9,29 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import me.rerere.ai.provider.ImageEditParams
 import me.rerere.ai.provider.ImageGenerationParams
 import me.rerere.ai.provider.ImageGenerationTerminalException
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelRequestException
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.ui.ImageGenerationItem
@@ -43,6 +49,12 @@ import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.repository.GenMediaRepository
+import me.rerere.rikkahub.data.repository.ConversationRepository
+import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
+import me.rerere.ai.provider.providers.OpenAIProvider
+import me.rerere.ai.provider.providers.ImageTaskQueryException
+import me.rerere.ai.ui.UIMessageAnnotation
+import androidx.core.net.toUri
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.utils.localizedChatMessage
 import java.io.File
@@ -56,7 +68,17 @@ import kotlin.uuid.Uuid
 import javax.net.ssl.SSLHandshakeException
 
 internal fun shouldFinalizeImageRecovery(error: Throwable, pendingStillExists: Boolean): Boolean =
-    error is ImageGenerationTerminalException || !pendingStillExists
+    error.hasTerminalImageCause() || !pendingStillExists
+
+private fun Throwable.hasTerminalImageCause(): Boolean =
+    generateSequence(this) { it.cause }.take(8).any { it is ImageGenerationTerminalException }
+
+/** The durable request still exists; callers must not submit another billable generation. */
+class ImageGenerationPendingException(val requestId: String, cause: Throwable) :
+    IllegalStateException("图片任务已保留，连接恢复后将继续获取结果，请勿重复提交", cause)
+
+class ImageGenerationBatchException(val files: List<File>, val failures: List<Throwable>) :
+    IllegalStateException("部分图片尚未完成")
 
 internal fun resolvePersistedImageProvider(
     model: Model,
@@ -113,6 +135,8 @@ class ImageGenerationManager(
     private val genMediaRepository: GenMediaRepository,
     private val appEventBus: AppEventBus,
     private val authTokenStore: AuthTokenStore,
+    private val conversationRepository: ConversationRepository? = null,
+    private val gatewayAPI: BingoGatewayAPI? = null,
     /** Inject the app-wide instance so chat and image tools share the same service lease. */
     private val generationProtectionManager: GenerationProtectionManager =
         GenerationProtectionManager(context),
@@ -122,6 +146,8 @@ class ImageGenerationManager(
      * being generated — the user read an un-cleared box as "nothing was sent".
      */
     data class State(
+        val requestId: String? = null,
+        val waitingForRecovery: Boolean = false,
         val generating: Boolean = false,
         val prompt: String = "",
         val images: List<GeneratedFile> = emptyList(),
@@ -148,8 +174,51 @@ class ImageGenerationManager(
     private val recoveringRequestIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val recoveryJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
     private val standaloneRequestIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val userCancelledRequestIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val hiddenRequestIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val recoveryMutex = Mutex()
+    private val imagePermits = Semaphore(2)
+    private val deliveryReceipts = ImageDeliveryReceiptStore(File(context.noBackupFilesDir, "image_delivery_receipts"))
+    private val accountSyncMutex = Mutex()
+    private var accountSyncCursor = "0"
+    private var lastAccountSync = 0L
+    private var syncAccountId: Long? = null
+    private val accountJobs = java.util.concurrent.ConcurrentHashMap<String, Pair<Long?, Job>>()
+
+    init {
+        appScope.launch {
+            authTokenStore.tokensFlow.collect {
+                val accountId = authTokenStore.currentTaskAccountId()
+                accountJobs.values.filter { it.first == null || it.first != accountId }
+                    .forEach { (_, job) -> job.cancel(CancellationException("账号已退出，图片任务保留待恢复")) }
+            }
+        }
+    }
+
+    private fun showsTask(task: PendingImageTask): Boolean = task.origin != ORIGIN_TOOL_GENERATE &&
+        task.requestId !in hiddenRequestIds &&
+        (_state.value.requestId == task.requestId || !_state.value.generating)
+
+    private suspend fun requireTaskAccount(task: PendingImageTask) {
+        if (!authTokenStore.isCurrentAccount(task)) throw CancellationException("图片任务等待原账号登录后恢复")
+    }
+
+    private suspend fun finishDelivery(task: PendingImageTask, files: List<File>, error: String? = null) {
+        requireTaskAccount(task)
+        authTokenStore.updatePendingImageTaskResult(task.requestId, files.map { it.absolutePath }, error)
+        if (task.conversationId != null && task.messageId != null && task.toolCallId != null) {
+            requireTaskAccount(task)
+            checkNotNull(conversationRepository).deliverImageResult(
+                task.conversationId, task.messageId,
+                UIMessageAnnotation.ImageDelivery(
+                    toolCallId = task.toolCallId, requestId = task.requestId,
+                    imageUrls = files.map { it.toUri().toString() }, error = error,
+                ),
+            )
+        }
+        requireTaskAccount(task)
+        if (error == null) withContext(Dispatchers.IO) { deliveryReceipts.record(checkNotNull(task.accountId), task.requestId) }
+        authTokenStore.removePendingImageTaskByRequestId(task.requestId)
+    }
 
     /**
      * Guards retry: once an image is on disk and in the gallery, retrying would duplicate it. Scoped
@@ -181,6 +250,7 @@ class ImageGenerationManager(
                     onImageKeySelected = selected,
                     onTaskSubmitted = submitted,
                     onAsyncFallback = fallback,
+                    allowSynchronousFallback = false,
                     onTaskFailed = failed,
                 ),
             )
@@ -212,6 +282,7 @@ class ImageGenerationManager(
                     onImageKeySelected = selected,
                     onTaskSubmitted = submitted,
                     onAsyncFallback = fallback,
+                    allowSynchronousFallback = false,
                     onTaskFailed = failed,
                 ),
             )
@@ -251,6 +322,7 @@ class ImageGenerationManager(
                         onImageKeySelected = selected,
                         onTaskSubmitted = submitted,
                         onAsyncFallback = fallback,
+                        allowSynchronousFallback = false,
                         onTaskFailed = failed,
                     ),
                 )
@@ -292,6 +364,7 @@ class ImageGenerationManager(
                         onImageKeySelected = selected,
                         onTaskSubmitted = submitted,
                         onAsyncFallback = fallback,
+                        allowSynchronousFallback = false,
                         onTaskFailed = failed,
                     ),
                 )
@@ -305,9 +378,10 @@ class ImageGenerationManager(
         variants: List<ImageGenerationVariant>,
         referenceImages: List<String>,
     ): List<File> = supervisorScope {
-        variants.map { variant ->
+        val operation = currentCoroutineContext()[ImageOperationContext]
+        variants.mapIndexed { index, variant ->
             async {
-                runCatching {
+                runImageBatchItem(operation, index) {
                     editForTool(
                         prompt = variant.prompt,
                         size = variant.size,
@@ -317,31 +391,36 @@ class ImageGenerationManager(
             }
         }.awaitAll().let { results ->
             val files = results.flatMap { it.getOrNull().orEmpty() }
-            if (files.isNotEmpty()) {
-                files
-            } else {
-                throw results.firstNotNullOfOrNull { it.exceptionOrNull() }
-                    ?: IllegalStateException("image generation returned no image")
-            }
+            val failures = results.mapNotNull { it.exceptionOrNull() }
+            if (failures.isNotEmpty()) throw ImageGenerationBatchException(files, failures)
+            files
         }
     }
 
     suspend fun generateForToolBatch(variants: List<ImageGenerationVariant>): List<File> = supervisorScope {
-        variants.map { variant ->
+        val operation = currentCoroutineContext()[ImageOperationContext]
+        variants.mapIndexed { index, variant ->
             async {
-                runCatching {
+                runImageBatchItem(operation, index) {
                     generateForTool(prompt = variant.prompt, size = variant.size)
                 }
             }
         }.awaitAll().let { results ->
             val files = results.flatMap { it.getOrNull().orEmpty() }
-            if (files.isNotEmpty()) {
-                files
-            } else {
-                throw results.firstNotNullOfOrNull { it.exceptionOrNull() }
-                    ?: IllegalStateException("image generation returned no image")
-            }
+            val failures = results.mapNotNull { it.exceptionOrNull() }
+            if (failures.isNotEmpty()) throw ImageGenerationBatchException(files, failures)
+            files
         }
+    }
+
+    private suspend fun runImageBatchItem(
+        operation: ImageOperationContext?, index: Int, block: suspend () -> List<File>,
+    ): Result<List<File>> = try {
+        Result.success(if (operation == null) block() else withContext(operation.copy(itemIndex = index)) { block() })
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Result.failure(error)
     }
 
     private fun start(
@@ -364,9 +443,9 @@ class ImageGenerationManager(
         ) -> Flow<ImageGenerationItem>,
     ) {
         if (prompt.isBlank() || _state.value.generating) return
-        val previous = job
-        cancelStandaloneWork(previous)
+        val requestId = "bingo_" + UUID.randomUUID().toString()
         _state.value = State(
+            requestId = requestId,
             generating = true,
             prompt = prompt,
             startedAt = SystemClock.elapsedRealtime(),
@@ -376,34 +455,42 @@ class ImageGenerationManager(
             try {
                 // begin() runs synchronously before previous.join() can suspend. Holding this
                 // provisional lease prevents a background transition in that hand-off window.
-                withStandaloneImageGenerationLease(generationProtectionManager, previous) {
+                val files = withStandaloneImageGenerationLease(generationProtectionManager, null) {
                     generateAndPersistWhileProtected(
                         prompt = prompt,
                         size = size,
                         numOfImages = numOfImages,
                         sourcePaths = sourcePaths,
                         origin = origin,
+                        requestId = requestId,
                         request = request,
                         onImagesChanged = { images ->
-                            _state.value = _state.value.copy(images = images)
+                            if (_state.value.requestId == requestId && requestId !in hiddenRequestIds) {
+                                _state.value = _state.value.copy(images = images)
+                            }
                         },
                     )
                 }
-                _state.value = _state.value.copy(generating = false, startedAt = 0L)
+                if (_state.value.requestId == requestId) {
+                    _state.value = _state.value.copy(generating = false, waitingForRecovery = false, startedAt = 0L)
+                }
                 appEventBus.tryEmit(
                     AppEvent.ImageGenerationEnded(
                         prompt = prompt,
-                        imageCount = _state.value.images.count { !it.partial },
+                        imageCount = files.size,
                         error = null,
                     )
                 )
             } catch (e: CancellationException) {
-                // 用户主动取消，不通知。
+                withContext(NonCancellable) { deferPendingTask(e, requestId) }
                 throw e
             } catch (e: Exception) {
+                if (deferPendingTask(e, requestId)) return@launch
                 Log.e(TAG, "Failed to generate image: ${e.javaClass.simpleName}")
                 val message = readableError(e)
-                _state.value = _state.value.copy(generating = false, error = message, startedAt = 0L)
+                if (_state.value.requestId == requestId && requestId !in hiddenRequestIds) {
+                    _state.value = _state.value.copy(generating = false, waitingForRecovery = false, error = message, startedAt = 0L)
+                }
                 appEventBus.tryEmit(
                     AppEvent.ImageGenerationEnded(prompt = prompt, imageCount = 0, error = message)
                 )
@@ -413,7 +500,7 @@ class ImageGenerationManager(
 
     fun cancel() {
         cancelStandaloneWork()
-        _state.value = _state.value.copy(generating = false, startedAt = 0L)
+        _state.value = _state.value.copy(generating = false, waitingForRecovery = false, startedAt = 0L)
     }
 
     fun clearError() {
@@ -425,55 +512,11 @@ class ImageGenerationManager(
         _state.value = State()
     }
 
-    /**
-     * A user cancellation is different from process death. Remove only standalone durable tasks;
-     * tool-owned tasks must continue in the shared AppScope. The in-memory tombstone also prevents
-     * a late submission callback from resurrecting a record after the UI has cancelled it.
-     */
-    private fun cancelStandaloneWork(previous: Job? = job) {
-        val ids = standaloneRequestIds.toSet()
-        if (previous?.isActive != true && ids.isEmpty()) return
-        val jobs = buildList {
-            previous?.let(::add)
-            ids.mapNotNullTo(this) { recoveryJobs[it] }
-        }.distinct()
-        userCancelledRequestIds.addAll(ids)
-        jobs.forEach { it.cancel() }
-        appScope.launch(Dispatchers.IO) {
-            // Provider callbacks and their DataStore writes run inside these jobs. Waiting for
-            // them to finish closes the late-callback window; deleting first and clearing the
-            // tombstone afterwards is still racy when a callback is already in flight.
-            withContext(NonCancellable) {
-                jobs.forEach { cancellationJob ->
-                    runCatching { cancellationJob.cancelAndJoin() }
-                        .onFailure { error ->
-                            Log.w(TAG, "Unable to join cancelled image generation", error)
-                        }
-                }
-                for (requestId in ids) {
-                    // Keep the in-memory cancellation tombstone until the durable delete has
-                    // completed. Otherwise a recovery wake-up can observe the still-pending record
-                    // in the small window after the generation job's finally block runs and replay
-                    // a request the user already cancelled.
-                    val removed = runCatching {
-                        recoveryMutex.withLock {
-                            authTokenStore.removePendingImageTaskByRequestId(requestId)
-                        }
-                        true
-                    }.onFailure { error ->
-                        Log.w(TAG, "Unable to remove cancelled image task $requestId", error)
-                    }.getOrDefault(false)
-                    if (
-                        removed &&
-                        !activeRequestIds.contains(requestId) &&
-                        recoveryJobs[requestId] == null
-                    ) {
-                        standaloneRequestIds.remove(requestId)
-                        userCancelledRequestIds.remove(requestId)
-                    }
-                }
-            }
-        }
+    /** Stops waiting in this screen. An accepted server operation remains recoverable. */
+    private fun cancelStandaloneWork() {
+        hiddenRequestIds.addAll(standaloneRequestIds)
+        _state.value.requestId?.let { hiddenRequestIds.add(it) }
+        ImageGenerationRecoveryScheduler.enqueue(context, delayedHeartbeat = true)
     }
 
     /**
@@ -486,13 +529,13 @@ class ImageGenerationManager(
      * application-scoped job acquires foreground protection.
      */
     suspend fun recoverPendingTasks(): Unit = recoveryMutex.withLock {
+        reconcileAccountTasks()
         val tasks = authTokenStore.currentPendingImageTasks()
         if (tasks.isEmpty()) return
 
         tasks.forEach { task ->
             val requestId = task.requestId.ifBlank { task.taskId ?: return@forEach }
-            if (userCancelledRequestIds.contains(requestId) ||
-                activeRequestIds.contains(requestId) ||
+            if (activeRequestIds.contains(requestId) ||
                 !recoveringRequestIds.add(requestId)
             ) {
                 return@forEach
@@ -504,10 +547,11 @@ class ImageGenerationManager(
                     } finally {
                         recoveryJobs.remove(requestId)
                         if (task.origin != ORIGIN_TOOL_GENERATE &&
-                            !userCancelledRequestIds.contains(requestId)
+                            requestId !in hiddenRequestIds &&
+                            !(_state.value.requestId == requestId && _state.value.waitingForRecovery)
                         ) {
                             standaloneRequestIds.remove(requestId)
-                            userCancelledRequestIds.remove(requestId)
+                            hiddenRequestIds.remove(requestId)
                         }
                     }
                 }
@@ -517,29 +561,154 @@ class ImageGenerationManager(
         }
     }
 
-    suspend fun hasPendingTasks(): Boolean = authTokenStore.currentPendingImageTasks().isNotEmpty()
+    suspend fun hasPendingTasks(): Boolean = accountSyncCursor != "0" || authTokenStore.currentPendingImageTasks().isNotEmpty()
+
+    suspend fun reconcileAccountImageTasks() { reconcileAccountTasks() }
+
+    suspend fun hasSavedRecoveryCredentials(): Boolean = authTokenStore.currentPendingImageTasks()
+        .all { (it.taskId != null && gatewayAPI != null) || (it.providerSnapshot != null && it.modelSnapshot != null) }
+
+    /** Account lookup repairs a lost POST acknowledgement and missing local task records. */
+    private suspend fun reconcileAccountTasks() = accountSyncMutex.withLock {
+        val api = gatewayAPI ?: return@withLock
+        val accountId = authTokenStore.currentTaskAccountId() ?: return@withLock
+        if (syncAccountId != accountId) {
+            syncAccountId = accountId
+            accountSyncCursor = "0"
+            lastAccountSync = 0L
+        }
+        if (SystemClock.elapsedRealtime() - lastAccountSync < 30_000 && lastAccountSync != 0L) return@withLock
+        try {
+            val page = api.imageTasks(accountSyncCursor)
+            if (authTokenStore.currentTaskAccountId() != accountId) return@withLock
+            val pending = authTokenStore.currentPendingImageTasks().associateBy { it.requestId }
+            page.data.forEach { remote ->
+                val local = pending[remote.requestId]
+                if (local != null && local.taskId == null) {
+                    authTokenStore.setPendingImageTaskId(local.requestId, remote.id)
+                } else if (local == null && remote.requestId.startsWith("bingo_") &&
+                    remote.status != "failed" &&
+                    !withContext(Dispatchers.IO) { deliveryReceipts.contains(accountId, remote.requestId) }) {
+                    val origin = conversationRepository?.findImageTaskOrigin(remote.requestId)
+                    if (authTokenStore.currentTaskAccountId() != accountId) return@withLock
+                    authTokenStore.savePendingImageTask(PendingImageTask(
+                        accountId = accountId, requestId = remote.requestId, taskId = remote.id,
+                        conversationId = origin?.conversationId, messageId = origin?.messageId,
+                        toolCallId = origin?.toolCallId, operationId = origin?.operationId, itemId = origin?.itemId,
+                        prompt = "从账号恢复的图片", modelName = "生图",
+                        origin = if (origin != null) ORIGIN_TOOL_GENERATE else "account_recovery",
+                    ))
+                }
+            }
+            accountSyncCursor = page.nextCursor.ifBlank { "0" }
+            lastAccountSync = SystemClock.elapsedRealtime()
+            if (accountSyncCursor != "0") ImageGenerationRecoveryScheduler.enqueue(context, delayedHeartbeat = true)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            // Older gateways have no account endpoint. Existing durable records still recover
+            // through their original key; a catalog failure never triggers image creation.
+            lastAccountSync = SystemClock.elapsedRealtime()
+            Log.w(TAG, "Account task reconciliation deferred: ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun accountTaskImages(task: PendingImageTask, traceId: String): Flow<ImageGenerationItem> = flow {
+        val api = checkNotNull(gatewayAPI)
+        val parser = providerManager.getProviderByType(ProviderSetting.OpenAI()) as OpenAIProvider
+        while (true) {
+            requireTaskAccount(task)
+            val remote = try {
+                api.imageTask(checkNotNull(task.taskId))
+            } catch (error: retrofit2.HttpException) {
+                if (error.code() == 404 && task.providerSnapshot is ProviderSetting.OpenAI) {
+                    emitAll(providerManager.getProviderByType(task.providerSnapshot).resumeImageTask(
+                        providerSetting = task.providerSnapshot, taskId = task.taskId!!,
+                        traceId = traceId, apiKeyFingerprint = task.apiKeyFingerprint,
+                    ))
+                    return@flow
+                }
+                if (error.code() == 410 && error.response()?.errorBody()?.string()
+                        ?.contains("IMAGE_TASK_RESULT_EXPIRED") == true) {
+                    throw ImageGenerationTerminalException("图片结果已超过服务端保留期限", error)
+                }
+                throw IOException("图片任务暂时无法查询，稍后恢复", error)
+            }
+            requireTaskAccount(task)
+            if (remote.id != task.taskId) throw IOException("图片任务查询返回了不匹配的任务，等待重新获取")
+            when (remote.status) {
+                "completed", "succeeded", "success" -> {
+                    val result = remote.result ?: throw IOException("图片已生成，等待服务端提供结果")
+                    val images = try { parser.parseImageResponse(result.toString(), traceId, remote.id) }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (error: Exception) {
+                        throw ImageTaskQueryException(remote.id, message = "图片已生成，等待下载恢复：${error.javaClass.simpleName}")
+                    }
+                    images.forEach { emit(it) }
+                    return@flow
+                }
+                "failed", "cancelled", "expired" -> throw ImageGenerationTerminalException(
+                    remote.error?.toString() ?: "服务端图片任务失败")
+                else -> delay(3_000)
+            }
+        }
+    }
+
+    private suspend fun deferPendingTask(error: Throwable, requestId: String?): Boolean {
+        if (requestId.isNullOrBlank() || error.hasTerminalImageCause()) return false
+        val task = authTokenStore.currentPendingImageTasks().firstOrNull { it.requestId == requestId } ?: return false
+        if (showsTask(task)) {
+            standaloneRequestIds.add(requestId)
+            _state.value = _state.value.copy(
+                requestId = requestId, prompt = task.prompt, generating = true,
+                waitingForRecovery = true, error = null, startedAt = 0L,
+            )
+        }
+        ImageGenerationRecoveryScheduler.enqueue(context, delayedHeartbeat = true)
+        return true
+    }
 
     private suspend fun recoverPendingTask(task: PendingImageTask) {
         val traceId = nextTraceId()
         val requestId = task.requestId.ifBlank { task.taskId ?: return }
-        if (userCancelledRequestIds.contains(requestId)) {
-            recoveringRequestIds.remove(requestId)
-            return
-        }
         if (!activeRequestIds.add(requestId)) {
             recoveringRequestIds.remove(requestId)
             return
         }
         try {
-            if (task.origin != ORIGIN_TOOL_GENERATE) {
+            requireTaskAccount(task)
+            currentCoroutineContext()[Job]?.let { accountJobs[requestId] = task.accountId to it }
+            if (task.deliveryError != null || (task.completedPaths.isNotEmpty() &&
+                    task.completedPaths.all { filesManager.isValidImageFile(File(it)) })) {
+                val files = task.completedPaths.map(::File)
+                finishDelivery(task, files, task.deliveryError)
+                if (showsTask(task)) {
+                    _state.value = State(requestId = task.requestId, prompt = task.prompt,
+                        images = files.map { GeneratedFile(it.absolutePath, false) }, error = task.deliveryError)
+                }
+                appEventBus.tryEmit(AppEvent.ImageGenerationEnded(task.prompt, files.size, task.deliveryError))
+                return
+            }
+            if (showsTask(task)) {
                 _state.value = State(
+                    requestId = requestId,
                     generating = true,
                     prompt = task.prompt,
                     startedAt = SystemClock.elapsedRealtime(),
                     editing = task.editing || task.sourcePaths != null,
                 )
             }
-            generationProtectionManager.withProtection(GenerationKind.IMAGE) {
+            imagePermits.withPermit { generationProtectionManager.withProtection(GenerationKind.IMAGE) {
+                requireTaskAccount(task)
+                if (task.taskId != null && gatewayAPI != null) {
+                    val files = collectInto(accountTaskImages(task, traceId), task.prompt, task.modelName,
+                        task.sourcePaths, Committed(), traceId, 1, requestId, accountTask = task,
+                        onImagesChanged = { images -> if (showsTask(task)) _state.value = _state.value.copy(images = images) })
+                    finishDelivery(task, files)
+                    if (showsTask(task)) _state.value = _state.value.copy(generating = false, waitingForRecovery = false, startedAt = 0L)
+                    appEventBus.tryEmit(AppEvent.ImageGenerationEnded(task.prompt, files.size, null))
+                    return@withProtection
+                }
                 if (task.taskId == null) validateRecoveryInputs(task)
                 val (model, providerSetting) = resolveImageModel(task)
                 if (providerSetting !is ProviderSetting.OpenAI) {
@@ -552,11 +721,13 @@ class ImageGenerationManager(
                 val recoveryFingerprint = task.recoveryApiKeyFingerprint()
                 var submittedTaskId = task.taskId
                 val onSubmitted: suspend (String) -> Unit = { taskId ->
+                    requireTaskAccount(task)
                     submittedTaskId = taskId
                     authTokenStore.setPendingImageTaskId(requestId, taskId)
                     ImageGenerationRecoveryScheduler.enqueue(context)
                 }
                 val onSelected: suspend (String) -> Unit = { fingerprint ->
+                    requireTaskAccount(task)
                     authTokenStore.setPendingImageTaskKeyFingerprint(requestId, fingerprint)
                 }
                 val onFallback: suspend () -> Unit = {
@@ -565,10 +736,7 @@ class ImageGenerationManager(
                     // it; replaying after a process death could charge the same image twice.
                     authTokenStore.removePendingImageTaskByRequestId(requestId)
                 }
-                val onFailed: suspend (String) -> Unit = { taskId ->
-                    authTokenStore.removePendingImageTask(taskId)
-                    authTokenStore.removePendingImageTaskByRequestId(requestId)
-                }
+                val onFailed: suspend (String) -> Unit = { requireTaskAccount(task) }
                 val images = if (submittedTaskId != null) {
                     provider.resumeImageTask(
                         providerSetting = providerSetting,
@@ -636,9 +804,11 @@ class ImageGenerationManager(
                     traceId = traceId,
                     attempt = 1,
                     requestId = requestId,
+                    accountTask = task,
                     onImagesChanged = { images ->
-                        if (task.origin != ORIGIN_TOOL_GENERATE) {
+                        if (showsTask(task)) {
                             _state.value = State(
+                                requestId = requestId,
                                 generating = true,
                                 prompt = task.prompt,
                                 images = images,
@@ -648,11 +818,9 @@ class ImageGenerationManager(
                         }
                     },
                 )
-                recoveryMutex.withLock {
-                    authTokenStore.removePendingImageTaskByRequestId(requestId)
-                }
-                if (task.origin != ORIGIN_TOOL_GENERATE) {
-                    _state.value = _state.value.copy(generating = false, startedAt = 0L)
+                finishDelivery(task.copy(taskId = submittedTaskId), files)
+                if (showsTask(task)) {
+                    _state.value = _state.value.copy(generating = false, waitingForRecovery = false, startedAt = 0L)
                 }
                 appEventBus.tryEmit(
                     AppEvent.ImageGenerationEnded(
@@ -662,15 +830,9 @@ class ImageGenerationManager(
                     )
                 )
                 trace(traceId, "task_recovered", "task_id=${submittedTaskId ?: "pending"} files=${files.size}")
-            }
+            } }
         } catch (e: CancellationException) {
-            if (userCancelledRequestIds.contains(requestId)) {
-                withContext(NonCancellable) {
-                    authTokenStore.removePendingImageTaskByRequestId(requestId)
-                    task.taskId?.let { authTokenStore.removePendingImageTask(it) }
-                }
-                return
-            }
+            withContext(NonCancellable) { deferPendingTask(e, requestId) }
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "Unable to recover image task ${task.taskId}; error=${e.javaClass.simpleName}")
@@ -680,20 +842,19 @@ class ImageGenerationManager(
                 }
             }.getOrDefault(true)
             if (shouldFinalizeImageRecovery(e, pendingStillExists)) {
+                val message = readableError(ModelRequestException(task.modelSnapshot?.modelId ?: task.modelName, e))
                 val removed = runCatching {
                     withContext(NonCancellable) {
-                        recoveryMutex.withLock {
-                            authTokenStore.removePendingImageTaskByRequestId(requestId)
-                        }
+                        finishDelivery(task, emptyList(), message)
                     }
                 }.onFailure { cleanupError ->
                     Log.w(TAG, "Unable to finalize failed image task ${task.taskId}", cleanupError)
                 }.isSuccess
                 if (removed) {
-                    val message = readableError(e)
-                    if (task.origin != ORIGIN_TOOL_GENERATE) {
+                    if (showsTask(task)) {
                         _state.value = _state.value.copy(
                             generating = false,
+                            waitingForRecovery = false,
                             error = message,
                             startedAt = 0L,
                         )
@@ -707,10 +868,11 @@ class ImageGenerationManager(
                     )
                     trace(traceId, "task_recovery_failed", "task_id=${task.taskId ?: "pending"}")
                 }
-            } else if (task.origin != ORIGIN_TOOL_GENERATE) {
-                _state.value = _state.value.copy(generating = false, startedAt = 0L)
+            } else {
+                deferPendingTask(e, requestId)
             }
         } finally {
+            accountJobs.remove(requestId)
             activeRequestIds.remove(requestId)
             recoveringRequestIds.remove(requestId)
         }
@@ -723,6 +885,22 @@ class ImageGenerationManager(
      */
     private suspend fun resolveImageModel(task: PendingImageTask? = null):
         Pair<me.rerere.ai.provider.Model, me.rerere.ai.provider.ProviderSetting> {
+        if (task?.modelSnapshot != null && task.providerSnapshot != null) {
+            return task.modelSnapshot to task.providerSnapshot
+        }
+        if (task != null && task.modelId.isNotBlank()) {
+            val routing = authTokenStore.currentGatewayRouting()
+            val candidates = listOfNotNull(routing.image) + routing.imageHistory.asReversed()
+            for (binding in candidates) {
+                if (task.apiKeyFingerprint.isNotBlank() &&
+                    me.rerere.ai.util.keyFingerprint(binding.key) != task.apiKeyFingerprint) continue
+                val cached = me.rerere.rikkahub.data.auth.ProviderInjector.models(
+                    binding, me.rerere.rikkahub.data.model.gateway.GatewayPurpose.IMAGE,
+                ).firstOrNull { it.id.toString() == task.modelId } ?: continue
+                val provider = cached.providerOverwrite as? ProviderSetting.OpenAI ?: continue
+                return cached to provider.copy(useAsyncImageTasks = true)
+            }
+        }
         val settings = settingsStore.settingsFlow.first()
         val persistedModelValue = task?.modelId?.takeIf(String::isNotBlank)
         val model = if (persistedModelValue != null) {
@@ -792,17 +970,30 @@ class ImageGenerationManager(
             suspend (String) -> Unit,
         ) -> Flow<ImageGenerationItem>,
         onImagesChanged: (List<GeneratedFile>) -> Unit = {},
-    ): List<File> = generationProtectionManager.withProtection(GenerationKind.IMAGE) {
-        generateAndPersistWhileProtected(
-            prompt = prompt,
-            size = size,
-            numOfImages = numOfImages,
-            sourcePaths = sourcePaths,
-            origin = origin,
-            traceId = traceId,
-            request = request,
-            onImagesChanged = onImagesChanged,
-        )
+    ): List<File> {
+        val operation = currentCoroutineContext()[ImageOperationContext]
+        val requestId = operation?.requestId ?: "bingo_" + UUID.randomUUID().toString()
+        try {
+            return generationProtectionManager.withProtection(GenerationKind.IMAGE) {
+                generateAndPersistWhileProtected(
+                    prompt = prompt,
+                    size = size,
+                    numOfImages = numOfImages,
+                    sourcePaths = sourcePaths,
+                    origin = origin,
+                    requestId = requestId,
+                    traceId = traceId,
+                    request = request,
+                    onImagesChanged = onImagesChanged,
+                )
+            }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) { deferPendingTask(e, requestId) }
+            throw e
+        } catch (e: Exception) {
+            if (deferPendingTask(e, requestId)) throw ImageGenerationPendingException(requestId, e)
+            throw e
+        }
     }
 
     /** Caller holds an active image-generation lease for the complete request and persistence work. */
@@ -812,6 +1003,7 @@ class ImageGenerationManager(
         numOfImages: Int,
         sourcePaths: String?,
         origin: String,
+        requestId: String = "bingo_" + UUID.randomUUID().toString(),
         traceId: String = nextTraceId(),
         request: suspend (
             me.rerere.ai.provider.Model,
@@ -828,6 +1020,26 @@ class ImageGenerationManager(
     ): List<File> {
         val startedAt = SystemClock.elapsedRealtime()
         trace(traceId, "manager_start", "origin=$origin prompt_chars=${prompt.length}")
+        val operation = currentCoroutineContext()[ImageOperationContext]
+        // A completed business operation stays completed even if the user changed model/key,
+        // or an old tool snapshot is executed again after its pending record was acknowledged.
+        if (operation != null) {
+            val delivered = conversationRepository?.findImageDelivery(operation)
+            val existingFiles = delivered?.imageUrls?.mapNotNull { url ->
+                val uri = url.toUri()
+                uri.path?.takeIf { uri.scheme == "file" }?.let(::File)
+            }.orEmpty()
+            if (existingFiles.isNotEmpty() && existingFiles.size == delivered?.imageUrls?.size &&
+                existingFiles.all { filesManager.isValidImageFile(it) }) {
+                return existingFiles
+            }
+            val accountId = authTokenStore.currentTaskAccountId()
+            if (delivered != null || (accountId != null && withContext(Dispatchers.IO) {
+                    deliveryReceipts.contains(accountId, requestId)
+                })) {
+                throw ImageGenerationTerminalException("此生图请求已完成，请查看原聊天或作品；如需重新生图，请发送新消息。")
+            }
+        }
         if (sourcePaths != null) validateImageEditSources(sourcePaths)
         val resolveStartedAt = SystemClock.elapsedRealtime()
         val (model, provider) = resolveImageModel()
@@ -836,106 +1048,154 @@ class ImageGenerationManager(
             "model_resolved",
             "origin=$origin elapsed_ms=${elapsedSince(resolveStartedAt)} model=${model.modelId}",
         )
-        val requestId = UUID.randomUUID().toString()
         val durableTask = provider is ProviderSetting.OpenAI && provider.useAsyncImageTasks
-        activeRequestIds.add(requestId)
-        if (origin != ORIGIN_TOOL_GENERATE) standaloneRequestIds.add(requestId)
-        if (durableTask) {
-            authTokenStore.savePendingImageTask(
-                PendingImageTask(
-                    requestId = requestId,
-                    taskId = null,
-                    prompt = prompt,
-                    sourcePaths = sourcePaths,
-                    modelName = model.displayName,
-                    origin = origin,
-                    modelId = model.id.toString(),
-                    providerId = provider.id.toString(),
-                    providerBaseUrl = provider.baseUrl,
-                    size = size,
-                    numOfImages = numOfImages.coerceAtLeast(1),
-                    editing = sourcePaths != null,
-                )
-            )
-            ImageGenerationRecoveryScheduler.enqueue(context)
-            trace(traceId, "request_persisted", "request_id=$requestId")
-        }
-        var submittedTaskId: String? = null
-        val onTaskSubmitted: suspend (String) -> Unit = { taskId ->
-            submittedTaskId = taskId
-            if (durableTask && !userCancelledRequestIds.contains(requestId)) {
-                authTokenStore.setPendingImageTaskId(requestId, taskId)
-            }
-            trace(traceId, "task_persisted", "task_id=$taskId")
-        }
-        var selectedApiKeyFingerprint: String? = null
-        val onImageKeySelected: suspend (String) -> Unit = { fingerprint ->
-            // The first key is part of the billing/idempotency identity. Keep it stable for every
-            // in-process retry, even when persisting the callback itself is delayed or fails.
-            if (selectedApiKeyFingerprint == null) selectedApiKeyFingerprint = fingerprint
-            if (durableTask && !userCancelledRequestIds.contains(requestId)) {
-                authTokenStore.setPendingImageTaskKeyFingerprint(requestId, fingerprint)
-            }
-            trace(traceId, "image_key_bound", "request_id=$requestId")
-        }
-        val onTaskFailed: suspend (String) -> Unit = { taskId ->
-            authTokenStore.removePendingImageTask(taskId)
-            if (durableTask) authTokenStore.removePendingImageTaskByRequestId(requestId)
-            trace(traceId, "task_removed", "task_id=$taskId reason=terminal_failure")
-        }
-        var asyncFallbackUsed = false
-        val onAsyncFallback: suspend () -> Unit = {
-            asyncFallbackUsed = true
-            if (durableTask && !userCancelledRequestIds.contains(requestId)) {
-                // The synchronous endpoint has no durable task contract. Do not let a process
-                // restart replay an already-started fallback request with an unknown billing state.
-                authTokenStore.removePendingImageTaskByRequestId(requestId)
-            }
-            trace(traceId, "async_fallback", "request_id=$requestId reason=endpoint_unsupported")
+        if (!activeRequestIds.add(requestId)) {
+            throw ImageGenerationPendingException(requestId, IllegalStateException("同一图片任务正在处理"))
         }
         try {
-            val files = withRetry(traceId, idempotent = { durableTask && !asyncFallbackUsed }) { committed, attempt ->
-                // Retried attempts restart from scratch, so drop anything a failed attempt showed.
-                onImagesChanged(emptyList())
-                collectInto(
-                    images = request(
-                        model,
-                        provider,
-                        requestId,
-                        selectedApiKeyFingerprint,
-                        traceId,
-                        onImageKeySelected,
-                        onTaskSubmitted,
-                        onAsyncFallback,
-                        onTaskFailed,
-                    ),
-                    prompt = prompt,
-                    modelName = model.displayName,
-                    sourcePaths = sourcePaths,
-                    committed = committed,
-                    traceId = traceId,
-                    attempt = attempt,
-                    requestId = requestId,
-                    onImagesChanged = onImagesChanged,
-                )
-            }
+            if (origin != ORIGIN_TOOL_GENERATE) standaloneRequestIds.add(requestId)
+            var persistedTask: PendingImageTask? = null
             if (durableTask) {
-                recoveryMutex.withLock {
+                val existing = authTokenStore.currentPendingImageTasks().firstOrNull { it.requestId == requestId }
+                if (existing != null) {
+                    activeRequestIds.remove(requestId)
+                    ImageGenerationRecoveryScheduler.enqueue(context)
+                    throw ImageGenerationPendingException(requestId, IllegalStateException("已有任务等待恢复"))
+                }
+                persistedTask = PendingImageTask(
+                        accountId = authTokenStore.currentTaskAccountId(),
+                        conversationId = operation?.conversationId,
+                        messageId = operation?.messageId,
+                        toolCallId = operation?.toolCallId,
+                        operationId = operation?.operationId,
+                        itemId = operation?.itemId,
+                        modelSnapshot = model,
+                        providerSnapshot = provider,
+                        requestId = requestId,
+                        prompt = prompt,
+                        sourcePaths = sourcePaths,
+                        modelName = model.displayName,
+                        origin = origin,
+                        modelId = model.id.toString(),
+                        providerId = provider.id.toString(),
+                        providerBaseUrl = provider.baseUrl,
+                        size = size,
+                        numOfImages = numOfImages.coerceAtLeast(1),
+                        editing = sourcePaths != null,
+                    )
+                authTokenStore.savePendingImageTask(
+                    persistedTask,
+                )
+                currentCoroutineContext()[Job]?.let { accountJobs[requestId] = persistedTask.accountId to it }
+                if (origin != ORIGIN_TOOL_GENERATE && _state.value.requestId == requestId && requestId !in hiddenRequestIds) {
+                    _state.value = _state.value.copy(requestId = requestId, waitingForRecovery = false)
+                }
+                ImageGenerationRecoveryScheduler.enqueue(context)
+                trace(traceId, "request_persisted", "request_id=$requestId")
+            }
+            var submittedTaskId: String? = null
+            val onTaskSubmitted: suspend (String) -> Unit = { taskId ->
+                submittedTaskId = taskId
+                if (durableTask) {
+                    requireTaskAccount(persistedTask!!)
+                    authTokenStore.setPendingImageTaskId(requestId, taskId)
+                }
+                trace(traceId, "task_persisted", "task_id=$taskId")
+            }
+            var selectedApiKeyFingerprint: String? = null
+            val onImageKeySelected: suspend (String) -> Unit = { fingerprint ->
+                // The first key is part of the billing/idempotency identity. Keep it stable for every
+                // in-process retry, even when persisting the callback itself is delayed or fails.
+                if (selectedApiKeyFingerprint == null) selectedApiKeyFingerprint = fingerprint
+                if (durableTask) {
+                    requireTaskAccount(persistedTask!!)
+                    authTokenStore.setPendingImageTaskKeyFingerprint(requestId, fingerprint)
+                }
+                trace(traceId, "image_key_bound", "request_id=$requestId")
+            }
+            val onTaskFailed: suspend (String) -> Unit = { taskId ->
+                persistedTask?.let { requireTaskAccount(it) }
+                trace(traceId, "task_terminal", "task_id=$taskId reason=terminal_failure")
+            }
+            var asyncFallbackUsed = false
+            val onAsyncFallback: suspend () -> Unit = {
+                asyncFallbackUsed = true
+                if (durableTask) {
+                    // The synchronous endpoint has no durable task contract. Do not let a process
+                    // restart replay an already-started fallback request with an unknown billing state.
                     authTokenStore.removePendingImageTaskByRequestId(requestId)
                 }
-                trace(traceId, "task_removed", "task_id=${submittedTaskId ?: "none"} reason=completed")
+                trace(traceId, "async_fallback", "request_id=$requestId reason=endpoint_unsupported")
             }
-            trace(
-                traceId,
-                "manager_complete",
-                "origin=$origin files=${files.size} elapsed_ms=${elapsedSince(startedAt)}",
-            )
-            return files
+            try {
+                val files = imagePermits.withPermit {
+                  persistedTask?.let { requireTaskAccount(it) }
+                  withRetry(traceId, idempotent = { durableTask && !asyncFallbackUsed }) { committed, attempt ->
+                    // Retried attempts restart from scratch, so drop anything a failed attempt showed.
+                    onImagesChanged(emptyList())
+                    collectInto(
+                        images = if (submittedTaskId != null && provider is ProviderSetting.OpenAI) {
+                            // Once acknowledged, retry the same task's GET rather than its billable POST.
+                            providerManager.getProviderByType(provider).resumeImageTask(
+                                providerSetting = provider,
+                                taskId = submittedTaskId!!,
+                                customHeaders = model.customHeaders,
+                                traceId = traceId,
+                                apiKeyFingerprint = selectedApiKeyFingerprint.orEmpty(),
+                                onTaskFailed = onTaskFailed,
+                            )
+                        } else request(
+                            model,
+                            provider,
+                            requestId,
+                            selectedApiKeyFingerprint,
+                            traceId,
+                            onImageKeySelected,
+                            onTaskSubmitted,
+                            onAsyncFallback,
+                            onTaskFailed,
+                        ),
+                        prompt = prompt,
+                        modelName = model.displayName,
+                        sourcePaths = sourcePaths,
+                        committed = committed,
+                        traceId = traceId,
+                        attempt = attempt,
+                        requestId = requestId,
+                        accountTask = persistedTask,
+                        onImagesChanged = onImagesChanged,
+                    )
+                  }
+                }
+                if (durableTask) {
+                    finishDelivery(persistedTask!!.copy(taskId = submittedTaskId,
+                        apiKeyFingerprint = selectedApiKeyFingerprint.orEmpty()), files)
+                    trace(traceId, "task_removed", "task_id=${submittedTaskId ?: "none"} reason=completed")
+                }
+                trace(
+                    traceId,
+                    "manager_complete",
+                    "origin=$origin files=${files.size} elapsed_ms=${elapsedSince(startedAt)}",
+                )
+                return files
+            } catch (terminal: ImageGenerationTerminalException) {
+                if (durableTask) {
+                    withContext(NonCancellable) {
+                        finishDelivery(persistedTask!!.copy(taskId = submittedTaskId), emptyList(),
+                            readableError(ModelRequestException(model.modelId, terminal)))
+                    }
+                }
+                throw ModelRequestException(model.modelId, terminal)
+            } catch (error: Exception) {
+                if (error is CancellationException || error is ModelRequestException) throw error
+                throw ModelRequestException(model.modelId, error)
+            }
         } finally {
+            accountJobs.remove(requestId)
             activeRequestIds.remove(requestId)
-            if (origin != ORIGIN_TOOL_GENERATE && !userCancelledRequestIds.contains(requestId)) {
+            if (origin != ORIGIN_TOOL_GENERATE) {
                 standaloneRequestIds.remove(requestId)
-                userCancelledRequestIds.remove(requestId)
+                hiddenRequestIds.remove(requestId)
             }
         }
     }
@@ -949,6 +1209,7 @@ class ImageGenerationManager(
         traceId: String,
         attempt: Int,
         requestId: String,
+        accountTask: PendingImageTask? = null,
         onImagesChanged: (List<GeneratedFile>) -> Unit,
     ): List<File> {
         val finals = mutableListOf<GeneratedFile>()
@@ -956,6 +1217,7 @@ class ImageGenerationManager(
         var previewFile: File? = null
         var index = 0
         images.collect { item ->
+            accountTask?.let { requireTaskAccount(it) }
             previewFile?.delete()
             if (item.partial) {
                 // Temp folder, not images/: previews are transient and must not accumulate in gallery storage.
@@ -974,6 +1236,7 @@ class ImageGenerationManager(
                 onImagesChanged(finals.toList())
             }
         }
+        check(files.isNotEmpty()) { "生图模型未返回有效图片" }
         return files
     }
 
@@ -1013,7 +1276,7 @@ class ImageGenerationManager(
         )
         val downloadedPath = item.localPath
         val materializeStartedAt = SystemClock.elapsedRealtime()
-        val created = if (target.isFile && target.length() > 0L) {
+        val created = if (filesManager.isValidImageFile(target)) {
             downloadedPath?.let { path -> File(path).takeIf { it != target }?.delete() }
             target
         } else {
@@ -1114,6 +1377,8 @@ class ImageGenerationManager(
 
     // 绘画特有的两种配置缺失自己处理, 其余(余额/限流/鉴权/网络...)交给共用的中文映射.
     private fun readableError(e: Exception): String = when {
+        e.message?.contains("Cannot safely fall back to synchronous") == true ->
+            "中转站暂时无法使用可恢复生图接口，请稍后重试或联系管理员。"
         e.message?.contains("No image model") == true ->
             context.getString(R.string.imggen_error_no_model)
 

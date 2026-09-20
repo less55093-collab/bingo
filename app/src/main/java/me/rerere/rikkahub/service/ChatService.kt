@@ -12,6 +12,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -40,6 +42,8 @@ import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessageAnnotation
+import me.rerere.rikkahub.utils.localizedChatMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.canResumeToolExecution
 import me.rerere.ai.ui.finishPendingTools
@@ -169,7 +173,27 @@ class ChatService(
     // adding the persistent interruption annotation.
     private val activeStreamTokens = ConcurrentHashMap<Uuid, Long>()
     private val userStoppedStreamTokens = ConcurrentHashMap<Uuid, Long>()
+    // Approval is a continuation of a completed tool plan. Cancelling its predecessor must not
+    // rewrite already accepted choices or other still-pending choices as user-denied tools.
+    private val approvalContinuationStreamTokens = ConcurrentHashMap<Uuid, Long>()
     private val _sessionsVersion = MutableStateFlow(0L)
+
+    init {
+        appScope.launch {
+            conversationRepo.imageDeliveries.collect { (conversationId, delivered) ->
+                val session = sessions[conversationId] ?: return@collect
+                synchronized(session) {
+                    val current = session.state.value
+                    val receipts = delivered.annotations.filterIsInstance<UIMessageAnnotation.ImageDelivery>()
+                    updateConversation(conversationId, current.copy(messageNodes = current.messageNodes.map { node ->
+                        node.copy(messages = node.messages.map { message ->
+                            if (message.id == delivered.id) message.withImageDeliveries(receipts) else message
+                        })
+                    }))
+                }
+            }
+        }
+    }
 
     // 错误状态
     private val _errors = MutableStateFlow<List<ChatError>>(emptyList())
@@ -273,6 +297,8 @@ class ChatService(
             // so an immediate background transition is protected while recovery finishes.
             ensureConversationInitialized(conversationId)
             block(lease)
+        } catch (error: Exception) {
+            addError(error, conversationId, title = context.getString(R.string.error_title_send_message))
         } finally {
             withContext(NonCancellable) { lease.close() }
         }
@@ -343,19 +369,22 @@ class ChatService(
 
     // ---- 发送消息 ----
 
-    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
+    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true,
+        directImageGeneration: Boolean = false) {
         if (content.isEmptyInputMessage()) return
 
         val session = getOrCreateSession(conversationId)
         val previousJob = session.getJob()
+        if (previousJob?.isActive == true) return
         previousJob?.cancel()
 
         val job = launchChatGeneration(conversationId) { lease ->
             try {
                 runCatching { previousJob?.join() }
+                session.processingStatus.value = "正在准备发送，请先保持 App 在前台"
                 finishInterruptedPendingTools(conversationId)
 
-                val currentConversation = session.state.value
+                val currentConversation = session.state.value.clearReplyPending()
                 val settings = settingsStore.settingsFlow.first()
                 val assistant = settings.getAssistantById(currentConversation.assistantId)
                     ?: settings.getCurrentAssistant()
@@ -366,6 +395,10 @@ class ChatService(
                     messageNodes = currentConversation.messageNodes + UIMessage(
                         role = MessageRole.USER,
                         parts = processedContent,
+                        annotations = buildList {
+                            if (answer) add(UIMessageAnnotation.ReplyPending)
+                            if (directImageGeneration) add(UIMessageAnnotation.DirectImageRequest)
+                        },
                     ).toMessageNode(),
                 )
                 saveConversation(conversationId, newConversation)
@@ -383,7 +416,16 @@ class ChatService(
                 }
             } catch (e: Exception) {
                 Logging.log(TAG, "sendMessage failed: ${e.javaClass.simpleName}")
+                if (session.state.value.messageNodes.lastOrNull()?.currentMessage?.annotations
+                        ?.any { it is UIMessageAnnotation.ReplyPending } == true) {
+                    withContext(NonCancellable) {
+                        val failed = session.state.value.withGenerationFailure(null, e.localizedChatMessage(context))
+                        saveConversation(conversationId, failed)
+                    }
+                }
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
+            } finally {
+                session.processingStatus.value = null
             }
         }
         session.setJob(job)
@@ -482,69 +524,52 @@ class ChatService(
         reason: String = "",
         answer: String? = null,
         inputOverride: String? = null,
+        expectedMessageId: Uuid? = null,
     ) {
         val session = getOrCreateSession(conversationId)
-        val previousJob = session.getJob()
-        previousJob?.cancel()
-
-        val job = launchChatGeneration(conversationId) { lease ->
-            try {
-                runCatching { previousJob?.join() }
-                val conversation = session.state.value
-                val newApprovalState = when {
-                    answer != null -> ToolApprovalState.Answered(answer)
-                    approved -> ToolApprovalState.Approved
-                    else -> ToolApprovalState.Denied(reason)
-                }
-
-                // Update the tool approval state
-                val updatedNodes = conversation.messageNodes.map { node ->
-                    node.copy(
-                        messages = node.messages.map { msg ->
-                            msg.copy(
-                                parts = msg.parts.map { part ->
-                                    when {
-                                        part is UIMessagePart.Tool && part.toolCallId == toolCallId -> {
-                                            part.copy(
-                                                input = inputOverride ?: part.input,
-                                                approvalState = newApprovalState,
-                                            )
-                                        }
-
-                                        else -> part
-                                    }
-                                }
-                            )
-                        }
-                    )
-                }
-                val updatedConversation = conversation.copy(messageNodes = updatedNodes)
-                saveConversation(conversationId, updatedConversation)
-
-                // Check if there are still pending tools
-                val hasPendingTools = updatedNodes.any { node ->
-                    node.currentMessage.parts.any { part ->
-                        part is UIMessagePart.Tool && part.isPending
-                    }
-                }
-
-                // Only continue generation when all pending tools are handled
-                if (!hasPendingTools) {
-                    generationProtectionManager.withActiveLease(lease) {
-                        val completed = handleMessageComplete(
-                            conversationId,
-                            generationToken = nextStreamGenerationToken.incrementAndGet(),
-                            protectionRunToken = lease.runToken,
-                        )
-                        if (completed) _generationDoneFlow.emit(conversationId)
-                    }
-                }
-            } catch (e: Exception) {
-                addError(e, conversationId, title = context.getString(R.string.error_title_tool_approval))
-            }
+        val newApprovalState = when {
+            answer != null -> ToolApprovalState.Answered(answer)
+            approved -> ToolApprovalState.Approved
+            else -> ToolApprovalState.Denied(reason)
         }
+        synchronized(session) {
+            // Commit synchronously before creating/cancelling a Job. Duplicate callbacks can run
+            // before a launched coroutine resumes; only the first may consume this Pending state.
+            val transition = session.state.value.transitionPendingTailTool(
+                toolCallId, newApprovalState, inputOverride, expectedMessageId,
+            ) ?: return
+            updateConversation(conversationId, transition.conversation)
+            val previousJob = session.getJob()
+            activeStreamTokens[conversationId]?.let { approvalContinuationStreamTokens[conversationId] = it }
+            previousJob?.cancel()
 
-        session.setJob(job)
+            val job = launchChatGeneration(conversationId) { lease ->
+                try {
+                    // Keep replacement chains ordered even if another tool's approval cancels
+                    // this waiting job. Its predecessor must finish cleanup before the next starts.
+                    withContext(NonCancellable) { previousJob?.join() }
+                    currentCoroutineContext().ensureActive()
+                    val conversation = session.state.value
+                    if (!transition.canContinue(conversation)) return@launchChatGeneration
+                    saveConversation(conversationId, conversation)
+                    val tailTools = conversation.currentMessages.last().getTools()
+                    if (tailTools.none { it.isPending } && tailTools.any { it.canResumeExecution }) {
+                        generationProtectionManager.withActiveLease(lease) {
+                            val completed = handleMessageComplete(
+                                conversationId,
+                                generationToken = nextStreamGenerationToken.incrementAndGet(),
+                                protectionRunToken = lease.runToken,
+                            )
+                            if (completed) _generationDoneFlow.emit(conversationId)
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    addError(e, conversationId, title = context.getString(R.string.error_title_tool_approval))
+                }
+            }
+            session.setJob(job)
+        }
     }
 
     // ---- 处理消息补全 ----
@@ -557,10 +582,16 @@ class ChatService(
         protectionRunToken: Long,
     ): Boolean {
         val settings = settingsStore.settingsFlow.first()
+        checkInvalidMessages(conversationId)
         val initialConversation = getConversationFlow(conversationId).value
+        val generationInput = selectChatGenerationInput(initialConversation.currentMessages, messageRange)
         val assistant = settings.getAssistantById(initialConversation.assistantId)
             ?: settings.getCurrentAssistant()
-        val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId) ?: return false
+        val directImageGeneration = generationInput.directImageGeneration
+        val model = settings.findModelById(if (directImageGeneration) settings.imageGenerationModelId
+            else assistant.chatModelId ?: settings.chatModelId)
+            ?: error(if (directImageGeneration) "当前生图模型不可用，请在设置中同步或重新选择生图模型，尚未提交任务。"
+                else "当前聊天模型不可用，请在设置中同步模型或重新选择模型。尚未启动生图。")
 
         val senderName = if (assistant.useAssistantAvatar) {
             assistant.name.ifEmpty { context.getString(R.string.assistant_page_default_assistant) }
@@ -576,7 +607,7 @@ class ChatService(
             updateConversation(conversationId, initialConversation.copy(chatSuggestions = emptyList()))
 
             // memory tool
-            if (!model.abilities.contains(ModelAbility.TOOL)) {
+            if (!directImageGeneration && !model.abilities.contains(ModelAbility.TOOL)) {
                 if (shouldAttachAppSearchTools(assistant, model) || mcpManager.getAllAvailableTools().isNotEmpty()) {
                     addError(
                         IllegalStateException(context.getString(R.string.tools_warning)),
@@ -586,8 +617,6 @@ class ChatService(
                 }
             }
 
-            // check invalid messages
-            checkInvalidMessages(conversationId)
             val conversation = getConversationFlow(conversationId).value
 
             // start generating
@@ -601,16 +630,11 @@ class ChatService(
             )
             streamStarted = true
             generationHandler.generateText(
+                conversationId = conversationId.toString(),
                 settings = settings,
                 model = model,
                 processingStatus = session.processingStatus,
-                messages = conversation.currentMessages.let {
-                    if (messageRange != null) {
-                        it.subList(messageRange.start, messageRange.endInclusive + 1)
-                    } else {
-                        it
-                    }
-                },
+                messages = generationInput.messages,
                 assistant = assistant,
                 conversationSystemPrompt = conversation.customSystemPrompt,
                 conversationModeInjectionIds = conversation.modeInjectionIds,
@@ -627,7 +651,7 @@ class ChatService(
                     add(workspaceReminderTransformer)
                 },
                 outputTransformers = outputTransformers,
-                tools = buildList {
+                tools = if (directImageGeneration) listOf(localTools.imageGenerationTool) else buildList {
                     if (shouldAttachAppSearchTools(assistant, model)) {
                         addAll(createSearchTools(settings))
                     }
@@ -697,11 +721,19 @@ class ChatService(
                 when (chunk) {
                     is GenerationChunk.Messages -> {
                         if (!streamCheckpoint.isCurrent(conversationId, generationToken)) return@collect
-                        val updatedConversation = getConversationFlow(conversationId).value
-                            .updateCurrentMessages(chunk.messages)
+                        val currentConversation = getConversationFlow(conversationId).value
+                        val existingReceipts = currentConversation.messageNodes.flatMap { it.messages }
+                            .associate { it.id to it.annotations.filterIsInstance<me.rerere.ai.ui.UIMessageAnnotation.ImageDelivery>() }
+                        val updatedConversation = currentConversation.updateCurrentMessages(chunk.messages.map { message ->
+                            message.withImageDeliveries(existingReceipts[message.id].orEmpty())
+                        })
                         generationTarget?.observe(updatedConversation)
                         updateConversation(conversationId, updatedConversation)
                         streamCheckpoint.offer(conversationId, generationToken, updatedConversation)
+                        // Paid tools may start only after their original message is durable.
+                        if (chunk.messages.lastOrNull()?.getTools()?.any { it.executionStarted } == true) {
+                            streamCheckpoint.flush(conversationId, generationToken, updatedConversation)
+                        }
 
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
                         // tryEmit 不挂起，事件丢失只影响单次通知更新，不能反压生成链
@@ -718,7 +750,8 @@ class ChatService(
                     }
                 }
             }
-            val finalConversation = getConversationFlow(conversationId).value
+            val finalConversation = getConversationFlow(conversationId).value.clearReplyPending()
+            updateConversation(conversationId, finalConversation)
             val persisted = withContext(NonCancellable) {
                 streamCheckpoint.saveFinal(
                     conversationId = conversationId,
@@ -776,6 +809,8 @@ class ChatService(
 
             val stoppedByUser = error is CancellationException &&
                 userStoppedStreamTokens.remove(conversationId, generationToken)
+            val continuingToolApproval = error is CancellationException &&
+                approvalContinuationStreamTokens.remove(conversationId, generationToken)
             val protectionLost = generationProtectionManager.isProtectionLost(protectionRunToken)
             val interrupted = error !is CancellationException || protectionLost
             backgroundInterruptionNotice.recordIfEligible(
@@ -806,11 +841,18 @@ class ChatService(
             // Cancellation/failure must retain received tool output as well as text. The final
             // save shares the checkpoint mutex, so an older generation cannot overwrite a newer
             // branch after it has been cancelled.
-            val failedConversation = if (interrupted) {
+            val interruptedConversation = if (continuingToolApproval && !protectionLost && !stoppedByUser) {
+                getConversationFlow(conversationId).value.clearReplyPending()
+                    .finishGenerationReasoning(generationTarget, updateAt = Instant.now())
+            } else if (interrupted) {
                 markCurrentGenerationInterrupted(conversationId, generationTarget)
             } else {
                 finishCurrentGenerationByUser(conversationId, generationTarget)
             }
+            val failedConversation = if (error !is CancellationException) {
+                interruptedConversation.withGenerationFailure(generationTarget, error.localizedChatMessage(context))
+            } else interruptedConversation.clearReplyPending()
+            updateConversation(conversationId, failedConversation)
             try {
                 withContext(NonCancellable) {
                     streamCheckpoint.offer(conversationId, generationToken, failedConversation)
@@ -863,6 +905,7 @@ class ChatService(
             // behind would make a later user stop attach its intent to an unrelated generation.
             activeStreamTokens.remove(conversationId, generationToken)
             userStoppedStreamTokens.remove(conversationId, generationToken)
+            approvalContinuationStreamTokens.remove(conversationId, generationToken)
             if (streamStarted) {
                 try {
                     withContext(NonCancellable) {
@@ -1191,8 +1234,20 @@ class ChatService(
     private fun updateConversation(conversationId: Uuid, conversation: Conversation) {
         if (conversation.id != conversationId) return
         val session = getOrCreateSession(conversationId)
-        checkFilesDelete(conversation, session.state.value)
-        session.state.value = conversation
+        synchronized(session) {
+            val current = session.state.value
+            val currentMessages = current.messageNodes.flatMap { it.messages }.associateBy { it.id }
+            val receipts = current.messageNodes.flatMap { it.messages }
+                .associate { it.id to it.annotations.filterIsInstance<UIMessageAnnotation.ImageDelivery>() }
+            val merged = conversation.copy(messageNodes = conversation.messageNodes.map { node ->
+                node.copy(messages = node.messages.map { message ->
+                    message.withAcceptedToolApprovals(currentMessages[message.id])
+                        .withImageDeliveries(receipts[message.id].orEmpty())
+                })
+            })
+            checkFilesDelete(merged, current)
+            session.state.value = merged
+        }
     }
 
     private fun markCurrentGenerationInterrupted(
@@ -1209,8 +1264,8 @@ class ChatService(
     }
 
     fun updateConversationState(conversationId: Uuid, update: (Conversation) -> Conversation) {
-        val current = getConversationFlow(conversationId).value
-        updateConversation(conversationId, update(current))
+        val session = getOrCreateSession(conversationId)
+        synchronized(session) { updateConversation(conversationId, update(session.state.value)) }
     }
 
     /**

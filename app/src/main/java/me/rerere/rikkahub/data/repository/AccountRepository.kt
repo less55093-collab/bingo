@@ -25,6 +25,7 @@ import me.rerere.rikkahub.data.model.gateway.TokenPair
 import me.rerere.rikkahub.data.model.gateway.UserProfile
 import me.rerere.rikkahub.data.sync.s3.S3CredentialStore
 import me.rerere.rikkahub.data.sync.ChatBackupSync
+import me.rerere.rikkahub.data.sync.DatabaseRestoreCoordinator
 import me.rerere.rikkahub.data.db.AccountDatabaseManager
 
 sealed interface AuthState {
@@ -79,9 +80,9 @@ class AccountRepository(
     }
 
     /**
-     * Persists the session, then provisions inference keys. Key provisioning failure does not fail
-     * the login — the user is authenticated and we retry on next launch — but it does mean chat
-     * cannot work yet, so it is surfaced by [me.rerere.rikkahub.data.auth.ProviderKeys.isComplete].
+     * Persists the session, then switches onto the account-scoped database. Key provisioning is
+     * deferred until after that restart so login does not sit on chat for a few seconds and then
+     * kill the process a second time.
      */
     private suspend fun onAuthenticated(pair: TokenPair) {
         val previousDatabase = AccountDatabaseManager.currentDatabaseName(context)
@@ -91,12 +92,22 @@ class AccountRepository(
             expiresInSeconds = pair.expiresIn,
         )
         pair.user?.let { tokenStore.saveProfile(it) }
-        runCatching { keyProvisioner.ensureProvisioned() }
-            .onFailure { Log.w(TAG, "key provisioning failed after auth", it) }
         if (pair.user == null) runCatching { refreshProfile() }
         val profile = tokenStore.profileFlow.first()
         val targetDatabase = AccountDatabaseManager.databaseName(profile?.id?.takeIf { it > 0 })
-        if (previousDatabase != targetDatabase) chatBackupSync.restartApp()
+        runCatching { chatBackupSync.restoreIfLocalEmpty(targetDatabase) }
+            .onFailure { Log.w(TAG, "chat restore after auth failed", it) }
+        if (shouldRestartAfterAuthentication(
+                previousDatabase,
+                targetDatabase,
+                DatabaseRestoreCoordinator.hasPending(context),
+            )
+        ) {
+            chatBackupSync.restartApp()
+            return
+        }
+        runCatching { keyProvisioner.ensureProvisioned() }
+            .onFailure { Log.w(TAG, "key provisioning failed after auth", it) }
     }
 
     /** Called on cold start when already authenticated, to self-heal missing or revoked keys. */
@@ -138,8 +149,7 @@ class AccountRepository(
         }
         runCatching { s3CredentialStore.clearLegacySettingsCredentials() }
             .onFailure { error -> Log.w(TAG, "failed to clear legacy S3 credentials on logout", error) }
-        tokenStore.clear()
-        runCatching { keyProvisioner.applyToSettings(ProviderKeys()) }
+        runCatching { keyProvisioner.clearAccount() }
             .onFailure { Log.w(TAG, "failed to clear injected keys on logout", it) }
         chatBackupSync.restartApp()
     }
@@ -167,3 +177,9 @@ class AccountRepository(
 
 /** Only positive gateway IDs identify a persisted account namespace. */
 internal fun UserProfile?.s3CredentialAccountId(): Long? = this?.id?.takeIf { it > 0 }
+
+internal fun shouldRestartAfterAuthentication(
+    previousDatabase: String,
+    targetDatabase: String,
+    pendingRestore: Boolean,
+): Boolean = previousDatabase != targetDatabase || pendingRestore

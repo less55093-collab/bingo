@@ -4,15 +4,24 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.Serializable
 import me.rerere.rikkahub.data.model.gateway.UserProfile
+import me.rerere.rikkahub.data.model.gateway.GatewayRouting
 import me.rerere.rikkahub.utils.JsonInstant
 import java.util.UUID
 
@@ -41,6 +50,12 @@ data class AuthTokens(
 
 class AuthTokenStore(private val context: Context) {
     private val dataStore = context.authStore
+    private val pendingStore = PendingImageTaskStore(context.noBackupFilesDir.resolve("pending_image_tasks"))
+    private val pendingMutex = Mutex()
+    private val pendingStorageIssues = MutableStateFlow(0)
+
+    /** Number of preserved unreadable records; healthy records are still recoverable. */
+    val pendingImageTaskStorageIssuesFlow: Flow<Int> = pendingStorageIssues
 
     companion object {
         private val ACCESS_TOKEN = stringPreferencesKey("access_token")
@@ -50,7 +65,9 @@ class AuthTokenStore(private val context: Context) {
         private val CLAUDE_KEY = stringPreferencesKey("claude_api_key")
         private val GPT_KEY = stringPreferencesKey("gpt_api_key")
         private val IMAGE_KEY = stringPreferencesKey("image_api_key")
+        private val GATEWAY_ROUTING = stringPreferencesKey("gateway_routing")
         private val PENDING_IMAGE_TASKS = stringPreferencesKey("pending_image_tasks")
+        private val PENDING_LEGACY_ACCOUNT_ID = longPreferencesKey("pending_image_tasks_account_id")
         private val TUTORIAL_SHOWN = booleanPreferencesKey("tutorial_shown")
     }
 
@@ -75,20 +92,81 @@ class AuthTokenStore(private val context: Context) {
 
     val tutorialShownFlow: Flow<Boolean> = dataStore.data.map { it[TUTORIAL_SHOWN] ?: false }
 
-    val pendingImageTasksFlow: Flow<List<PendingImageTask>> = dataStore.data.map { prefs ->
-        prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-            runCatching {
-                JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                    .map(PendingImageTask::normalized)
-            }.getOrNull()
-        } ?: emptyList()
-    }
+    val pendingImageTasksFlow: Flow<List<PendingImageTask>> =
+        combine(dataStore.data, pendingStore.revision) { _, _ -> currentPendingImageTasks() }
+            .distinctUntilChanged()
 
     suspend fun currentTokens(): AuthTokens = tokensFlow.first()
 
     suspend fun currentProviderKeys(): ProviderKeys = providerKeysFlow.first()
 
-    suspend fun currentPendingImageTasks(): List<PendingImageTask> = pendingImageTasksFlow.first()
+    val gatewayRoutingFlow: Flow<GatewayRouting> = dataStore.data.map { prefs ->
+        prefs[GATEWAY_ROUTING]?.let { JsonInstant.decodeFromString<GatewayRouting>(it) } ?: GatewayRouting()
+    }
+
+    suspend fun currentGatewayRouting(): GatewayRouting = gatewayRoutingFlow.first()
+
+    suspend fun saveGatewayRouting(routing: GatewayRouting) {
+        dataStore.edit { prefs ->
+            prefs[GATEWAY_ROUTING] = JsonInstant.encodeToString(routing)
+            prefs[GPT_KEY] = routing.chat?.key.orEmpty()
+            prefs[IMAGE_KEY] = routing.image?.key.orEmpty()
+            prefs[CLAUDE_KEY] = ""
+        }
+    }
+
+    suspend fun currentPendingImageTasks(): List<PendingImageTask> = withContext(Dispatchers.IO) {
+        pendingMutex.withLock {
+            val prefs = dataStore.data.first()
+            migrateLegacyTasks(prefs)
+            val accountId = prefs.activeTaskAccountId() ?: run {
+                pendingStorageIssues.value = 0
+                return@withLock emptyList()
+            }
+            val result = pendingStore.read(accountId)
+            pendingStorageIssues.value = result.damagedRecords
+            result.tasks
+        }
+    }
+
+    suspend fun currentTaskAccountId(): Long? = dataStore.data.first().activeTaskAccountId()
+
+    /** Recheck immediately before using a saved provider/key snapshot or delivering its result. */
+    suspend fun isCurrentAccount(task: PendingImageTask): Boolean =
+        task.accountId != null && task.accountId == currentTaskAccountId()
+
+    private fun Preferences.activeTaskAccountId(): Long? {
+        if (this[ACCESS_TOKEN].isNullOrBlank() || this[REFRESH_TOKEN].isNullOrBlank()) return null
+        return this[PROFILE]?.let { encoded ->
+            runCatching { JsonInstant.decodeFromString<UserProfile>(encoded).id.takeIf { it > 0 } }.getOrNull()
+        }
+    }
+
+    private suspend fun migrateLegacyTasks(prefs: Preferences) {
+        val legacy = prefs[PENDING_IMAGE_TASKS] ?: return
+        val accountId = if (prefs[PENDING_LEGACY_ACCOUNT_ID] != null) {
+            prefs[PENDING_LEGACY_ACCOUNT_ID]?.takeIf { it > 0 }
+        } else prefs.activeTaskAccountId()
+        if (accountId == null) pendingStore.preserveUnownedLegacy(legacy)
+        else pendingStore.importLegacy(accountId, legacy)
+        // The import has synced independent records (including any corrupt bytes) before deleting
+        // the preference. A crash before this edit safely replays the import.
+        dataStore.edit { current ->
+            if (current[PENDING_IMAGE_TASKS] == legacy) {
+                current.remove(PENDING_IMAGE_TASKS)
+                current.remove(PENDING_LEGACY_ACCOUNT_ID)
+            }
+        }
+    }
+
+    private suspend fun mutatePendingTasks(block: (Long) -> Unit) = withContext(Dispatchers.IO) {
+        pendingMutex.withLock {
+            val prefs = dataStore.data.first()
+            migrateLegacyTasks(prefs)
+            val accountId = prefs.activeTaskAccountId() ?: error("请登录原账号后恢复图片任务")
+            block(accountId)
+        }
+    }
 
     /**
      * Read tokens without suspending. Used once in `RouteActivity.onCreate` to pick the start
@@ -127,90 +205,76 @@ class AuthTokenStore(private val context: Context) {
     }
 
     suspend fun savePendingImageTask(task: PendingImageTask) {
-        val normalized = task.normalized()
-        dataStore.edit { prefs ->
-            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching {
-                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                        .map(PendingImageTask::normalized)
-                }.getOrNull()
-            }.orEmpty()
-            prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(
-                tasks.filterNot {
-                    it.requestId == normalized.requestId ||
-                        (normalized.taskId != null && it.taskId == normalized.taskId)
-                } + normalized
-            )
-        }
+        mutatePendingTasks { accountId -> pendingStore.save(accountId, task) }
     }
 
     suspend fun removePendingImageTask(taskId: String) {
-        dataStore.edit { prefs ->
-            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching {
-                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                        .map(PendingImageTask::normalized)
-                }.getOrNull()
-            }.orEmpty().filterNot { it.taskId == taskId }
-            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
-            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
-        }
+        mutatePendingTasks { accountId -> pendingStore.remove(accountId) { it.taskId == taskId } }
     }
 
     suspend fun removePendingImageTaskByRequestId(requestId: String) {
-        dataStore.edit { prefs ->
-            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching {
-                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                        .map(PendingImageTask::normalized)
-                }.getOrNull()
-            }.orEmpty().filterNot { it.requestId == requestId }
-            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
-            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
-        }
+        mutatePendingTasks { accountId -> pendingStore.remove(accountId) { it.requestId == requestId } }
     }
 
     suspend fun setPendingImageTaskId(requestId: String, taskId: String) {
         if (requestId.isBlank() || taskId.isBlank()) return
-        dataStore.edit { prefs ->
-            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching {
-                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                        .map(PendingImageTask::normalized)
-                }.getOrNull()
-            }.orEmpty().map { task ->
-                if (task.requestId == requestId) task.copy(taskId = taskId) else task
-            }
-            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
-            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        mutatePendingTasks { accountId ->
+            pendingStore.update(accountId, requestId) { it.copy(taskId = taskId) }
         }
     }
 
     /** Binds recovery polling to the same configured API key used for submission. */
     suspend fun setPendingImageTaskKeyFingerprint(requestId: String, fingerprint: String) {
         if (requestId.isBlank() || fingerprint.isBlank()) return
-        dataStore.edit { prefs ->
-            val tasks = prefs[PENDING_IMAGE_TASKS]?.let { encoded ->
-                runCatching {
-                    JsonInstant.decodeFromString<List<PendingImageTask>>(encoded)
-                        .map(PendingImageTask::normalized)
-                }.getOrNull()
-            }.orEmpty().map { task ->
-                if (task.requestId == requestId) task.copy(apiKeyFingerprint = fingerprint) else task
-            }
-            if (tasks.isEmpty()) prefs.remove(PENDING_IMAGE_TASKS)
-            else prefs[PENDING_IMAGE_TASKS] = JsonInstant.encodeToString(tasks)
+        mutatePendingTasks { accountId ->
+            pendingStore.update(accountId, requestId) { it.copy(apiKeyFingerprint = fingerprint) }
         }
     }
 
-    /** Clears everything account-scoped so the next login cannot inherit these keys. */
-    suspend fun clear() {
-        dataStore.edit { it.clear() }
+    suspend fun updatePendingImageTaskResult(requestId: String, paths: List<String>, error: String? = null) {
+        mutatePendingTasks { accountId ->
+            pendingStore.update(accountId, requestId) { it.copy(completedPaths = paths, deliveryError = error) }
+        }
+    }
+
+    /** Clear active credentials; recovery records remain isolated until this account signs in. */
+    suspend fun clear() = withContext(Dispatchers.IO) {
+        pendingMutex.withLock {
+            val prefs = dataStore.data.first()
+            // Preserve the owner before removing credentials even if disk-full prevents import.
+            prefs.activeTaskAccountId()?.let { owner ->
+                dataStore.edit { if (it[PENDING_IMAGE_TASKS] != null) it[PENDING_LEGACY_ACCOUNT_ID] = owner }
+            }
+            try {
+                migrateLegacyTasks(dataStore.data.first())
+            } finally {
+                dataStore.edit { current ->
+                    val legacy = current[PENDING_IMAGE_TASKS]
+                    val owner = current[PENDING_LEGACY_ACCOUNT_ID]
+                    current.clear()
+                    if (legacy != null) {
+                        current[PENDING_IMAGE_TASKS] = legacy
+                        // Zero marks an unknown owner, so a future account never adopts it.
+                        current[PENDING_LEGACY_ACCOUNT_ID] = owner ?: 0L
+                    }
+                }
+            }
+        }
     }
 }
 
 @Serializable
 data class PendingImageTask(
+    val accountId: Long? = null,
+    val conversationId: String? = null,
+    val messageId: String? = null,
+    val toolCallId: String? = null,
+    val operationId: String? = null,
+    val itemId: String? = null,
+    val completedPaths: List<String> = emptyList(),
+    val deliveryError: String? = null,
+    val modelSnapshot: me.rerere.ai.provider.Model? = null,
+    val providerSnapshot: me.rerere.ai.provider.ProviderSetting? = null,
     val taskId: String? = null,
     val prompt: String = "",
     val sourcePaths: String? = null,

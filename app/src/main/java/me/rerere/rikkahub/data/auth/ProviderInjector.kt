@@ -1,68 +1,138 @@
 package me.rerere.rikkahub.data.auth
 
+import me.rerere.ai.provider.Modality
+import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderSetting
-import me.rerere.rikkahub.data.datastore.BINGO_MODELS
+import me.rerere.ai.registry.ModelRegistry
+import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import me.rerere.rikkahub.data.datastore.BINGO_PROVIDER
-import me.rerere.rikkahub.data.datastore.BINGO_PROVIDER_ID
+import me.rerere.rikkahub.data.datastore.BINGO_IMAGE_OVERWRITE_ID
+import me.rerere.rikkahub.data.datastore.BingoModelIds
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.model.gateway.GatewayBinding
+import me.rerere.rikkahub.data.model.gateway.GatewayPurpose
+import me.rerere.rikkahub.data.model.gateway.GatewayRouting
+import me.rerere.rikkahub.data.model.gateway.enforceGroupRestrictions
+import java.util.UUID
+import kotlin.uuid.Uuid
 
-/**
- * The **only** place API keys are written into provider settings. Key rotation and logout both go
- * through here, so there is no second writer to fall out of sync with.
- *
- * Also the enforcement point for locked-down provider config: [inject] rebuilds baseUrl, paths and
- * the model list from code on every call, so a restored backup or a leaked editor route cannot
- * leave edited provider config in effect past the next launch.
- */
+/** Builds the picker from the account's last successful upstream catalog, never a fixed model list. */
 object ProviderInjector {
+    private val legacyChatIds = mapOf(
+        "gpt-5.6-sol" to BingoModelIds.GPT_5_6_SOL,
+        "gpt-5.6-terra" to BingoModelIds.GPT_5_6_TERRA,
+        "gpt-5.5" to BingoModelIds.GPT_5_5,
+        "gpt-5.4" to BingoModelIds.GPT_5_4,
+        "gpt-5.4-mini" to BingoModelIds.GPT_5_4_MINI,
+    )
 
-    /** Rebuilds the bingo provider from code with [keys] applied, dropping every other provider. */
-    fun inject(settings: Settings, keys: ProviderKeys): Settings {
-        val existingModels = settings.providers
-            .flatMap { it.models }
-            .associateBy { it.id }
-        val provider = BINGO_PROVIDER.copy(
-            apiKey = keys.gptKey,
-            models = BINGO_MODELS.map { baseline ->
-                baseline.copy(tools = existingModels[baseline.id]?.tools ?: baseline.tools)
-                    .withOverwriteKey(keys)
-            },
+    fun modelId(id: String, purpose: GatewayPurpose): Uuid =
+        (if (purpose == GatewayPurpose.CHAT) legacyChatIds[id]
+        else if (id == "gpt-image-2") BingoModelIds.GPT_IMAGE_2 else null)
+            ?: Uuid.parse(UUID.nameUUIDFromBytes("bingo:${purpose.name}:$id".toByteArray(Charsets.UTF_8)).toString())
+
+    // Also used to recover previously submitted image tasks, whose group may no longer be selectable.
+    // Active catalogs must go through inject(), which enforces the current group restrictions.
+    fun models(binding: GatewayBinding?, purpose: GatewayPurpose): List<Model> = binding?.models.orEmpty().map { remote ->
+        val image = purpose == GatewayPurpose.IMAGE
+        Model(
+            id = modelId(remote.id, purpose),
+            modelId = remote.id,
+            displayName = remote.displayName.ifBlank { remote.id },
+            type = if (image) ModelType.IMAGE else ModelType.CHAT,
+            inputModalities = if (image) listOf(Modality.TEXT, Modality.IMAGE)
+                else ModelRegistry.MODEL_INPUT_MODALITIES.getData(remote.id),
+            outputModalities = if (image) listOf(Modality.IMAGE) else listOf(Modality.TEXT),
+            abilities = if (image) emptyList() else
+                (ModelRegistry.MODEL_ABILITIES.getData(remote.id) + ModelAbility.TOOL).distinct(),
+            providerOverwrite = if (image) imageProvider(binding!!, remote.id) else chatProvider(binding!!),
         )
-        return settings.copy(providers = listOf(provider))
     }
 
-    /**
-     * Clears secrets while keeping the provider shape intact, so a logged-out app has no spendable
-     * key on disk but the model picker still renders rather than crashing on a missing provider.
-     */
-    fun clear(settings: Settings): Settings = inject(settings, ProviderKeys())
-
-    /**
-     * Keys are duplicated into each model's `providerOverwrite`, which is the cost of keeping one
-     * flat provider-free picker. Contained here so rotation stays a single call.
-     */
-    private fun Model.withOverwriteKey(keys: ProviderKeys): Model = when (val o = providerOverwrite) {
-        is ProviderSetting.OpenAI -> copy(providerOverwrite = o.copy(apiKey = keys.imageKey))
-        else -> this
-    }
-
-    /** True when [settings] already matches what [inject] would produce, so a write can be skipped. */
-    fun isUpToDate(settings: Settings, keys: ProviderKeys): Boolean {
-        val provider = settings.providers.singleOrNull() as? ProviderSetting.OpenAI ?: return false
-        if (provider.id != BINGO_PROVIDER_ID) return false
-        if (provider.apiKey != keys.gptKey) return false
-        if (provider.baseUrl != BINGO_PROVIDER.baseUrl) return false
-        if (provider.useResponseApi != BINGO_PROVIDER.useResponseApi) return false
-        if (provider.models.map { it.modelId } != BINGO_MODELS.map { it.modelId }) return false
-        return provider.models.all { model ->
-            val expected = BINGO_MODELS.firstOrNull { it.id == model.id }?.providerOverwrite
-            when (val o = model.providerOverwrite) {
-                is ProviderSetting.OpenAI ->
-                    o.apiKey == keys.imageKey && o.useAsyncImageTasks ==
-                        (expected as? ProviderSetting.OpenAI)?.useAsyncImageTasks
-                else -> true
-            }
+    private fun chatProvider(binding: GatewayBinding): ProviderSetting =
+        if (binding.group.claudeCodeOnly || binding.group.platform == "anthropic") {
+            ProviderSetting.Claude(
+                id = BINGO_PROVIDER.id, name = binding.group.displayName,
+                baseUrl = "${BingoGatewayAPI.INFERENCE_BASE_URL}/v1", apiKey = binding.key,
+            )
+        } else {
+            BINGO_PROVIDER.copy(name = binding.group.displayName, apiKey = binding.key,
+                useResponseApi = binding.group.platform == "openai")
         }
+
+    fun imageProvider(binding: GatewayBinding, model: String): ProviderSetting {
+        val google = binding.group.platform in setOf("gemini", "antigravity") ||
+            (binding.group.platform == "composite" &&
+                (model.startsWith("gemini", true) || model.contains("nano-banana", true)))
+        return if (google) {
+            ProviderSetting.Google(
+                id = BINGO_IMAGE_OVERWRITE_ID, name = binding.group.displayName,
+                baseUrl = "${BingoGatewayAPI.INFERENCE_BASE_URL}/v1beta", apiKey = binding.key,
+            )
+        } else {
+            ProviderSetting.OpenAI(
+                id = BINGO_IMAGE_OVERWRITE_ID, name = binding.group.displayName,
+                baseUrl = "${BingoGatewayAPI.INFERENCE_BASE_URL}/v1", apiKey = binding.key,
+                useAsyncImageTasks = binding.group.platform in setOf("openai", "grok"),
+            )
+        }
+    }
+
+    fun inject(settings: Settings, routing: GatewayRouting): Settings {
+        val active = routing.enforceGroupRestrictions()
+        val existing = settings.providers.flatMap { it.models }.associateBy { it.id }
+        val models = (models(active.chat, GatewayPurpose.CHAT) + models(active.image, GatewayPurpose.IMAGE))
+            .map { model -> model.copy(tools = (existing[model.id]?.tools ?: model.tools)
+                .filterNot { it == BuiltInTools.ImageGeneration }.toSet()) }
+        val chatIds = models.filter { it.type == ModelType.CHAT }.map { it.id }
+        val imageModels = models.filter { it.type == ModelType.IMAGE }
+        val imageIds = imageModels.map { it.id }
+        val chatDefault = BingoModelIds.GPT_5_6_SOL.takeIf { it in chatIds }
+            ?: chatIds.firstOrNull() ?: Uuid.NIL
+        val migrateDefault = !settings.solDefaultApplied && BingoModelIds.GPT_5_6_SOL in chatIds
+        // This only chooses a default; it never removes unfamiliar upstream models from the picker.
+        val imageDefault = imageModels.firstOrNull { looksLikeImageModel(it.modelId) }?.id
+            ?: imageIds.firstOrNull() ?: Uuid.NIL
+        fun chat(id: Uuid) = id.takeIf { it in chatIds } ?: chatDefault
+        return settings.copy(
+            providers = listOf(BINGO_PROVIDER.copy(apiKey = active.chat?.key.orEmpty(), models = models)),
+            chatModelId = if (migrateDefault && settings.chatModelId == BingoModelIds.GPT_5_5)
+                BingoModelIds.GPT_5_6_SOL else chat(settings.chatModelId),
+            solDefaultApplied = settings.solDefaultApplied || migrateDefault,
+            fastModelId = chat(settings.fastModelId),
+            titleModelId = settings.titleModelId?.let(::chat),
+            translateModeId = chat(settings.translateModeId),
+            suggestionModelId = settings.suggestionModelId?.let(::chat),
+            ocrModelId = chat(settings.ocrModelId),
+            compressModelId = chat(settings.compressModelId),
+            imageGenerationModelId = settings.imageGenerationModelId.takeIf { it in imageIds } ?: imageDefault,
+            assistants = settings.assistants.map { assistant ->
+                assistant.copy(chatModelId = if (migrateDefault && assistant.chatModelId == BingoModelIds.GPT_5_5)
+                    BingoModelIds.GPT_5_6_SOL else assistant.chatModelId?.takeIf { it in chatIds })
+            },
+            favoriteModels = settings.favoriteModels.filter { it in chatIds || it in imageIds },
+        )
+    }
+
+    private fun looksLikeImageModel(id: String): Boolean =
+        id.contains("image", true) || id.contains("dall-e", true) ||
+            id.contains("imagen", true) || id.contains("banana", true) || id.contains("flux", true)
+
+    /** Backups keep model references but never account credentials. */
+    fun clear(settings: Settings): Settings = settings.copy(
+        providers = settings.providers.map { provider ->
+            clearKey(provider).copyProvider(models = provider.models.map { model ->
+                model.copy(providerOverwrite = model.providerOverwrite?.let(::clearKey))
+            })
+        },
+    )
+
+    private fun clearKey(provider: ProviderSetting): ProviderSetting = when (provider) {
+        is ProviderSetting.OpenAI -> provider.copy(apiKey = "")
+        is ProviderSetting.Claude -> provider.copy(apiKey = "")
+        is ProviderSetting.Google -> provider.copy(apiKey = "", privateKey = "", serviceAccountEmail = "")
     }
 }

@@ -114,6 +114,8 @@ val appModule = module {
             appEventBus = get(),
             authTokenStore = get(),
             generationProtectionManager = get(),
+            conversationRepository = get(),
+            gatewayAPI = get(),
         )
     }
 

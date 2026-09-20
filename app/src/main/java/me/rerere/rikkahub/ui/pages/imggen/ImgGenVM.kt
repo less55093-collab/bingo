@@ -99,6 +99,10 @@ class ImgGenVM(
         .map { it.error }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
+    val waitingForRecovery: StateFlow<Boolean> = imageGenerationManager.state
+        .map { it.waitingForRecovery }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
     /**
      * 估算进度(0f..1f)。上游不回传真实进度，所以按耗时推一条渐近曲线：越接近预期时长增长越慢，
      * 且永远到不了 1f，最后一段留给真实的完成事件收尾——否则进度条会先满上再干等着。

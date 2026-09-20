@@ -15,7 +15,7 @@ import org.junit.Test
 
 class ImageGenerationToolUITest {
     @Test
-    fun `direct tool stays in image generation while input is partial`() {
+    fun `partial tool input stays in preparation before execution`() {
         val phase = resolveImageGenerationToolPhase(
             toolName = IMAGE_GENERATION_TOOL_NAME,
             input = """{"prompt":"a cat""",
@@ -24,17 +24,18 @@ class ImageGenerationToolUITest {
             hasImages = false,
         )
 
-        assertEquals(ImageGenerationToolPhase.GENERATING, phase)
+        assertEquals(ImageGenerationToolPhase.PREPARING, phase)
     }
 
     @Test
-    fun `direct prompt starts image generation without approval`() {
+    fun `direct prompt starts image generation only after execution begins`() {
         val phase = resolveImageGenerationToolPhase(
             toolName = IMAGE_GENERATION_TOOL_NAME,
             input = """{"prompt":"a cat","size":"1024x1024"}""",
             approvalState = ToolApprovalState.Auto,
             hasOutput = false,
             hasImages = false,
+            executionStarted = true,
         )
 
         assertEquals(ImageGenerationToolPhase.GENERATING, phase)
@@ -75,16 +76,17 @@ class ImageGenerationToolUITest {
                 approvalState = ToolApprovalState.Approved,
                 hasOutput = false,
                 hasImages = false,
+                executionStarted = true,
             ),
         )
     }
 
     @Test
-    fun `approved plan keeps a confirmed state before output`() {
+    fun `approved plan waits until execution actually starts`() {
         val input = """{"request":"a cat","variants":[{"prompt":"A"},{"prompt":"B"}]}"""
 
         assertEquals(
-            ImageGenerationToolPhase.PLAN_CONFIRMED,
+            ImageGenerationToolPhase.PLAN_PREPARING,
             resolveImageGenerationToolPhase(
                 toolName = IMAGE_GENERATION_PLAN_TOOL_NAME,
                 input = input,

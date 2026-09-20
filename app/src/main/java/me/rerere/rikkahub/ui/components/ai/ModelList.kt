@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.ui.components.ai
 
 import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -90,6 +91,8 @@ class ModelListState internal constructor(
     modelId: Uuid?,
     providers: List<ProviderSetting>,
     type: ModelType,
+    secondaryType: ModelType? = null,
+    secondaryModelId: Uuid? = null,
 ) {
     var modelId by mutableStateOf(modelId)
         private set
@@ -100,6 +103,12 @@ class ModelListState internal constructor(
     var type by mutableStateOf(type)
         private set
 
+    var secondaryType by mutableStateOf(secondaryType)
+        private set
+
+    var secondaryModelId by mutableStateOf(secondaryModelId)
+        private set
+
     var visible by mutableStateOf(false)
         private set
 
@@ -107,8 +116,11 @@ class ModelListState internal constructor(
         get() = modelId?.let { providers.findModelById(it) }
 
     val filteredProviders: List<ProviderSetting>
-        get() = providers.fastFilter { provider ->
-            provider.enabled && provider.models.fastAny { model -> model.type == type }
+        get() {
+            val types = modelTypes(type, secondaryType).toSet()
+            return providers.fastFilter { provider ->
+                provider.enabled && provider.models.fastAny { model -> model.type in types }
+            }
         }
 
     fun open() {
@@ -123,11 +135,20 @@ class ModelListState internal constructor(
         modelId: Uuid?,
         providers: List<ProviderSetting>,
         type: ModelType,
+        secondaryType: ModelType? = null,
+        secondaryModelId: Uuid? = null,
     ) {
         this.modelId = modelId
         this.providers = providers
         this.type = type
+        this.secondaryType = secondaryType
+        this.secondaryModelId = secondaryModelId
     }
+}
+
+internal fun modelTypes(type: ModelType, secondaryType: ModelType?): List<ModelType> {
+    val requested = listOfNotNull(type, secondaryType).toSet()
+    return listOf(ModelType.CHAT, ModelType.IMAGE, ModelType.EMBEDDING).filter { it in requested }
 }
 
 @Composable
@@ -135,18 +156,24 @@ fun rememberModelListState(
     modelId: Uuid?,
     providers: List<ProviderSetting>,
     type: ModelType,
+    secondaryType: ModelType? = null,
+    secondaryModelId: Uuid? = null,
 ): ModelListState {
     return remember {
         ModelListState(
             modelId = modelId,
             providers = providers,
             type = type,
+            secondaryType = secondaryType,
+            secondaryModelId = secondaryModelId,
         )
     }.also {
         it.update(
             modelId = modelId,
             providers = providers,
             type = type,
+            secondaryType = secondaryType,
+            secondaryModelId = secondaryModelId,
         )
     }
 }
@@ -159,12 +186,16 @@ fun ModelSelector(
     modifier: Modifier = Modifier,
     onlyIcon: Boolean = false,
     allowClear: Boolean = false,
+    secondaryType: ModelType? = null,
+    secondaryModelId: Uuid? = null,
     onSelect: (Model) -> Unit
 ) {
     val state = rememberModelListState(
         modelId = modelId,
         providers = providers,
         type = type,
+        secondaryType = secondaryType,
+        secondaryModelId = secondaryModelId,
     )
     val model = state.currentModel
 
@@ -271,6 +302,8 @@ fun ModelListSheet(
                 currentModel = state.modelId,
                 providers = state.filteredProviders,
                 modelType = state.type,
+                secondaryType = state.secondaryType,
+                secondaryModelId = state.secondaryModelId,
                 onSelect = {
                     onSelect(it)
                     dismiss()
@@ -288,6 +321,8 @@ private fun ColumnScope.ModelList(
     currentModel: Uuid? = null,
     providers: List<ProviderSetting>,
     modelType: ModelType,
+    secondaryType: ModelType? = null,
+    secondaryModelId: Uuid? = null,
     onSelect: (Model) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -296,28 +331,32 @@ private fun ColumnScope.ModelList(
     val settings = settingsStore.settingsFlow
         .collectAsStateWithLifecycle()
 
+    val listedTypes = remember(modelType, secondaryType) { modelTypes(modelType, secondaryType) }
     val favoriteModels = settings.value.favoriteModels.mapNotNull { modelId ->
         val model = settings.value.providers.findModelById(modelId) ?: return@mapNotNull null
-        if (model.type != modelType) return@mapNotNull null
+        if (model.type !in listedTypes) return@mapNotNull null
         val provider = model.findProvider(providers = settings.value.providers, checkOverwrite = false) ?: return@mapNotNull null
         model to provider
     }
 
     var searchKeywords by remember { mutableStateOf("") }
 
-    val typeFilteredModelsByProvider = remember(providers, modelType) {
+    val typeFilteredModelsByProvider = remember(providers, listedTypes) {
         providers.associate { provider ->
-            provider.id to provider.models.fastFilter { it.type == modelType }
+            provider.id to provider.models.fastFilter { it.type in listedTypes }
         }
     }
 
-    val searchFilteredModelsByProvider = remember(providers, modelType, searchKeywords) {
+    val searchFilteredModelsByProvider = remember(providers, listedTypes, searchKeywords) {
         providers.associate { provider ->
             provider.id to provider.models.fastFilter {
-                it.type == modelType && it.displayName.contains(searchKeywords, true)
+                it.type in listedTypes && it.displayName.contains(searchKeywords, true)
             }
         }
     }
+
+    fun isSelected(model: Model): Boolean =
+        model.id == currentModel || model.id == secondaryModelId
 
     // 计算当前选中模型的位置
     val selectedModelPosition = remember(currentModel, favoriteModels, providers, typeFilteredModelsByProvider) {
@@ -466,7 +505,7 @@ private fun ColumnScope.ModelList(
                         modifier = Modifier
                             .scale(if (isDragging) 0.95f else 1f)
                             .animateItem(),
-                        select = model.id == currentModel,
+                        select = isSelected(model),
                         onDismiss = {
                             onDismiss()
                         },
@@ -509,60 +548,126 @@ private fun ColumnScope.ModelList(
             }
         }
 
-        providers.fastForEach { providerSetting ->
-            items(
-                items = searchFilteredModelsByProvider[providerSetting.id].orEmpty(),
-                key = { it.id }
-            ) { model ->
-                val favorite = settings.value.favoriteModels.contains(model.id)
-                ModelItem(
-                    model = model,
-                    onSelect = onSelect,
-                    modifier = Modifier.animateItem(),
-                    select = currentModel == model.id,
-                    onDismiss = {
-                        onDismiss()
-                    },
-                    tail = {
-                        IconButton(
-                            onClick = {
+        if (secondaryType != null) {
+            listedTypes.forEach { sectionType ->
+                val sectionModels = providers.flatMap { providerSetting ->
+                    searchFilteredModelsByProvider[providerSetting.id].orEmpty().fastFilter { it.type == sectionType }
+                }
+                stickyHeader(key = "header:${sectionType.name}") {
+                    Text(
+                        text = modelTypeSectionTitle(sectionType),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surface)
+                            .padding(bottom = 4.dp, top = 8.dp),
+                    )
+                }
+                if (sectionModels.isEmpty()) {
+                    item(key = "empty:${sectionType.name}") {
+                        Text(
+                            text = if (sectionType == ModelType.IMAGE) "暂无生图模型，可到设置同步或充值后刷新"
+                            else "暂无聊天模型，可到设置同步或切换分组",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.extendColors.gray6,
+                            modifier = Modifier.padding(8.dp),
+                        )
+                    }
+                } else {
+                    items(
+                        items = sectionModels,
+                        key = { "${sectionType.name}:${it.id}" }
+                    ) { model ->
+                        ModelPickRow(
+                            model = model,
+                            selected = isSelected(model),
+                            favorite = settings.value.favoriteModels.contains(model.id),
+                            onSelect = onSelect,
+                            onDismiss = onDismiss,
+                            modifier = Modifier.animateItem(),
+                            onToggleFavorite = { favorite ->
                                 coroutineScope.launch {
-                                    settingsStore.update { settings ->
-                                        if (favorite) {
-                                            settings.copy(
-                                                favoriteModels = settings.favoriteModels.filter { it != model.id }
-                                            )
-
-                                        } else {
-                                            settings.copy(
-                                                favoriteModels = settings.favoriteModels + model.id
-                                            )
-                                        }
+                                    settingsStore.update { current ->
+                                        if (favorite) current.copy(favoriteModels = current.favoriteModels.filter { it != model.id })
+                                        else current.copy(favoriteModels = current.favoriteModels + model.id)
                                     }
                                 }
-                            }
-                        ) {
-                            if (favorite) {
-                                Icon(
-                                    HeartIcon,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp),
-                                    tint = MaterialTheme.colorScheme.primary,
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = HugeIcons.Favourite,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
+                            },
+                        )
                     }
-                )
+                }
+            }
+        } else {
+            providers.fastForEach { providerSetting ->
+                items(
+                    items = searchFilteredModelsByProvider[providerSetting.id].orEmpty(),
+                    key = { it.id }
+                ) { model ->
+                    ModelPickRow(
+                        model = model,
+                        selected = isSelected(model),
+                        favorite = settings.value.favoriteModels.contains(model.id),
+                        onSelect = onSelect,
+                        onDismiss = onDismiss,
+                        modifier = Modifier.animateItem(),
+                        onToggleFavorite = { favorite ->
+                            coroutineScope.launch {
+                                settingsStore.update { current ->
+                                    if (favorite) current.copy(favoriteModels = current.favoriteModels.filter { it != model.id })
+                                    else current.copy(favoriteModels = current.favoriteModels + model.id)
+                                }
+                            }
+                        },
+                    )
+                }
             }
         }
     }
 
+}
+
+internal fun modelTypeSectionTitle(type: ModelType): String = when (type) {
+    ModelType.CHAT -> "聊天模型"
+    ModelType.IMAGE -> "生图模型"
+    ModelType.EMBEDDING -> "嵌入模型"
+}
+
+@Composable
+private fun ModelPickRow(
+    model: Model,
+    selected: Boolean,
+    favorite: Boolean,
+    onSelect: (Model) -> Unit,
+    onDismiss: () -> Unit,
+    onToggleFavorite: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    ModelItem(
+        model = model,
+        onSelect = onSelect,
+        modifier = modifier,
+        select = selected,
+        onDismiss = onDismiss,
+        tail = {
+            IconButton(onClick = { onToggleFavorite(favorite) }) {
+                if (favorite) {
+                    Icon(
+                        HeartIcon,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    Icon(
+                        imageVector = HugeIcons.Favourite,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        },
+    )
 }
 
 @Composable

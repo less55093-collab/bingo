@@ -58,10 +58,10 @@ data class ApiKeyDto(
     val id: Long = 0,
     val key: String = "",
     val name: String = "",
-    @SerialName("group_id") val groupId: Int = 0,
+    @SerialName("group_id") val groupId: Int? = null,
     val status: String = "",
-    val quota: Long = 0,
-    @SerialName("quota_used") val quotaUsed: Long = 0,
+    val quota: Double = 0.0,
+    @SerialName("quota_used") val quotaUsed: Double = 0.0,
     @SerialName("expires_at") val expiresAt: String? = null,
 ) {
     val isUsable: Boolean

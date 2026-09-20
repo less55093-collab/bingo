@@ -7,14 +7,19 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInfo
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.FileProvider
 import androidx.core.net.toUri
+import me.rerere.rikkahub.ui.activity.PackageInstallTrampolineActivity
+import okhttp3.CacheControl
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -91,28 +96,31 @@ class UpdateChecker(
     }.flowOn(Dispatchers.IO)
 
     /**
-     * Performs a verified same-package update. A backup is written before the system installer is
-     * launched, so an APK overlay update keeps live app data and a recoverable snapshot exists.
+     * Downloads a verified same-package update and hands it to the system installer.
+     * A lightweight backup is best-effort only so a large or failing snapshot cannot block install.
      */
     suspend fun downloadAndInstall(context: Context, download: UpdateDownload): Result<Unit> = runCatching {
-        ensureCanRequestPackageInstalls(context)
-        val notification = UpdateProgressNotification(context)
+        val appContext = context.applicationContext
+        ensureCanRequestPackageInstalls(appContext)
+        val notification = UpdateProgressNotification(appContext)
         val expectedHash = download.sha256?.lowercase()?.takeIf { it.matches(SHA256_PATTERN) }
             ?: error("更新包缺少有效的 SHA-256 校验值")
-        val apk = downloadApk(context, download.url, notification)
+        val apk = downloadApk(appContext, download.url, notification)
         try {
             notification.showPreparingInstall()
             check(apk.sha256Hex() == expectedHash) { "更新包校验失败" }
-            verifyApk(context, apk)
-            createBackup(context)
+            verifyApk(appContext, apk)
+            runCatching { createBackup(appContext) }
+                .onFailure { error -> Log.w(TAG, "pre-install backup failed", error) }
+            notification.showOpeningInstaller()
+            launchInstaller(appContext, apk)
             notification.cancel()
-            launchInstaller(context, apk)
         } catch (error: Throwable) {
             apk.delete()
             throw error
         }
     }.onFailure { error ->
-        UpdateProgressNotification(context).showFailure(error.message)
+        UpdateProgressNotification(context.applicationContext).showFailure(error.message)
     }
 
     fun canShowDownloadProgress(context: Context): Boolean =
@@ -129,7 +137,14 @@ class UpdateChecker(
         partial.delete()
         notification.showDownloadProgress(progress = null)
         try {
-            client.newCall(Request.Builder().url(url).get().build()).await().use { response ->
+            client.newCall(
+                Request.Builder()
+                    .url(url)
+                    .header("Accept-Encoding", "identity")
+                    .cacheControl(CacheControl.FORCE_NETWORK)
+                    .get()
+                    .build()
+            ).await().use { response ->
                 check(response.isSuccessful) { "下载更新包失败：HTTP ${response.code}" }
                 val totalBytes = response.body.contentLength()
                 FileOutputStream(partial).use { output ->
@@ -168,7 +183,9 @@ class UpdateChecker(
         check(archive.packageName == context.packageName) { "更新包不属于当前应用" }
         check(archive.versionCodeCompat() > BuildConfig.VERSION_CODE.toLong()) { "更新包版本未高于当前版本" }
         val installed = manager.getPackageInfoCompat(context.packageName)
-        check(archive.signingHashes() == installed.signingHashes()) { "更新包签名不一致" }
+        val archiveHashes = archive.signingHashes()
+        val installedHashes = installed.signingHashes()
+        check(archiveHashes.intersect(installedHashes).isNotEmpty()) { "更新包签名不一致" }
     }
 
     private suspend fun createBackup(context: Context): File = withContext(Dispatchers.IO) {
@@ -187,9 +204,8 @@ class UpdateChecker(
                     context.getDatabasePath(AccountDatabaseManager.currentDatabaseName(context))
                         .takeIf(File::isFile)
                         ?.let { zip.writeFile(it, "rikka_hub.db") }
-                    listOf("upload", "images", "skills", "fonts").forEach { name ->
-                        File(context.filesDir, name).takeIf(File::isDirectory)?.let { zip.writeDirectory(it, "$name/") }
-                    }
+                    // Media folders can be hundreds of MB and used to stall the installer at 100%.
+                    // Settings plus the live database are enough to recover after a failed overlay.
                     zip.finish()
                     zip.flush()
                     fileOutput.fd.sync()
@@ -209,12 +225,66 @@ class UpdateChecker(
     }
 
     private fun launchInstaller(context: Context, apk: File) {
+        runCatching { installWithPackageInstaller(context, apk) }
+            .onFailure { error -> Log.w(TAG, "PackageInstaller session failed, falling back to ACTION_VIEW", error) }
+            .recoverCatching { installWithViewIntent(context, apk) }
+            .getOrThrow()
+    }
+
+    private fun installWithPackageInstaller(context: Context, apk: File) {
+        val installer = context.packageManager.packageInstaller
+        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
+            setAppPackageName(context.packageName)
+            setSize(apk.length())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
+            }
+        }
+        val sessionId = installer.createSession(params)
+        val session = installer.openSession(sessionId)
+        try {
+            session.openWrite("package", 0, apk.length()).use { output ->
+                apk.inputStream().use { input -> input.copyTo(output) }
+                session.fsync(output)
+            }
+            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                sessionId,
+                Intent(context, PackageInstallTrampolineActivity::class.java).apply {
+                    action = ACTION_PACKAGE_INSTALLED
+                    data = Uri.parse("package-install://$sessionId")
+                },
+                pendingFlags,
+            )
+            session.commit(pendingIntent.intentSender)
+        } catch (error: Throwable) {
+            session.abandon()
+            throw error
+        } finally {
+            session.close()
+        }
+    }
+
+    private fun installWithViewIntent(context: Context, apk: File) {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        )
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+            .putExtra(Intent.EXTRA_RETURN_RESULT, true)
+        @Suppress("DEPRECATION")
+        val resolved = context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        check(resolved.isNotEmpty()) { "没有可用的安装程序，请允许本应用安装未知应用后重试" }
+        resolved.forEach { resolve ->
+            context.grantUriPermission(
+                resolve.activityInfo.packageName,
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        context.startActivity(intent)
     }
 
     private fun ensureCanRequestPackageInstalls(context: Context) {
@@ -235,10 +305,21 @@ class UpdateChecker(
     )
 
     @Suppress("DEPRECATION")
-    private fun PackageManager.getPackageArchiveInfoCompat(path: String): PackageInfo? = getPackageArchiveInfo(
-        path,
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES,
-    )
+    private fun PackageManager.getPackageArchiveInfoCompat(path: String): PackageInfo? {
+        val signingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+        val info = getPackageArchiveInfo(path, signingFlags)
+            ?: getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)
+            ?: return null
+        info.applicationInfo?.apply {
+            sourceDir = path
+            publicSourceDir = path
+        }
+        return info
+    }
 
     @Suppress("DEPRECATION")
     private fun PackageInfo.versionCodeCompat(): Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) longVersionCode else versionCode.toLong()
@@ -246,10 +327,14 @@ class UpdateChecker(
     @Suppress("DEPRECATION")
     private fun PackageInfo.signingHashes(): Set<String> {
         val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            requireNotNull(signingInfo).apkContentsSigners
+            signingInfo?.let { info ->
+                if (info.hasMultipleSigners()) info.apkContentsSigners
+                else info.signingCertificateHistory ?: info.apkContentsSigners
+            } ?: signatures
         } else {
-            requireNotNull(signatures)
+            signatures
         }
+        check(!signatures.isNullOrEmpty()) { "无法读取安装包签名" }
         return signatures.map { MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).toHexString() }.toSet()
     }
 
@@ -282,16 +367,39 @@ class UpdateChecker(
         closeEntry()
     }
 
-    private fun ZipOutputStream.writeDirectory(directory: File, prefix: String) {
-        directory.listFiles()?.forEach { child ->
-            if (child.isDirectory) writeDirectory(child, "$prefix${child.name}/") else if (child.isFile) writeFile(child, "$prefix${child.name}")
-        }
-    }
-
     companion object {
+        private const val TAG = "UpdateChecker"
         private val SHA256_PATTERN = Regex("[0-9a-f]{64}")
     }
 }
+
+internal const val ACTION_PACKAGE_INSTALLED = "me.rerere.rikkahub.action.PACKAGE_INSTALLED"
+
+internal fun handlePackageInstallResult(context: Context, intent: Intent): Boolean {
+    val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
+    return when (status) {
+        PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+            val confirm = intent.installConfirmIntent() ?: return false
+            confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(confirm)
+            true
+        }
+        PackageInstaller.STATUS_SUCCESS, PackageInstaller.STATUS_FAILURE_ABORTED -> true
+        else -> {
+            val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+            UpdateProgressNotification(context).showFailure(message)
+            false
+        }
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun Intent.installConfirmIntent(): Intent? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+    } else {
+        getParcelableExtra(Intent.EXTRA_INTENT)
+    }
 
 internal fun calculateDownloadProgress(downloadedBytes: Long, totalBytes: Long): Int? {
     if (downloadedBytes < 0L || totalBytes <= 0L) return null
@@ -334,6 +442,16 @@ private class UpdateProgressNotification(private val context: Context) {
         notify(
             baseBuilder()
                 .setContentText(context.getString(R.string.update_notification_preparing))
+                .setProgress(0, 0, true)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+        )
+    }
+
+    fun showOpeningInstaller() {
+        notify(
+            baseBuilder()
+                .setContentText(context.getString(R.string.update_notification_installing))
                 .setProgress(0, 0, true)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

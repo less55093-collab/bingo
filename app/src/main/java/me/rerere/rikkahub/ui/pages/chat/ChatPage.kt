@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -66,6 +67,8 @@ import me.rerere.hugeicons.stroke.LeftToRightListBullet
 import me.rerere.hugeicons.stroke.Menu03
 import me.rerere.hugeicons.stroke.MessageAdd01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.Screen
+import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
@@ -90,12 +93,16 @@ import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.Navigator
 import me.rerere.rikkahub.ui.hooks.ChatInputState
 import me.rerere.rikkahub.ui.hooks.EditStateContent
+import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.ui.hooks.useEditState
+import me.rerere.rikkahub.ui.pages.account.AccountVM
+import me.rerere.rikkahub.ui.pages.account.isBalanceDepleted
 import me.rerere.rikkahub.utils.ImageUtils
 import me.rerere.rikkahub.utils.base64Decode
 import me.rerere.rikkahub.utils.isAllowedFileType
 import me.rerere.rikkahub.utils.navigateToChatPage
 import me.rerere.rikkahub.utils.openBackgroundGenerationSettings
+import me.rerere.rikkahub.utils.openUrl
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
@@ -377,7 +384,13 @@ private fun ChatPageContent(
     var showFilesSheet by remember { mutableStateOf(false) }
 
     fun submitChatMessage() {
-        if (currentChatModel == null) {
+        val directImageGeneration = inputState.directImageGeneration && !inputState.isEditing()
+        if (directImageGeneration) {
+            me.rerere.rikkahub.data.ai.directImageInputError(inputState.getContents())?.let { error ->
+                toaster.show(error, type = ToastType.Error)
+                return
+            }
+        } else if (currentChatModel == null) {
             toaster.show("请先选择模型", type = ToastType.Error)
             return
         }
@@ -389,7 +402,7 @@ private fun ChatPageContent(
         } else {
             val content = inputState.getContents()
             if (!content.isEmptyInputMessage()) {
-                vm.handleMessageSend(content)
+                vm.handleMessageSend(content, directImageGeneration = directImageGeneration)
                 onFirstMessageSubmitted()
                 scope.launch {
                     chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
@@ -413,6 +426,13 @@ private fun ChatPageContent(
 
     TTSAutoPlay(vm = vm, setting = setting, conversation = conversation)
 
+    val accountVm: AccountVM = koinViewModel()
+    val profile by accountVm.profile.collectAsStateWithLifecycle()
+    var welcomeShown by rememberSharedPreferenceBoolean(PREF_WELCOME_CREDIT_SHOWN)
+    var coachShown by rememberSharedPreferenceBoolean(PREF_CHAT_COACH_SHOWN)
+    val depleted = isBalanceDepleted(profile)
+
+    Box(modifier = Modifier.fillMaxSize()) {
     Surface(
         color = MaterialTheme.colorScheme.background,
         modifier = Modifier.fillMaxSize()
@@ -484,7 +504,15 @@ private fun ChatPageContent(
                         inputState.clearInput()
                     },
                     onUpdateChatModel = {
+                        inputState.directImageGeneration = false
                         vm.setChatModel(assistant = setting.getCurrentAssistant(), model = it)
+                    },
+                    onUpdateImageModel = {
+                        inputState.directImageGeneration = true
+                        vm.setImageModel(it)
+                    },
+                    onOpenImageGen = {
+                        navController.navigate(Screen.ImageGen)
                     },
                     onUpdateAssistant = {
                         vm.updateSettings(
@@ -574,11 +602,11 @@ private fun ChatPageContent(
                         chatListState.requestScrollToItem(index)
                     }
                 },
-                onToolApproval = { toolCallId, approved, reason, inputOverride ->
-                    vm.handleToolApproval(toolCallId, approved, reason, inputOverride)
+                onToolApproval = { messageId, toolCallId, approved, reason, inputOverride ->
+                    vm.handleToolApproval(messageId, toolCallId, approved, reason, inputOverride)
                 },
-                onToolAnswer = { toolCallId, answer ->
-                    vm.handleToolAnswer(toolCallId, answer)
+                onToolAnswer = { messageId, toolCallId, answer ->
+                    vm.handleToolAnswer(messageId, toolCallId, answer)
                 },
                 onToggleFavorite = { node ->
                     vm.toggleMessageFavorite(node)
@@ -600,6 +628,29 @@ private fun ChatPageContent(
                 onDismiss = { showFilesSheet = false },
             )
         }
+    }
+        if (depleted) {
+            InsufficientBalanceOverlay(
+                onBuy = { context.openUrl(BingoGatewayAPI.SHOP_URL) },
+                onRedeem = { navController.navigate(Screen.Redeem) },
+            )
+        }
+    }
+
+    val currentProfile = profile
+    if (!depleted && currentProfile != null && !welcomeShown) {
+        WelcomeCreditDialog(
+            balance = currentProfile.balance,
+            onDismiss = { welcomeShown = true },
+        )
+    } else if (!depleted && currentProfile != null && welcomeShown && !coachShown) {
+        ChatCoachDialog(
+            onDismiss = { coachShown = true },
+            onOpenSettings = {
+                coachShown = true
+                navController.navigate(Screen.Setting)
+            },
+        )
     }
 }
 

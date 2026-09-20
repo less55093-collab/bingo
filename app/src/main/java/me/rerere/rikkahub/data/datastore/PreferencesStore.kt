@@ -93,6 +93,7 @@ class SettingsStore(
         // 模型选择
         val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
         val SELECT_MODEL = stringPreferencesKey("chat_model")
+        val SOL_DEFAULT_APPLIED = booleanPreferencesKey("sol_default_applied")
         val FAST_MODEL = stringPreferencesKey("fast_model")
         val TITLE_MODEL = stringPreferencesKey("title_model")
         val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
@@ -177,6 +178,7 @@ class SettingsStore(
                 } ?: emptyList(),
                 chatModelId = preferences[SELECT_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
+                solDefaultApplied = preferences[SOL_DEFAULT_APPLIED] ?: false,
                 fastModelId = preferences[FAST_MODEL]?.let { Uuid.parse(it) }
                     ?: BINGO_FAST_MODEL_ID,
                 titleModelId = preferences[TITLE_MODEL]?.let { Uuid.parse(it) },
@@ -378,6 +380,7 @@ class SettingsStore(
 
             preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
             preferences[SELECT_MODEL] = settings.chatModelId.toString()
+            preferences[SOL_DEFAULT_APPLIED] = settings.solDefaultApplied
             preferences[FAST_MODEL] = settings.fastModelId.toString()
             settings.titleModelId?.let {
                 preferences[TITLE_MODEL] = it.toString()
@@ -538,6 +541,7 @@ data class Settings(
     val displaySetting: DisplaySetting = DisplaySetting(),
     val favoriteModels: List<Uuid> = emptyList(),
     val chatModelId: Uuid = BINGO_DEFAULT_MODEL_ID,
+    val solDefaultApplied: Boolean = false,
     val fastModelId: Uuid = BINGO_FAST_MODEL_ID,
     val titleModelId: Uuid? = null,
     val imageGenerationModelId: Uuid = BINGO_IMAGE_MODEL_ID,

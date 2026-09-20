@@ -1,9 +1,5 @@
 package me.rerere.rikkahub.data.datastore
 
-import me.rerere.ai.provider.Modality
-import me.rerere.ai.provider.Model
-import me.rerere.ai.provider.ModelAbility
-import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import kotlin.uuid.Uuid
@@ -30,70 +26,12 @@ object BingoModelIds {
     val GPT_IMAGE_2: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f1")
 }
 
-/**
- * Image generation lives on its own gateway group (rate multiplier 0.01), so it needs its own key
- * and therefore its own overwrite even though it is the same `openai` platform as the chat
- * container. Typed `OpenAI` because `OpenAIProvider.generateImage` requires that subtype and reads
- * `apiKey`/`baseUrl` straight off it.
- */
-private fun imageOverwrite() = ProviderSetting.OpenAI(
-    id = BINGO_IMAGE_OVERWRITE_ID,
-    name = "bingo-image",
-    baseUrl = "${BingoGatewayAPI.INFERENCE_BASE_URL}/v1",
-    chatCompletionsPath = "/chat/completions",
-    apiKey = "",
-    enabled = true,
-    builtIn = true,
-    useAsyncImageTasks = true,
-)
-
-private fun gptModel(id: Uuid, modelId: String, displayName: String) = Model(
-    id = id,
-    modelId = modelId,
-    displayName = displayName,
-    inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
-    outputModalities = listOf(Modality.TEXT),
-    abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
-)
-
-/**
- * Curated rather than discovered via `/v1/models`: the menu must be stable and every entry must
- * actually work. Verified against the live gateway — bare `gpt-5.6` and `gpt-5.2-pro` are excluded
- * because they return `upstream_error` on group 16 and a consumer app cannot ship a dead model.
- * The `-sol` / `-terra` variants are distinct upstream routes and were probed directly on group 16
- * (both returned a normal completion), which is why they ship even though bare `gpt-5.6` does not.
- */
-val BINGO_MODELS: List<Model> = listOf(
-    gptModel(BingoModelIds.GPT_5_6_SOL, "gpt-5.6-sol", "GPT-5.6 sol"),
-    gptModel(BingoModelIds.GPT_5_6_TERRA, "gpt-5.6-terra", "GPT-5.6 terra"),
-    gptModel(BingoModelIds.GPT_5_5, "gpt-5.5", "GPT-5.5"),
-    gptModel(BingoModelIds.GPT_5_4, "gpt-5.4", "GPT-5.4"),
-    gptModel(BingoModelIds.GPT_5_4_MINI, "gpt-5.4-mini", "GPT-5.4 mini"),
-    Model(
-        id = BingoModelIds.GPT_IMAGE_2,
-        modelId = "gpt-image-2",
-        displayName = "AI 绘画",
-        type = ModelType.IMAGE,
-        inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
-        outputModalities = listOf(Modality.IMAGE),
-        abilities = emptyList(),
-        providerOverwrite = imageOverwrite(),
-    ),
-)
-
-/** The only image model, so image generation never needs a picker. */
+/** Legacy references retained so an upgrade preserves existing model selections when available upstream. */
 val BINGO_IMAGE_MODEL_ID: Uuid = BingoModelIds.GPT_IMAGE_2
-
-/** Default chat model for a fresh install. */
 val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.GPT_5_6_SOL
-
-/** Cheapest capable model, used for titles/suggestions/translation background calls. */
 val BINGO_FAST_MODEL_ID: Uuid = BingoModelIds.GPT_5_4_MINI
 
-/**
- * The GPT key lives on this container and the image key is kept on the image model overwrite.
- * ProviderInjector rewrites both on every launch, so stale or restored values cannot persist.
- */
+/** The catalog starts empty and is populated from the authenticated group's /v1/models response. */
 val BINGO_PROVIDER: ProviderSetting.OpenAI = ProviderSetting.OpenAI(
     id = BINGO_PROVIDER_ID,
     name = "AI",
@@ -103,5 +41,5 @@ val BINGO_PROVIDER: ProviderSetting.OpenAI = ProviderSetting.OpenAI(
     enabled = true,
     builtIn = true,
     useResponseApi = true,
-    models = BINGO_MODELS,
+    models = emptyList(),
 )

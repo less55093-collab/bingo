@@ -1,8 +1,11 @@
 package me.rerere.rikkahub
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import androidx.compose.foundation.ComposeFoundationFlags
@@ -40,6 +43,8 @@ import me.rerere.rikkahub.data.auth.AuthTokenStore
 import me.rerere.rikkahub.data.sync.ChatBackupScheduler
 import me.rerere.rikkahub.data.sync.ChatBackupSync
 import me.rerere.rikkahub.service.WebServerService
+import me.rerere.ai.provider.StreamNetworkState
+import me.rerere.rikkahub.ui.activity.isAppRestartProcess
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
@@ -68,6 +73,8 @@ const val WEB_SERVER_NOTIFICATION_CHANNEL_ID = "web_server"
 class RikkaHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        // The restart helper lives in a sidecar process. Do not open Room or Koin there.
+        if (isAppRestartProcess()) return
         AccountDatabaseManager.prepare(this)
         DatabaseRestoreCoordinator.applyPendingRestore(this)
         startKoin {
@@ -114,6 +121,17 @@ class RikkaHubApp : Application() {
         // The local web server has no UI in this build; ensure a stale
         // enabled flag from an older install cannot start it.
         stopWebServer()
+
+        // The provider layer owns no Context, so connectivity is injected once here. A resumed
+        // stream waits for real connectivity instead of spending an attempt on a hand-over or
+        // captive network.
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        StreamNetworkState.install {
+            val network = connectivityManager.activeNetwork ?: return@install false
+            connectivityManager.getNetworkCapabilities(network)
+                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        }
 
         // 退到后台时把 WAL 回写主库, 保证系统自动备份能拿到完整聊天记录
         registerDatabaseCheckpoint()

@@ -39,6 +39,9 @@ import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.ImageGenerationParams
+import me.rerere.ai.provider.ImageEditParams
+import me.rerere.ai.ui.ImageGenerationItem
 import me.rerere.ai.provider.providers.vertex.ServiceAccountTokenProvider
 import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.GoogleThoughtMetadata
@@ -168,6 +171,78 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 emptyList()
             }
         }
+
+    override suspend fun generateImage(
+        providerSetting: ProviderSetting,
+        params: ImageGenerationParams,
+    ): Flow<ImageGenerationItem> = generateImages(
+        providerSetting, params.model, params.prompt, emptyList(), params.numOfImages,
+        params.size, params.customHeaders, params.customBody,
+    )
+
+    override suspend fun editImage(
+        providerSetting: ProviderSetting,
+        params: ImageEditParams,
+    ): Flow<ImageGenerationItem> = generateImages(
+        providerSetting, params.model, params.prompt, params.images, params.numOfImages,
+        params.size, params.customHeaders, params.customBody,
+    )
+
+    private fun generateImages(
+        providerSetting: ProviderSetting,
+        model: Model,
+        prompt: String,
+        images: List<String>,
+        count: Int,
+        size: String,
+        headers: List<me.rerere.ai.provider.CustomHeader>,
+        body: List<me.rerere.ai.provider.CustomBody>,
+    ): Flow<ImageGenerationItem> = flow {
+        require(providerSetting is ProviderSetting.Google)
+        require(count in 1..4) { "Image count must be between 1 and 4" }
+        val message = UIMessage.user(prompt).copy(
+            parts = listOf(UIMessagePart.Text(prompt)) + images.map { UIMessagePart.Image(it) },
+        )
+        val custom = buildList {
+            val ratio = when (size) {
+                "1024x1024", "512x512", "256x256" -> "1:1"
+                "1536x1024" -> "3:2"
+                "1024x1536" -> "2:3"
+                "1792x1024" -> "16:9"
+                "1024x1792" -> "9:16"
+                else -> null
+            }
+            if (ratio != null) add(me.rerere.ai.provider.CustomBody(
+                "generationConfig", buildJsonObject {
+                    put("imageConfig", buildJsonObject { put("aspectRatio", ratio) })
+                },
+            ))
+            addAll(body)
+        }
+        // Gemini returns one image per generation; each completed image is emitted before the next call.
+        repeat(count) {
+            val params = TextGenerationParams(
+                model = model.copy(outputModalities = listOf(Modality.TEXT, Modality.IMAGE)),
+                customHeaders = headers, customBody = custom,
+            )
+            val requestBody = buildCompletionRequestBody(listOf(message), params)
+            val path = if (providerSetting.vertexAI) "publishers/google/models/${model.modelId}:generateContent"
+                else "models/${model.modelId}:generateContent"
+            val request = transformRequest(providerSetting, Request.Builder()
+                .url(buildUrl(providerSetting, path))
+                .headers(headers.toHeaders())
+                .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+                .build())
+            val generated = withContext(Dispatchers.IO) {
+                client.newCall(request).await().use { response ->
+                    check(response.isSuccessful) { "Image generation failed (HTTP ${response.code})" }
+                    parseGoogleImageResponse(json.parseToJsonElement(response.body.string()).jsonObject)
+                }
+            }
+            check(generated.isNotEmpty()) { "No image returned by the selected model" }
+            generated.forEach { emit(it) }
+        }
+    }
 
     override suspend fun generateText(
         providerSetting: ProviderSetting.Google,

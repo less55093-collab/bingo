@@ -4,6 +4,7 @@
 
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
   <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
   <uses-permission android:name="android.permission.CAMERA" />
   <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -44,6 +45,13 @@
     <intent>
       <action android:name="android.intent.action.MAIN" />
       <category android:name="android.intent.category.HOME" />
+    </intent>
+    <intent>
+      <action android:name="android.intent.action.VIEW" />
+      <data android:mimeType="application/vnd.android.package-archive" />
+    </intent>
+    <intent>
+      <action android:name="android.intent.action.INSTALL_PACKAGE" />
     </intent>
   </queries>
 
@@ -97,6 +105,18 @@
         android:name="android.app.shortcuts"
         android:resource="@xml/shortcuts" />
     </activity>
+    <activity
+      android:name=".ui.activity.AppRestartActivity"
+      android:excludeFromRecents="true"
+      android:exported="false"
+      android:process=":restart"
+      android:theme="@style/Theme.Rikkahub.Restart" />
+    <activity
+      android:name=".ui.activity.PackageInstallTrampolineActivity"
+      android:excludeFromRecents="true"
+      android:exported="false"
+      android:taskAffinity=""
+      android:theme="@style/Theme.Rikkahub.Restart" />
     <activity
       android:name=".ui.activity.ShortcutHandlerActivity"
       android:exported="true"

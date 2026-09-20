@@ -36,6 +36,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
 import me.rerere.ai.ui.ImageGenSize
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessagePart
@@ -57,6 +58,8 @@ internal enum class ImageGenerationToolPhase {
     PLAN_PREPARING,
     PLAN_APPROVAL,
     PLAN_CONFIRMED,
+    PREPARING,
+    WAITING_FOR_RECOVERY,
     GENERATING,
     COMPLETED,
     CANCELLED,
@@ -69,12 +72,19 @@ internal fun resolveImageGenerationToolPhase(
     approvalState: ToolApprovalState,
     hasOutput: Boolean,
     hasImages: Boolean,
+    executionStarted: Boolean = false,
+    loading: Boolean = true,
+    waitingForRecovery: Boolean = false,
 ): ImageGenerationToolPhase {
     if (approvalState is ToolApprovalState.Denied) return ImageGenerationToolPhase.CANCELLED
+    if (waitingForRecovery) return ImageGenerationToolPhase.WAITING_FOR_RECOVERY
     if (hasImages) return ImageGenerationToolPhase.COMPLETED
     if (hasOutput) return ImageGenerationToolPhase.FAILED
-    if (toolName == IMAGE_GENERATION_TOOL_NAME) return ImageGenerationToolPhase.GENERATING
     if (approvalState is ToolApprovalState.Pending) return ImageGenerationToolPhase.PLAN_APPROVAL
+    if (!loading) return ImageGenerationToolPhase.FAILED
+    if (!executionStarted) return if (toolName == IMAGE_GENERATION_TOOL_NAME)
+        ImageGenerationToolPhase.PREPARING else ImageGenerationToolPhase.PLAN_PREPARING
+    if (toolName == IMAGE_GENERATION_TOOL_NAME) return ImageGenerationToolPhase.GENERATING
     if (approvalState == ToolApprovalState.Approved) return ImageGenerationToolPhase.PLAN_CONFIRMED
 
     val variantCount = runCatching {
@@ -116,13 +126,27 @@ fun ImageGenerationToolStep(
         tool.output.filterIsInstance<UIMessagePart.Text>()
             .any { it.text.isInsufficientBalanceError() }
     }
-    val phase = remember(tool.input, tool.output, tool.approvalState, images) {
+    val results = remember(tool.output) {
+        tool.output.filterIsInstance<UIMessagePart.Text>().map { text ->
+            runCatching { Json.parseToJsonElement(text.text) as? JsonObject }.getOrNull()
+        }.filterNotNull()
+    }
+    val result = results.firstOrNull { (it["status"] as? JsonPrimitive)?.contentOrNull == "waiting_for_recovery" }
+        ?: results.firstOrNull { (it["status"] as? JsonPrimitive)?.contentOrNull == "failed" }
+        ?: results.firstOrNull()
+    val resultMessage = (result?.get("error") as? JsonPrimitive)?.contentOrNull
+        ?: (result?.get("message") as? JsonPrimitive)?.contentOrNull
+        ?: tool.output.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }.take(1000)
+    val phase = remember(tool, images, loading) {
         resolveImageGenerationToolPhase(
             toolName = tool.toolName,
             input = tool.input,
             approvalState = tool.approvalState,
             hasOutput = tool.isExecuted,
             hasImages = images.isNotEmpty(),
+            executionStarted = tool.executionStarted,
+            loading = loading,
+            waitingForRecovery = (result?.get("status") as? JsonPrimitive)?.contentOrNull == "waiting_for_recovery",
         )
     }
     val navController = LocalNavController.current
@@ -139,6 +163,15 @@ fun ImageGenerationToolStep(
             )
         } else {
             when (phase) {
+                ImageGenerationToolPhase.PREPARING -> Text(
+                    "正在接收生图工具参数，尚未开始生图",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                ImageGenerationToolPhase.WAITING_FOR_RECOVERY -> Text(
+                    resultMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 ImageGenerationToolPhase.PLAN_PREPARING -> ImageGenerationPlanPreparing()
                 ImageGenerationToolPhase.PLAN_APPROVAL -> {
                     if (variants.size > 1 && onApprove != null && onDeny != null) {
@@ -168,30 +201,29 @@ fun ImageGenerationToolStep(
                     loading = loading,
                 )
                 ImageGenerationToolPhase.FAILED -> {
-                    if (tool.toolName == IMAGE_GENERATION_PLAN_TOOL_NAME) {
-                        ImageGenerationPlanSummary(variants = variants)
-                    }
-                    ImageGenerationProgress(
-                        tool = tool,
-                        aspectRatio = aspectRatio,
-                        loading = false,
+                    Text(
+                        text = resultMessage.ifBlank { "生图未完成，请查看本条消息的模型错误或中断提示。" },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
                     )
                 }
                 ImageGenerationToolPhase.COMPLETED -> {
                     if (tool.toolName == IMAGE_GENERATION_PLAN_TOOL_NAME) {
                         ImageGenerationPlanSummary(variants = variants)
                     }
-                    images.fastForEach { image ->
-                        ZoomableAsyncImage(
-                            model = image.url,
-                            contentDescription = null,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(16.dp)),
-                        )
+                    if ((result?.get("status") as? JsonPrimitive)?.contentOrNull == "failed") {
+                        Text(resultMessage, color = MaterialTheme.colorScheme.error)
                     }
                 }
             }
+        }
+        // A batch can deliver images while its other items are still recovering.
+        images.fastForEach { image ->
+            ZoomableAsyncImage(
+                model = image.url,
+                contentDescription = null,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)),
+            )
         }
     }
 }
@@ -211,6 +243,7 @@ private fun ImageGenerationProgress(
         progress = progress.value,
         showSlowHint = progress.showSlowHint,
         loading = loading,
+        loadingText = "正在调用生图模型，请等待结果",
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(aspectRatio)
@@ -233,7 +266,7 @@ private fun ImageGenerationPlanPreparing() {
 private fun ImageGenerationPlanSummary(variants: List<ImageGenerationVariant>) {
     val summary = variants.joinToString("、") { it.label }
     Text(
-        text = if (summary.isBlank()) "已确认方案，正在生成图片" else "已确认：$summary",
+        text = if (summary.isBlank()) "已确认方案" else "已确认：$summary",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(horizontal = 4.dp),
@@ -467,7 +500,7 @@ private fun String.displayName(): String = when (this) {
  * 从工具入参的 size 推断占位画布比例, 让占位框和最终图片尺寸一致, 避免出图时跳动
  */
 private fun UIMessagePart.Tool.imageAspectRatio(): Float {
-    val args = inputAsJson().jsonObject
+    val args = inputAsJson() as? JsonObject ?: return 1f
     val size = args.getStringContent("size")
         ?: runCatching {
             parseImageGenerationVariants(args).firstOrNull()?.size

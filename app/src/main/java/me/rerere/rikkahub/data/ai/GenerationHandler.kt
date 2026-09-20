@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
@@ -16,6 +17,8 @@ import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
@@ -24,12 +27,14 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.core.merge
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelRequestException
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessageAnnotation
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.finishReasoning
@@ -44,6 +49,8 @@ import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
 import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
+import me.rerere.rikkahub.data.ai.tools.local.IMAGE_GENERATION_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.local.IMAGE_GENERATION_PLAN_TOOL_NAME
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -51,6 +58,8 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.utils.applyPlaceholders
+import me.rerere.rikkahub.utils.localizedChatMessage
+import me.rerere.rikkahub.service.ImageOperationContext
 import java.util.Locale
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
@@ -58,13 +67,23 @@ import kotlin.uuid.Uuid
 private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+private val IMAGE_TOOL_NAMES = setOf(IMAGE_GENERATION_TOOL_NAME, IMAGE_GENERATION_PLAN_TOOL_NAME)
 
 internal fun validateExecutableToolCalls(tools: List<UIMessagePart.Tool>) {
+    require(tools.map { it.toolCallId }.distinct().size == tools.size) { "模型返回了重复的工具标识，尚未执行" }
+    require(tools.count { it.toolName in IMAGE_TOOL_NAMES && it.approvalState !is ToolApprovalState.Denied } <= 1) {
+        "模型在同一回复中重复提交了生图工具。请使用一个生图方案或直接生图，尚未执行扣费。"
+    }
     require(tools.all { it.toolCallId.isNotBlank() }) {
         "Model returned an incomplete tool call without an id"
     }
     require(tools.all { it.toolName.isNotBlank() }) {
         "Model returned an incomplete tool call without a name"
+    }
+    tools.filterNot { it.approvalState is ToolApprovalState.Denied }.forEach { tool ->
+        require(Json.parseToJsonElement(tool.input.ifBlank { "{}" }) is JsonObject) {
+            "模型返回的 ${tool.toolName} 工具参数不完整，尚未执行工具"
+        }
     }
 }
 
@@ -96,11 +115,25 @@ class GenerationHandler(
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        conversationId: String? = null,
     ): Flow<GenerationChunk> = flow {
-        val provider = model.findProvider(settings.providers) ?: error("Provider not found")
-        val providerImpl = providerManager.getProviderByType(provider)
+        // Explicit image actions only need the image tool. Resolving a text provider here would
+        // make a disabled chat model prevent an otherwise valid image request.
+        val provider by lazy { model.findProvider(settings.providers) ?: error("Provider not found") }
+        val providerImpl by lazy { providerManager.getProviderByType(provider) }
 
         var messages: List<UIMessage> = messages
+        val directImageGeneration = messages.lastOrNull { it.role == MessageRole.USER }
+            ?.annotations?.contains(UIMessageAnnotation.DirectImageRequest) == true
+        prepareDirectImageToolMessage(messages, model)?.let { toolMessage ->
+            messages = messages + toolMessage
+            processingStatus.value = "正在提交生图任务，请先保持 App 在前台"
+            emit(GenerationChunk.Messages(messages))
+        }
+        if (directImageGeneration && messages.lastOrNull()?.getTools()?.any { it.isExecuted } == true) {
+            emit(GenerationChunk.Messages(messages))
+            return@flow
+        }
 
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
@@ -138,6 +171,7 @@ class GenerationHandler(
 
             // Skip generation if we have approved/denied tool calls to handle
             if (pendingTools.isEmpty()) {
+                check(!directImageGeneration) { "图片任务状态不完整，尚未提交，请重新发送生图请求" }
                 generateInternal(
                     assistant = assistant,
                     settings = settings,
@@ -194,6 +228,7 @@ class GenerationHandler(
                         .toLocalDateTime(TimeZone.currentSystemDefault())
                 )
                 val tools = completedMessage.getTools().filter { !it.isExecuted }
+                validateModelToolCalls(tools, toolsInternal, model)
                 val finalizedMessage = if (tools.isEmpty()) completedMessage.finishReasoning() else completedMessage
                 messages = messages.slice(0 until messages.lastIndex) + finalizedMessage
                 emit(GenerationChunk.Messages(messages))
@@ -252,12 +287,35 @@ class GenerationHandler(
             }
 
             // Handle tools (execute approved tools, handle denied tools)
-            validateExecutableToolCalls(toolsToProcess)
+            validateModelToolCalls(toolsToProcess, toolsInternal, model)
+            val startedTools = toolsToProcess.map { tool ->
+                if (tool.approvalState is ToolApprovalState.Pending ||
+                    tool.approvalState is ToolApprovalState.Denied) tool
+                else tool.copy(executionStarted = true)
+            }
+            val startingMessage = messages.last()
+            messages = messages.dropLast(1) + startingMessage.copy(parts = startingMessage.parts.map { part ->
+                if (part is UIMessagePart.Tool) startedTools.find { it.toolCallId == part.toolCallId } ?: part
+                else part
+            })
+            emit(GenerationChunk.Messages(messages))
+            if (directImageGeneration) processingStatus.value = null
 
             // 同一轮里的多个工具调用并发执行，否则生成多张图片时会串行排队，等待时间成倍增加
+            val toolMessages = if (directImageGeneration) {
+                // Only explicitly attached reference images belong to this direct action. A fresh
+                // image request must not silently reuse a previous generated image as its source.
+                messages.drop(messages.indexOfLast { it.role == MessageRole.USER }.coerceAtLeast(0))
+            } else messages
             val executedTools = coroutineScope {
-                toolsToProcess.map { tool ->
-                    async { executeTool(tool, toolsInternal, messages) }
+                startedTools.map { tool ->
+                    async {
+                        if (conversationId != null && tool.toolName in IMAGE_TOOL_NAMES) {
+                            withContext(ImageOperationContext(conversationId, messages.last().id.toString(), tool.toolCallId)) {
+                                executeTool(tool, toolsInternal, toolMessages)
+                            }
+                        } else executeTool(tool, toolsInternal, toolMessages)
+                    }
                 }.awaitAll().filterNotNull()
             }
 
@@ -287,9 +345,38 @@ class GenerationHandler(
                     )
                 )
             )
+            // Image delivery ends this operation. A model continuation must not create another
+            // billable image, including after a successful tool result.
+            if (executedTools.any { it.toolName in IMAGE_TOOL_NAMES }) break
         }
 
     }.flowOn(Dispatchers.IO)
+
+    private fun validateModelToolCalls(calls: List<UIMessagePart.Tool>, definitions: List<Tool>, model: Model) {
+        try {
+            validateExecutableToolCalls(calls)
+            calls.filterNot { it.approvalState is ToolApprovalState.Denied }.forEach { call ->
+                val definition = definitions.find { it.name == call.toolName }
+                    ?: error("模型请求了不存在的工具 ${call.toolName}，尚未执行")
+                val args = call.inputAsJson() as JsonObject
+                val schema = definition.parameters() as? me.rerere.ai.core.InputSchema.Obj
+                require(schema?.required.orEmpty().all { key -> args[key] != null && args[key] != JsonNull }) {
+                    "模型返回的 ${call.toolName} 工具参数缺少必填内容，尚未执行"
+                }
+                schema?.properties?.forEach { (key, child) ->
+                    if (child is JsonObject) args[key]?.let { validateToolArgumentValue(it, child, key) }
+                }
+                if (call.toolName == IMAGE_GENERATION_TOOL_NAME) {
+                    require((args["prompt"] as? JsonPrimitive)?.content?.isNotBlank() == true) { "生图提示词不能为空" }
+                } else if (call.toolName == IMAGE_GENERATION_PLAN_TOOL_NAME) {
+                    me.rerere.rikkahub.data.ai.tools.local.parseImageGenerationVariants(args)
+                }
+            }
+        } catch (error: Exception) {
+            throw ModelRequestException(model.modelId,
+                IllegalStateException("模型返回了无效的工具调用，尚未执行生图。${error.message.orEmpty()}", error))
+        }
+    }
 
     private suspend fun generateInternal(
         assistant: Assistant,
@@ -348,7 +435,11 @@ class GenerationHandler(
 
         var messages: List<UIMessage> = messages
         val params = TextGenerationParams(
-            model = model,
+            // An explicit user choice must not be discarded just because a newly discovered
+            // upstream model is absent from the local capability registry. AUTO remains passive.
+            model = if (assistant.reasoningLevel != ReasoningLevel.AUTO) model.copy(
+                abilities = (model.abilities + me.rerere.ai.provider.ModelAbility.REASONING).distinct(),
+            ) else model,
             temperature = assistant.temperature,
             topP = assistant.topP,
             maxTokens = assistant.maxTokens,
@@ -363,14 +454,32 @@ class GenerationHandler(
                 addAll(model.customBodies)
             }
         )
+        var receivedOutput = false
+        fun observeOutput(parts: List<UIMessagePart>) {
+            if (parts.any { part ->
+                    when (part) {
+                        is UIMessagePart.Text -> part.text.isNotBlank()
+                        is UIMessagePart.Tool -> part.toolName.isNotBlank() || part.input.isNotBlank()
+                        is UIMessagePart.Image -> part.url.isNotBlank()
+                        is UIMessagePart.Audio -> true
+                        else -> false
+                    }
+                }) receivedOutput = true
+        }
+        processingStatus.value = "正在等待 ${model.modelId} 回复，可切到后台，完成后会通知你"
+        try {
         if (stream) {
             providerImpl.streamText(
                 providerSetting = provider,
                 messages = internalMessages,
-                params = params
-            ).collect {
-                messages = messages.handleMessageChunk(chunk = it, model = model)
-                it.usage?.let { usage ->
+                params = params,
+            ).collect { chunk ->
+                chunk.choices.forEach { choice ->
+                    observeOutput(choice.delta?.parts.orEmpty() + choice.message?.parts.orEmpty())
+                }
+                if (receivedOutput) processingStatus.value = null
+                messages = messages.handleMessageChunk(chunk = chunk, model = model)
+                chunk.usage?.let { usage ->
                     messages = messages.mapIndexed { index, message ->
                         if (index == messages.lastIndex) {
                             message.copy(usage = message.usage.merge(usage))
@@ -387,6 +496,9 @@ class GenerationHandler(
                 messages = internalMessages,
                 params = params,
             )
+            chunk.choices.forEach { choice ->
+                observeOutput(choice.delta?.parts.orEmpty() + choice.message?.parts.orEmpty())
+            }
             messages = messages.handleMessageChunk(chunk = chunk, model = model)
             chunk.usage?.let { usage ->
                 messages = messages.mapIndexed { index, message ->
@@ -400,6 +512,13 @@ class GenerationHandler(
                 }
             }
             onUpdateMessages(messages)
+        }
+        check(receivedOutput) { "模型返回空结果，未收到正文或有效工具调用，尚未启动生图。请切换模型或稍后重试。" }
+        } catch (error: Exception) {
+            if (error is CancellationException || error is ModelRequestException) throw error
+            throw ModelRequestException(model.modelId, error)
+        } finally {
+            processingStatus.value = null
         }
     }
 
@@ -464,10 +583,7 @@ class GenerationHandler(
                                 buildJsonObject {
                                     put(
                                         "error",
-                                        JsonPrimitive(buildString {
-                                            append("[${it.javaClass.name}] ${it.message}")
-                                            append("\n${it.stackTraceToString()}")
-                                        })
+                                        JsonPrimitive(it.localizedChatMessage(context))
                                     )
                                 }
                             )

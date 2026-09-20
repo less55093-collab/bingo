@@ -16,6 +16,15 @@ interface MessageNodeDAO {
     @Query("SELECT * FROM message_node WHERE conversation_id = :conversationId ORDER BY node_index ASC")
     suspend fun getNodesOfConversation(conversationId: String): List<MessageNodeEntity>
 
+    @Query("SELECT * FROM message_node WHERE conversation_id = :conversationId AND instr(messages, :messageId) > 0")
+    suspend fun getNodesContainingMessage(conversationId: String, messageId: String): List<MessageNodeEntity>
+
+    @Query("SELECT * FROM message_node WHERE conversation_id = :conversationId AND instr(messages, 'image_delivery') > 0")
+    suspend fun getNodesWithImageDeliveries(conversationId: String): List<MessageNodeEntity>
+
+    @Query("SELECT * FROM message_node WHERE instr(messages, 'generate_image') > 0 OR instr(messages, 'plan_image_generation') > 0 ORDER BY id LIMIT :limit OFFSET :offset")
+    suspend fun getImageToolNodes(limit: Int, offset: Int): List<MessageNodeEntity>
+
     @Query(
         "SELECT * FROM message_node WHERE conversation_id = :conversationId " +
             "ORDER BY node_index ASC LIMIT :limit OFFSET :offset"

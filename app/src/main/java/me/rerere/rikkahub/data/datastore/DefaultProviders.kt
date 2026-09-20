@@ -13,8 +13,7 @@ import kotlin.uuid.Uuid
 val DEFAULT_PROVIDERS: List<ProviderSetting> = listOf(BINGO_PROVIDER)
 
 /**
- * Fallback for `chatModelId` / `fastModelId` / `translateModeId` / `compressModelId`. Kept under the
- * original name so those call sites need no change, but it now resolves to a real curated model
- * rather than the old "auto" entry.
+ * Legacy fallback identity. Catalog synchronization replaces unavailable references with an
+ * upstream model, or NIL when the selected group has no models.
  */
 val DEFAULT_AUTO_MODEL_ID: Uuid = BINGO_DEFAULT_MODEL_ID

@@ -88,6 +88,7 @@ internal fun ImageGenerationLoading(
     showSlowHint: Boolean,
     loading: Boolean,
     modifier: Modifier = Modifier,
+    loadingText: String? = null,
 ) {
     val animatedProgress by animateFloatAsState(
         targetValue = progress,
@@ -109,13 +110,12 @@ internal fun ImageGenerationLoading(
         ) {
             if (loading) {
                 CircularWavyProgressIndicator(
-                    progress = { animatedProgress },
                     modifier = Modifier.size(48.dp),
                 )
             }
             Text(
                 text = if (loading) {
-                    stringResource(
+                    loadingText ?: stringResource(
                         R.string.chat_message_image_generation_loading_progress,
                         (animatedProgress * 100).toInt(),
                     )

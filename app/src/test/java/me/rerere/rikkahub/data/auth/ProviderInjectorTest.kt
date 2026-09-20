@@ -1,139 +1,145 @@
 package me.rerere.rikkahub.data.auth
 
-import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.BuiltInTools
-import me.rerere.rikkahub.data.datastore.BINGO_IMAGE_MODEL_ID
-import me.rerere.rikkahub.data.datastore.BINGO_PROVIDER_ID
+import me.rerere.ai.provider.ModelType
+import me.rerere.ai.provider.ProviderSetting
+import me.rerere.rikkahub.data.datastore.BINGO_PROVIDER
+import me.rerere.rikkahub.data.datastore.BingoModelIds
 import me.rerere.rikkahub.data.datastore.Settings
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import me.rerere.rikkahub.data.model.gateway.*
+import org.junit.Assert.*
 import org.junit.Test
+import kotlin.uuid.Uuid
 
-/**
- * The injector is the only writer of API keys, so these tests pin the routing that makes chat and
- * image gateway groups look like one flat model list. Image generation keeps its own overwrite
- * because it is billed separately.
- */
 class ProviderInjectorTest {
-    private val keys = ProviderKeys(
-        gptKey = "sk-gpt",
-        imageKey = "sk-image",
+    private fun binding(id: Int, platform: String, vararg models: String) =
+        GatewayBinding(GatewayGroup(id, "Group $id", platform), "sk-group-$id", models.map { GatewayModel(it) }, 123)
+
+    private val routing = GatewayRouting(
+        chat = binding(16, "openai", "gpt-5.6-sol", "new-upstream-model"),
+        image = binding(2, "openai", "gpt-image-2", "custom-image-model"),
     )
 
-    private fun inject(settings: Settings = Settings()) = ProviderInjector.inject(settings, keys)
+    private fun Settings.models() = providers.single().models
 
-    private fun Settings.container() = providers.single() as ProviderSetting.OpenAI
-
-    @Test
-    fun `each group's key reaches its own models`() {
-        val container = inject().container()
-
-        assertEquals("sk-gpt", container.apiKey)
-        assertTrue(container.useResponseApi)
-
-        val image = container.models.single { it.id == BINGO_IMAGE_MODEL_ID }
-        val imageProvider = image.providerOverwrite as ProviderSetting.OpenAI
-        assertEquals("sk-image", imageProvider.apiKey)
-        assertTrue(imageProvider.useAsyncImageTasks)
+    @Test fun `new upstream entries appear without a client allowlist`() {
+        val settings = ProviderInjector.inject(Settings(), routing)
+        assertEquals(listOf("gpt-5.6-sol", "new-upstream-model", "gpt-image-2", "custom-image-model"),
+            settings.models().map { it.modelId })
+        assertEquals(BingoModelIds.GPT_5_6_SOL, settings.chatModelId)
+        assertEquals(BingoModelIds.GPT_IMAGE_2, settings.imageGenerationModelId)
     }
 
-    @Test
-    fun `injecting drops providers left over from an older install`() {
-        val stale = ProviderSetting.OpenAI(name = "stale", apiKey = "sk-user-entered")
-
-        val result = inject(Settings(providers = listOf(stale)))
-
-        assertEquals(1, result.providers.size)
-        assertEquals(BINGO_PROVIDER_ID, result.container().id)
+    @Test fun `same upstream name in both purposes has separate stable identities and credentials`() {
+        val source = GatewayRouting(binding(16, "openai", "shared"), binding(13, "grok", "shared"))
+        val first = ProviderInjector.inject(Settings(), source)
+        val second = ProviderInjector.inject(first, source.copy(chat = binding(23, "openai", "shared")))
+        assertEquals(first.models().map { it.id }, second.models().map { it.id })
+        assertEquals(2, first.models().map { it.id }.distinct().size)
+        val chat = second.models().single { it.type == ModelType.CHAT }.providerOverwrite as ProviderSetting.OpenAI
+        val image = second.models().single { it.type == ModelType.IMAGE }.providerOverwrite as ProviderSetting.OpenAI
+        assertEquals("sk-group-23", chat.apiKey)
+        assertEquals("sk-group-13", image.apiKey)
+        assertTrue(image.useAsyncImageTasks)
     }
 
-    @Test
-    fun `clear leaves no spendable key but keeps the picker renderable`() {
-        val cleared = ProviderInjector.clear(inject())
-        val container = cleared.container()
-
-        assertEquals("", container.apiKey)
-        assertTrue(container.models.isNotEmpty())
-        container.models.forEach { model ->
-            when (val overwrite = model.providerOverwrite) {
-                is ProviderSetting.OpenAI -> assertEquals("", overwrite.apiKey)
-                else -> Unit
-            }
-        }
+    @Test fun `refresh preserves selected models and tools regardless of ordering`() {
+        val initial = ProviderInjector.inject(Settings(), routing)
+        val model = initial.models().first { it.modelId == "new-upstream-model" }
+        val selected = initial.copy(chatModelId = model.id,
+            providers = listOf(BINGO_PROVIDER.copy(models = initial.models().map {
+                if (it.id == model.id) it.copy(tools = setOf(BuiltInTools.Search)) else it
+            })))
+        val refreshed = ProviderInjector.inject(selected, routing.copy(chat = routing.chat!!.copy(
+            models = routing.chat.models.reversed(), key = "sk-rotated")))
+        assertEquals(model.id, refreshed.chatModelId)
+        assertEquals(setOf(BuiltInTools.Search), refreshed.models().first { it.id == model.id }.tools)
+        assertEquals("sk-rotated", (refreshed.models().first { it.id == model.id }.providerOverwrite as ProviderSetting.OpenAI).apiKey)
     }
 
-    @Test
-    fun `isUpToDate accepts freshly injected settings`() {
-        assertTrue(ProviderInjector.isUpToDate(inject(), keys))
-    }
-
-    @Test
-    fun `isUpToDate rejects a stale key in any group`() {
-        val injected = inject()
-
-        assertFalse(ProviderInjector.isUpToDate(injected, keys.copy(gptKey = "sk-rotated")))
-        // Regression guard: an image key rotated server-side must trigger a rewrite, otherwise
-        // drawing silently 401s while chat keeps working.
-        assertFalse(ProviderInjector.isUpToDate(injected, keys.copy(imageKey = "sk-rotated")))
-    }
-
-    @Test
-    fun `isUpToDate rejects edited provider config`() {
-        val edited = inject().let { settings ->
-            settings.copy(providers = listOf(settings.container().copy(baseUrl = "https://evil.test/v1")))
-        }
-
-        assertFalse(ProviderInjector.isUpToDate(edited, keys))
-    }
-
-    @Test
-    fun `isUpToDate rejects legacy Chat Completions routing`() {
-        val injected = inject()
-        val legacy = injected.copy(
-            providers = listOf(injected.container().copy(useResponseApi = false))
+    @Test fun `removed models repair assistant and background selections`() {
+        val initial = ProviderInjector.inject(Settings(), routing)
+        val removed = initial.chatModelId
+        val selected = initial.copy(
+            titleModelId = removed, suggestionModelId = removed,
+            assistants = initial.assistants.map { it.copy(chatModelId = removed) },
+            favoriteModels = listOf(removed),
         )
-
-        assertFalse(ProviderInjector.isUpToDate(legacy, keys))
+        val result = ProviderInjector.inject(selected, routing.copy(chat = binding(23, "anthropic", "claude-new")))
+        val replacement = result.models().first { it.type == ModelType.CHAT }.id
+        assertEquals(replacement, result.chatModelId)
+        assertEquals(replacement, result.fastModelId)
+        assertEquals(replacement, result.titleModelId)
+        assertEquals(replacement, result.suggestionModelId)
+        assertEquals(replacement, result.ocrModelId)
+        assertEquals(replacement, result.compressModelId)
+        assertTrue(result.assistants.all { it.chatModelId == null })
+        assertTrue(result.favoriteModels.isEmpty())
     }
 
-    @Test
-    fun `isUpToDate rejects a stale synchronous image overwrite`() {
-        val injected = inject()
-        val container = injected.container()
-        val editedModels = container.models.map { model ->
-            val overwrite = model.providerOverwrite
-            if (overwrite is ProviderSetting.OpenAI) {
-                model.copy(providerOverwrite = overwrite.copy(useAsyncImageTasks = false))
-            } else model
+    @Test fun `an authoritative empty catalog does not resurrect fixed models`() {
+        val initial = ProviderInjector.inject(Settings(), routing)
+        val result = ProviderInjector.inject(initial, GatewayRouting(binding(16, "openai"), binding(2, "openai")))
+        assertTrue(result.models().isEmpty())
+        assertEquals(Uuid.NIL, result.chatModelId)
+        assertEquals(Uuid.NIL, result.imageGenerationModelId)
+    }
+
+    @Test fun `platform routing covers messages chat completions responses and Gemini images`() {
+        val claude = ProviderInjector.models(binding(1, "anthropic", "custom"), GatewayPurpose.CHAT).single()
+        assertTrue(claude.providerOverwrite is ProviderSetting.Claude)
+        val gemini = ProviderInjector.models(binding(2, "gemini", "gemini-image"), GatewayPurpose.IMAGE).single()
+        assertEquals("https://api.bingoapi.top/v1beta", (gemini.providerOverwrite as ProviderSetting.Google).baseUrl)
+        for (platform in listOf("gemini", "composite", "deepseek", "grok")) {
+            val model = ProviderInjector.models(binding(3, platform, "chat"), GatewayPurpose.CHAT).single()
+            assertFalse((model.providerOverwrite as ProviderSetting.OpenAI).useResponseApi)
         }
-
-        assertFalse(
-            ProviderInjector.isUpToDate(
-                injected.copy(providers = listOf(container.copy(models = editedModels))),
-                keys,
-            )
-        )
+        val openai = ProviderInjector.models(binding(4, "openai", "chat"), GatewayPurpose.CHAT).single()
+        assertTrue((openai.providerOverwrite as ProviderSetting.OpenAI).useResponseApi)
     }
 
-    @Test
-    fun `key reinjection preserves user selected built-in tools`() {
-        val injected = inject()
-        val container = injected.container()
-        val gpt = container.models.first { it.modelId.startsWith("gpt-") }
-        val withSearch = injected.copy(
-            providers = listOf(
-                container.copy(
-                    models = container.models.map { model ->
-                        if (model.id == gpt.id) model.copy(tools = setOf(BuiltInTools.Search)) else model
-                    }
-                )
-            )
-        )
+    @Test fun `backup removes credentials while preserving all saved references`() {
+        val source = GatewayRouting(binding(23, "anthropic", "claude"), binding(2, "gemini", "gemini-image"))
+        val settings = ProviderInjector.inject(Settings(), source)
+        val clean = ProviderInjector.clear(settings)
+        assertEquals(settings.chatModelId, clean.chatModelId)
+        assertEquals(settings.imageGenerationModelId, clean.imageGenerationModelId)
+        assertEquals(settings.models().map { it.id }, clean.models().map { it.id })
+        assertEquals("", (clean.providers.single() as ProviderSetting.OpenAI).apiKey)
+        assertEquals("", (clean.models()[0].providerOverwrite as ProviderSetting.Claude).apiKey)
+        assertEquals("", (clean.models()[1].providerOverwrite as ProviderSetting.Google).apiKey)
+    }
 
-        val reinjected = ProviderInjector.inject(withSearch, keys.copy(gptKey = "sk-rotated"))
-        val updatedGpt = reinjected.container().models.first { it.id == gpt.id }
+    @Test fun `injection ignores restored provider URLs and credentials`() {
+        val stale = Settings(providers = listOf(ProviderSetting.OpenAI(baseUrl = "https://wrong.example/v1", apiKey = "sk-stale")))
+        val result = ProviderInjector.inject(stale, routing)
+        assertEquals("https://api.bingoapi.top/v1", (result.providers.single() as ProviderSetting.OpenAI).baseUrl)
+        assertTrue(result.models().all { (it.providerOverwrite as ProviderSetting.OpenAI).baseUrl == "https://api.bingoapi.top/v1" })
+    }
 
-        assertEquals(setOf(BuiltInTools.Search), updatedGpt.tools)
+    @Test fun `disallowed cached groups never become active but old image tasks retain recovery credentials`() {
+        val old = GatewayRouting(binding(30, "openai", "old-chat"), binding(31, "openai", "old-image"))
+        val restricted = old.enforceGroupRestrictions()
+        val result = ProviderInjector.inject(ProviderInjector.inject(Settings(), routing), old)
+        assertTrue(result.models().isEmpty())
+        assertEquals("", (result.providers.single() as ProviderSetting.OpenAI).apiKey)
+        assertEquals(Uuid.NIL, result.chatModelId)
+        assertEquals(Uuid.NIL, result.imageGenerationModelId)
+        assertEquals(30, restricted.chat!!.group.id)
+        assertEquals(31, restricted.image!!.group.id)
+        assertEquals("", restricted.chat.key)
+        assertEquals("", restricted.image.key)
+        assertEquals(listOf(old.image), restricted.imageHistory)
+        val recoveryModel = ProviderInjector.models(restricted.imageHistory.single(), GatewayPurpose.IMAGE).single()
+        assertEquals("sk-group-31", (recoveryModel.providerOverwrite as ProviderSetting.OpenAI).apiKey)
+        assertEquals(restricted, restricted.enforceGroupRestrictions())
+    }
+
+    @Test fun `group choices are the account permissions intersected with each purpose's allowed ids`() {
+        val available = listOf(2, 30, 23, 16, 13).map { GatewayGroup(it, "Group $it") }
+        assertEquals(listOf(23, 16), GatewayPurpose.CHAT.availableGroups(available).map { it.id })
+        assertEquals(listOf(13, 2), GatewayPurpose.IMAGE.availableGroups(available).map { it.id })
+        assertEquals(listOf(16), GatewayPurpose.CHAT.availableGroups(available.filter { it.id != 23 }).map { it.id })
+        assertTrue(GatewayPurpose.IMAGE.availableGroups(available.filter { it.id == 23 }).isEmpty())
     }
 }

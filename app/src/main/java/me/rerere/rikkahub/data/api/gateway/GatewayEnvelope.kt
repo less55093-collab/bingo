@@ -51,7 +51,7 @@ object GatewayReasons {
     const val INVALID_VERIFY_CODE = "INVALID_VERIFY_CODE"
 }
 
-/** Group ids on api.bingoapi.top. Not discoverable at runtime: `/admin/groups` is admin-only. */
+/** Legacy defaults, used only when first migrating an account without a saved selection. */
 object GatewayGroups {
     /** openai platform, rate multiplier 0.6 — serves the gpt-* models. */
     const val GPT = 16

@@ -407,11 +407,11 @@
   <string name="setting_background_generation_title">允许后台持续生成</string>
   <string name="setting_background_generation_desc">打开应用信息，进入耗电管理后选择“完全允许后台行为”。部分设备的系统优化会中断尚未开始输出的回复。</string>
   <string name="background_generation_interrupted_dialog_title">后台生成已中断</string>
-  <string name="background_generation_interrupted_dialog_message">已保留已生成内容。设备的后台优化可能中断流式回复；如经常发生，可在耗电管理中选择“完全允许后台行为”。</string>
+  <string name="background_generation_interrupted_dialog_message">连接已中断且无法自动续写，已保留收到的内容。可在耗电管理中选择“完全允许后台行为”以减少中断。</string>
   <string name="background_generation_interrupted_dialog_settings">打开耗电管理</string>
   <string name="background_generation_interrupted_dialog_not_now">暂不设置</string>
   <string name="background_generation_first_message_dialog_title">允许后台持续生成</string>
-  <string name="background_generation_first_message_dialog_message">为避免切到后台后回复被系统中断，请在应用信息中进入耗电管理，关闭后台优化或选择“完全允许后台行为”。</string>
+  <string name="background_generation_first_message_dialog_message">发送后可直接切到后台，回复完成后会通知你。App 会保持后台连接，中途断线也会自动续写。生图任务同样会保留，任务编号已记录，返回后可在生图页恢复查看。</string>
   <string name="background_generation_first_message_dialog_settings">打开应用信息</string>
   <string name="background_generation_first_message_dialog_not_now">暂不设置</string>
   <string name="imggen_page_generation_count">生成数量</string>

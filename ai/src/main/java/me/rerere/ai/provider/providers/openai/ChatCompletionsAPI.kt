@@ -36,6 +36,7 @@ import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.resumableStream
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
 import me.rerere.ai.provider.providers.outputForModel
@@ -133,6 +134,22 @@ class ChatCompletionsAPI(
     }
 
     override suspend fun streamText(
+        providerSetting: ProviderSetting.OpenAI,
+        messages: List<UIMessage>,
+        params: TextGenerationParams,
+    ): Flow<MessageChunk> = resumableStream(messages = messages) { attemptMessages, _ ->
+        streamTextOnce(
+            providerSetting = providerSetting,
+            messages = attemptMessages,
+            params = params,
+        )
+    }
+
+    /**
+     * One streaming attempt. It closes normally only after a protocol terminal event; a broken
+     * socket surfaces as [StreamInterruptedException] so the caller can continue the reply.
+     */
+    private fun streamTextOnce(
         providerSetting: ProviderSetting.OpenAI,
         messages: List<UIMessage>,
         params: TextGenerationParams,
@@ -483,7 +500,7 @@ class ChatCompletionsAPI(
                         }
                     }
 
-                    "opencode.ai" -> {
+                    "api.bingoapi.top", "opencode.ai" -> {
                         if (level != ReasoningLevel.AUTO) {
                             put("reasoning_effort", level.effort)
                         }

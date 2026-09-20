@@ -1,9 +1,11 @@
 package me.rerere.rikkahub.data.sync
 
 import android.content.Context
-import android.content.Intent
-import android.os.Process
+import android.database.sqlite.SQLiteDatabase
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -16,6 +18,7 @@ import me.rerere.rikkahub.data.auth.AuthTokenStore
 import me.rerere.rikkahub.data.db.AccountDatabaseManager
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.model.gateway.ChatBackupUploadRequest
+import me.rerere.rikkahub.ui.activity.restartApplication
 import me.rerere.rikkahub.utils.DatabaseUtil
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -41,6 +44,8 @@ class ChatBackupSync(
     private val json: Json,
 ) {
     private val uploadMutex = Mutex()
+    private val _startupRestoreState = MutableStateFlow<StartupRestoreState>(StartupRestoreState.Idle)
+    val startupRestoreState: StateFlow<StartupRestoreState> = _startupRestoreState.asStateFlow()
 
     suspend fun uploadNow(): Boolean = withContext(Dispatchers.IO) {
         uploadMutex.withLock {
@@ -77,65 +82,77 @@ class ChatBackupSync(
         }
     }
 
-    suspend fun restoreIfLocalEmpty(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun restoreIfLocalEmpty(
+        targetDatabaseName: String? = null,
+    ): Boolean = withContext(Dispatchers.IO) {
         val accountId = currentAccountId() ?: return@withContext false
-        val databaseName = AccountDatabaseManager.currentDatabaseName(context)
+        val databaseName = targetDatabaseName ?: AccountDatabaseManager.currentDatabaseName(context)
         if (!AccountDatabaseManager.belongsToAccount(databaseName, accountId)) return@withContext false
-        if (hasLocalUserData()) return@withContext false
+        if (hasUserDataOnDisk(databaseName)) return@withContext false
 
         val status = api.chatBackupStatus().requireData()
         if (!status.enabled || !status.exists || status.size <= 0 || status.size > MAX_BACKUP_BYTES) {
             return@withContext false
         }
-        val signed = api.chatBackupDownloadURL().requireData()
-        check(signed.method.equals("GET", ignoreCase = true)) { "Unexpected backup download method" }
-        val archive = File.createTempFile("chat_backup_restore_", ".zip", context.cacheDir)
+        _startupRestoreState.value = StartupRestoreState.Restoring
         try {
-            val request = Request.Builder().url(signed.url).get().build()
-            rawHttpClient.newCall(request).execute().use { response ->
-                check(response.isSuccessful) { "OSS download failed with HTTP ${response.code}" }
-                val body = checkNotNull(response.body)
-                val declaredLength = body.contentLength()
-                check(declaredLength in 1..MAX_BACKUP_BYTES) { "Invalid chat backup size" }
-                body.byteStream().use { input ->
-                    FileOutputStream(archive).use { output -> copyLimited(input, output, MAX_BACKUP_BYTES) }
-                }
-            }
-            val restoredDatabase = extractAndValidateArchive(archive, accountId)
+            val signed = api.chatBackupDownloadURL().requireData()
+            check(signed.method.equals("GET", ignoreCase = true)) { "Unexpected backup download method" }
+            val archive = File.createTempFile("chat_backup_restore_", ".zip", context.cacheDir)
             try {
-                DatabaseRestoreCoordinator.stage(context, restoredDatabase, databaseName)
+                val request = Request.Builder().url(signed.url).get().build()
+                rawHttpClient.newCall(request).execute().use { response ->
+                    check(response.isSuccessful) { "OSS download failed with HTTP ${response.code}" }
+                    val body = checkNotNull(response.body)
+                    val declaredLength = body.contentLength()
+                    check(declaredLength in 1..MAX_BACKUP_BYTES) { "Invalid chat backup size" }
+                    body.byteStream().use { input ->
+                        FileOutputStream(archive).use { output -> copyLimited(input, output, MAX_BACKUP_BYTES) }
+                    }
+                }
+                val restoredDatabase = extractAndValidateArchive(archive, accountId)
+                try {
+                    DatabaseRestoreCoordinator.stage(context, restoredDatabase, databaseName)
+                } finally {
+                    restoredDatabase.delete()
+                }
+                true
             } finally {
-                restoredDatabase.delete()
+                archive.delete()
             }
-            true
-        } finally {
-            archive.delete()
+        } catch (error: Throwable) {
+            _startupRestoreState.value = StartupRestoreState.Idle
+            throw error
         }
     }
 
     fun restartApp() {
-        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            ?: return
-        context.startActivity(intent)
-        Process.killProcess(Process.myPid())
+        restartApplication(context)
     }
 
     private suspend fun currentAccountId(): Long? = tokenStore.profileFlow.first()?.id?.takeIf { it > 0 }
 
     private fun hasLocalUserData(): Boolean {
-        val query = """
-            SELECT
-                (SELECT COUNT(*) FROM conversationentity) +
-                (SELECT COUNT(*) FROM message_node) +
-                (SELECT COUNT(*) FROM genmediaentity) +
-                (SELECT COUNT(*) FROM managed_files) +
-                (SELECT COUNT(*) FROM favorites) +
-                (SELECT COUNT(*) FROM workspaces) +
-                (SELECT COUNT(*) FROM conversation_folder)
-        """.trimIndent()
-        return database.openHelper.readableDatabase.query(query).use { cursor ->
+        return database.openHelper.readableDatabase.query(USER_DATA_COUNT_SQL).use { cursor ->
             cursor.moveToFirst() && cursor.getLong(0) > 0L
+        }
+    }
+
+    private fun hasUserDataOnDisk(databaseName: String): Boolean {
+        val file = context.getDatabasePath(databaseName)
+        if (!file.isFile || file.length() == 0L) return false
+        return runCatching { queryUserDataCount(file) > 0L }.getOrDefault(true)
+    }
+
+    private fun queryUserDataCount(file: File): Long {
+        return SQLiteDatabase.openDatabase(
+            file.absolutePath,
+            null,
+            SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
+        ).use { db ->
+            db.rawQuery(USER_DATA_COUNT_SQL, null).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getLong(0) else 0L
+            }
         }
     }
 
@@ -319,7 +336,22 @@ class ChatBackupSync(
         private const val MAX_BACKUP_BYTES = 256L * 1024 * 1024
         private const val MAX_MANIFEST_BYTES = 64L * 1024
         private val ZIP_MEDIA_TYPE = "application/zip".toMediaType()
+        private val USER_DATA_COUNT_SQL = """
+            SELECT
+                (SELECT COUNT(*) FROM conversationentity) +
+                (SELECT COUNT(*) FROM message_node) +
+                (SELECT COUNT(*) FROM genmediaentity) +
+                (SELECT COUNT(*) FROM managed_files) +
+                (SELECT COUNT(*) FROM favorites) +
+                (SELECT COUNT(*) FROM workspaces) +
+                (SELECT COUNT(*) FROM conversation_folder)
+        """.trimIndent()
     }
+}
+
+sealed interface StartupRestoreState {
+    data object Idle : StartupRestoreState
+    data object Restoring : StartupRestoreState
 }
 
 @Serializable
