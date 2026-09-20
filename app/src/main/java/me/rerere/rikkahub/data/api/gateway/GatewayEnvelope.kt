@@ -53,8 +53,9 @@ object GatewayReasons {
 
 /** Group ids on api.bingoapi.top. Not discoverable at runtime: `/admin/groups` is admin-only. */
 object GatewayGroups {
-    /** openai platform, rate multiplier 0.6 — serves the gpt-* models. */
-    const val GPT = 16
+    /** deepseek platform, rate multiplier 1.2 — serves the deepseek-* models. */
+    const val CHAT = 29
+    const val GPT = 29
 
     /** openai platform, image generation — the app exposes only `gpt-image-2` from it. */
     const val IMAGE = 2
@@ -62,6 +63,7 @@ object GatewayGroups {
 
 /** Reserved API-key names so provisioning is idempotent across reinstalls. */
 object GatewayKeyNames {
-    const val GPT = "app-gpt"
+    const val CHAT = "app-deepseek"
+    const val GPT = "app-deepseek"
     const val IMAGE = "app-image"
 }

@@ -32,8 +32,8 @@ class KeyProvisioner(
 
         val gpt = reconcile(
             remote = remote,
-            name = GatewayKeyNames.GPT,
-            groupId = GatewayGroups.GPT,
+            name = GatewayKeyNames.CHAT,
+            groupId = GatewayGroups.CHAT,
             storedSecret = stored.gptKey,
         )
         val image = reconcile(

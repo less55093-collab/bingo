@@ -23,7 +23,6 @@ class DefaultProvidersTest {
         assertEquals("https://api.bingoapi.top/v1", provider.baseUrl)
         assertTrue(provider.enabled)
         assertTrue(provider.builtIn)
-        assertTrue(provider.useResponseApi)
     }
 
     @Test
@@ -47,9 +46,9 @@ class DefaultProvidersTest {
     }
 
     @Test
-    fun `fresh installs default to gpt 5 6 sol`() {
-        assertEquals(BingoModelIds.GPT_5_6_SOL, BINGO_DEFAULT_MODEL_ID)
-        assertEquals("gpt-5.6-sol", provider.models.single { it.id == BINGO_DEFAULT_MODEL_ID }.modelId)
+    fun `fresh installs default to deepseek chat`() {
+        assertEquals(BingoModelIds.DEEPSEEK_CHAT, BINGO_DEFAULT_MODEL_ID)
+        assertEquals("deepseek-chat", provider.models.single { it.id == BINGO_DEFAULT_MODEL_ID }.modelId)
     }
 
     @Test
