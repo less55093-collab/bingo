@@ -580,6 +580,7 @@ const ConversationTimeline = React.memo(
     onRegenerate: (messageId: string) => Promise<void>;
     onSelectBranch: (nodeId: string, selectIndex: number) => Promise<void>;
     onToolApproval: (
+      messageId: string,
       toolCallId: string,
       approved: boolean,
       reason: string,
@@ -663,7 +664,8 @@ const ConversationTimeline = React.memo(
                     onFork={onFork}
                     onRegenerate={onRegenerate}
                     onSelectBranch={onSelectBranch}
-                    onToolApproval={onToolApproval}
+                    onToolApproval={(toolCallId, approved, reason, answer) =>
+                      onToolApproval(message.id, toolCallId, approved, reason, answer)}
                   />
                 </div>
               );
@@ -817,10 +819,11 @@ function ConversationsPageInner() {
   );
 
   const handleToolApproval = React.useCallback(
-    async (toolCallId: string, approved: boolean, reason: string, answer?: string) => {
+    async (messageId: string, toolCallId: string, approved: boolean, reason: string, answer?: string) => {
       if (!activeId) return;
       await api.post<{ status: string }>(`conversations/${activeId}/tool-approval`, {
         toolCallId,
+        messageId,
         approved,
         reason,
         ...(answer != null ? { answer } : {}),

@@ -26,7 +26,7 @@ class GenerationProtectionManagerTest {
         assertEquals(1L, provisional.runToken)
 
         val lease = async { manager.awaitActive(provisional) }
-        testScheduler.advanceTimeBy(30_000)
+        testScheduler.advanceTimeBy(5_000)
         assertTrue(!lease.isCompleted)
 
         controller.active(1)

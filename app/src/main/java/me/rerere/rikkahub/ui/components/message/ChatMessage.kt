@@ -499,7 +499,7 @@ private fun MessagePartsBlock(
                                     .size(72.dp)
                                     .clip(MaterialTheme.shapes.medium)
                                     .background(MaterialTheme.colorScheme.surfaceVariant)
-                                    .shimmer(isLoading = true)
+                                    .shimmer(isLoading = loading)
                             )
                         } else {
                             ZoomableAsyncImage(
@@ -584,11 +584,19 @@ private fun MessagePartsBlock(
     // Annotations (always rendered at the end)
     val citations = annotations.filterIsInstance<UIMessageAnnotation.UrlCitation>()
     val generationInterrupted = annotations.any { it is UIMessageAnnotation.GenerationInterrupted }
-    if (generationInterrupted || citations.isNotEmpty()) {
+    val generationFailure = annotations.filterIsInstance<UIMessageAnnotation.GenerationFailure>().lastOrNull()
+    if (generationInterrupted || generationFailure != null || citations.isNotEmpty()) {
         Column(
             modifier = Modifier.animateContentSize(),
         ) {
-            if (generationInterrupted) {
+            if (generationFailure != null) {
+                Text(
+                    text = generationFailure.message,
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            } else if (generationInterrupted) {
                 Text(
                     text = stringResource(R.string.generation_interrupted),
                     modifier = Modifier.padding(top = 8.dp),

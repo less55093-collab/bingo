@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.common.android.Logging
 
 private const val PROTECTION_TRACE_TAG = "GenerationProtection"
@@ -219,7 +220,13 @@ class GenerationProtectionManager private constructor(
             ?: throw IllegalArgumentException("Lease was not created by GenerationProtectionManager")
 
         return try {
-            awaitActivation(ownedLease.runToken)
+            val activated = withTimeoutOrNull(15_000L) {
+                awaitActivation(ownedLease.runToken)
+                true
+            } ?: false
+            if (!activated) {
+                throw GenerationProtectionException("后台保护启动超时，请保持 App 在前台后重试")
+            }
             Logging.log(
                 PROTECTION_TRACE_TAG,
                 "lease_active run=${ownedLease.runToken} lease=${ownedLease.id} kind=${ownedLease.kind}",

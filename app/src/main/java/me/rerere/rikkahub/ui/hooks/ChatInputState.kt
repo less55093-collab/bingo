@@ -13,6 +13,7 @@ class ChatInputState {
     val textContent = TextFieldState()
     var messageContent by mutableStateOf(listOf<UIMessagePart>())
     var editingMessage by mutableStateOf<Uuid?>(null)
+    var directImageGeneration by mutableStateOf(false)
     private var editingParts: List<UIMessagePart>? = null
     private var editingAttachmentUrls: Set<String> = emptySet()
 
@@ -22,6 +23,7 @@ class ChatInputState {
         editingMessage = null
         editingParts = null
         editingAttachmentUrls = emptySet()
+        directImageGeneration = false
     }
 
     fun isEditing() = editingMessage != null

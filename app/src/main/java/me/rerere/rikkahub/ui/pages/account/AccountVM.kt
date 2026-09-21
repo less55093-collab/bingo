@@ -67,5 +67,9 @@ fun formatBalanceAmount(value: Double): String = when {
 /** Below this, chat starts failing mid-conversation, so the UI nudges toward topping up. */
 const val LOW_BALANCE_THRESHOLD = 0.5
 
+/** Zero or negative remaining credit cannot provision models; wait until a profile is known. */
+fun isBalanceDepleted(profile: UserProfile?): Boolean =
+    profile != null && profile.balance <= 0.0
+
 val AuthState.profileOrNull: UserProfile?
     get() = (this as? AuthState.Authenticated)?.profile

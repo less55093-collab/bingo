@@ -22,15 +22,17 @@ val BINGO_PROVIDER_ID: Uuid = Uuid.parse("dde5c839-9351-4ed7-8472-7bb98c829d93")
 val BINGO_IMAGE_OVERWRITE_ID: Uuid = Uuid.parse("3ac9d1f7-8e62-4b0d-95c4-1f7a6e2b8d50")
 
 object BingoModelIds {
-    val DEEPSEEK_CHAT: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000001")
-    val DEEPSEEK_REASONER: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000002")
+    val DEEPSEEK_FLASH: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000001")
+    val DEEPSEEK_V4_PRO: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000002")
 
-    // Compatibility aliases
-    val GPT_5_5: Uuid get() = DEEPSEEK_CHAT
-    val GPT_5_4: Uuid get() = DEEPSEEK_CHAT
-    val GPT_5_4_MINI: Uuid get() = DEEPSEEK_CHAT
-    val GPT_5_6_SOL: Uuid get() = DEEPSEEK_CHAT
-    val GPT_5_6_TERRA: Uuid get() = DEEPSEEK_CHAT
+    // Aliases
+    val DEEPSEEK_CHAT: Uuid get() = DEEPSEEK_FLASH
+    val DEEPSEEK_REASONER: Uuid get() = DEEPSEEK_V4_PRO
+    val GPT_5_5: Uuid get() = DEEPSEEK_FLASH
+    val GPT_5_4: Uuid get() = DEEPSEEK_FLASH
+    val GPT_5_4_MINI: Uuid get() = DEEPSEEK_FLASH
+    val GPT_5_6_SOL: Uuid get() = DEEPSEEK_FLASH
+    val GPT_5_6_TERRA: Uuid get() = DEEPSEEK_V4_PRO
     val GPT_IMAGE_2: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f1")
 }
 
@@ -70,16 +72,16 @@ private fun deepseekModel(
  */
 val BINGO_MODELS: List<Model> = listOf(
     deepseekModel(
-        BingoModelIds.DEEPSEEK_CHAT,
-        "deepseek-chat",
-        "DeepSeek-V3",
-        abilities = listOf(ModelAbility.TOOL),
+        BingoModelIds.DEEPSEEK_FLASH,
+        "deepseek-flash",
+        "DeepSeek-Flash",
+        abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
     ),
     deepseekModel(
-        BingoModelIds.DEEPSEEK_REASONER,
-        "deepseek-reasoner",
-        "DeepSeek-R1",
-        abilities = listOf(ModelAbility.REASONING),
+        BingoModelIds.DEEPSEEK_V4_PRO,
+        "deepseek-v4-pro",
+        "DeepSeek-V4-Pro",
+        abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
     ),
     Model(
         id = BingoModelIds.GPT_IMAGE_2,
@@ -97,10 +99,10 @@ val BINGO_MODELS: List<Model> = listOf(
 val BINGO_IMAGE_MODEL_ID: Uuid = BingoModelIds.GPT_IMAGE_2
 
 /** Default chat model for a fresh install. */
-val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.DEEPSEEK_CHAT
+val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.DEEPSEEK_FLASH
 
 /** Cheapest capable model, used for titles/suggestions/translation background calls. */
-val BINGO_FAST_MODEL_ID: Uuid = BingoModelIds.DEEPSEEK_CHAT
+val BINGO_FAST_MODEL_ID: Uuid = BingoModelIds.DEEPSEEK_FLASH
 
 /**
  * The DeepSeek key lives on this container and the image key is kept on the image model overwrite.

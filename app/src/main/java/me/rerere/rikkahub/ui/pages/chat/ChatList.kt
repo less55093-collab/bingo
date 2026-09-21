@@ -131,8 +131,8 @@ fun ChatList(
     onTranslate: ((UIMessage, java.util.Locale) -> Unit)? = null,
     onClearTranslation: (UIMessage) -> Unit = {},
     onJumpToMessage: (Int) -> Unit = {},
-    onToolApproval: ((toolCallId: String, approved: Boolean, reason: String, inputOverride: String?) -> Unit)? = null,
-    onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
+    onToolApproval: ((messageId: Uuid, toolCallId: String, approved: Boolean, reason: String, inputOverride: String?) -> Unit)? = null,
+    onToolAnswer: ((messageId: Uuid, toolCallId: String, answer: String) -> Unit)? = null,
     onToggleFavorite: ((MessageNode) -> Unit)? = null,
     onConversationSystemPromptChange: ((String?) -> Unit)? = null,
 ) {
@@ -203,8 +203,8 @@ private fun ChatListNormal(
     onTranslate: ((UIMessage, java.util.Locale) -> Unit)?,
     onClearTranslation: (UIMessage) -> Unit,
     animatedVisibilityScope: AnimatedVisibilityScope,
-    onToolApproval: ((toolCallId: String, approved: Boolean, reason: String, inputOverride: String?) -> Unit)? = null,
-    onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
+    onToolApproval: ((messageId: Uuid, toolCallId: String, approved: Boolean, reason: String, inputOverride: String?) -> Unit)? = null,
+    onToolAnswer: ((messageId: Uuid, toolCallId: String, answer: String) -> Unit)? = null,
     onToggleFavorite: ((MessageNode) -> Unit)? = null,
     onConversationSystemPromptChange: ((String?) -> Unit)? = null,
 ) {
@@ -361,8 +361,14 @@ private fun ChatListNormal(
                             },
                             onTranslate = onTranslate,
                             onClearTranslation = onClearTranslation,
-                            onToolApproval = onToolApproval,
-                            onToolAnswer = onToolAnswer,
+                            onToolApproval = onToolApproval?.let { callback ->
+                                { toolCallId, approved, reason, inputOverride ->
+                                    callback(node.currentMessage.id, toolCallId, approved, reason, inputOverride)
+                                }
+                            },
+                            onToolAnswer = onToolAnswer?.let { callback ->
+                                { toolCallId, answer -> callback(node.currentMessage.id, toolCallId, answer) }
+                            },
                             lastMessage = index == lastMessageIndex,
                         )
                     }

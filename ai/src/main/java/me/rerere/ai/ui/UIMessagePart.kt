@@ -142,6 +142,7 @@ sealed class UIMessagePart {
         val input: String,
         val output: List<UIMessagePart> = emptyList(),
         val approvalState: ToolApprovalState = ToolApprovalState.Auto,
+        val executionStarted: Boolean = false,
         override var metadata: JsonObject? = null
     ) : UIMessagePart() {
         /** Whether the tool has been executed (has output) */
@@ -165,6 +166,7 @@ sealed class UIMessagePart {
                 input = input + other.input,
                 output = output + other.output,
                 approvalState = approvalState,
+                executionStarted = executionStarted || other.executionStarted,
                 metadata = if (other.metadata != null) other.metadata else metadata,
             )
         }

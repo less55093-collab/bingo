@@ -161,6 +161,12 @@ class ChatVM(
         }
     }
 
+    fun setImageModel(model: Model) {
+        viewModelScope.launch {
+            settingsStore.update { it.copy(imageGenerationModelId = model.id) }
+        }
+    }
+
     // Update checker
     val updateState =
         updateChecker.checkUpdate().stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Loading)
@@ -171,10 +177,10 @@ class ChatVM(
      * @param content 消息内容
      * @param answer 是否触发消息生成，如果为false，则仅添加消息到消息列表中
      */
-    fun handleMessageSend(content: List<UIMessagePart>,answer: Boolean = true) {
+    fun handleMessageSend(content: List<UIMessagePart>, answer: Boolean = true, directImageGeneration: Boolean = false) {
         if (content.isEmptyInputMessage()) return
 
-        chatService.sendMessage(_conversationId, content, answer)
+        chatService.sendMessage(_conversationId, content, answer, directImageGeneration = directImageGeneration)
     }
 
     fun handleMessageEdit(parts: List<UIMessagePart>, messageId: Uuid) {
@@ -225,6 +231,7 @@ class ChatVM(
     }
 
     fun handleToolApproval(
+        messageId: Uuid,
         toolCallId: String,
         approved: Boolean,
         reason: String = "",
@@ -236,14 +243,17 @@ class ChatVM(
             approved = approved,
             reason = reason,
             inputOverride = inputOverride,
+            expectedMessageId = messageId,
         )
     }
 
     fun handleToolAnswer(
+        messageId: Uuid,
         toolCallId: String,
         answer: String,
     ) {
-        chatService.handleToolApproval(_conversationId, toolCallId, approved = true, answer = answer)
+        chatService.handleToolApproval(_conversationId, toolCallId, approved = true,
+            answer = answer, expectedMessageId = messageId)
     }
 
     fun stopGeneration() {

@@ -11,6 +11,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArrayBuilder
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -30,6 +31,7 @@ import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
+import me.rerere.ai.provider.ModelRequestException
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
@@ -45,6 +47,7 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.metadataAs
 import me.rerere.ai.ui.toMetadata
 import me.rerere.ai.util.KeyRoulette
+import me.rerere.ai.util.HttpException
 import me.rerere.ai.util.configureReferHeaders
 import me.rerere.ai.util.encodeBase64
 import me.rerere.ai.util.json
@@ -98,14 +101,17 @@ class ResponseAPI(
 
         Log.i(TAG, "generateText: model=${params.model.modelId}")
 
-        val response = client.newCall(request).await()
-        if (!response.isSuccessful) {
-            throw Exception("OpenAI response request failed with HTTP ${response.code}")
+        val bodyStr = client.newCall(request).await().use { response ->
+            val raw = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw runCatching { json.parseToJsonElement(raw).parseErrorDetail() }
+                    .getOrElse { IllegalStateException("模型请求被上游拒绝（HTTP ${response.code}）") }
+            }
+            raw
         }
-
-        val bodyStr = response.body?.string() ?: ""
         Log.i(TAG, "generateText: responseBytes=${bodyStr.toByteArray().size}")
         val bodyJson = json.parseToJsonElement(bodyStr).jsonObject
+        validateResponseStatus(bodyJson)
         val output = parseResponseOutput(bodyJson)
 
         return output
@@ -118,8 +124,9 @@ class ResponseAPI(
     ): Flow<MessageChunk> = callbackFlow {
         val producer = this
         val completed = AtomicBoolean(false)
+        val failed = AtomicBoolean(false)
         val closedByCollector = AtomicBoolean(false)
-        val functionCallsWithArgumentDeltas = mutableSetOf<String>()
+        val toolCalls = ResponseToolCallAccumulator()
 
         fun complete() {
             if (completed.compareAndSet(false, true)) {
@@ -128,9 +135,24 @@ class ResponseAPI(
         }
 
         fun fail(cause: Throwable) {
-            if (!completed.get() && !closedByCollector.get() && producer.isActive) {
+            if (!completed.get() && !closedByCollector.get() && producer.isActive && failed.compareAndSet(false, true)) {
                 producer.close(cause)
             }
+        }
+
+        fun emitCompletedTools(response: JsonObject? = null) {
+            val tools = toolCalls.finish(response)
+            if (tools.isEmpty()) return
+            producer.trySend(MessageChunk(
+                id = (response?.get("id") as? JsonPrimitive)?.contentOrNull.orEmpty(),
+                model = params.model.modelId,
+                choices = listOf(UIMessageChoice(
+                    index = 0,
+                    delta = UIMessage(role = MessageRole.ASSISTANT, parts = tools),
+                    message = null,
+                    finishReason = null,
+                )),
+            ))
         }
 
         fun transportFailure(t: Throwable?, response: Response?): Throwable {
@@ -157,6 +179,7 @@ class ResponseAPI(
 
         fun responseEventFailure(payload: JsonObject, sseType: String?): Throwable? {
             val eventType = payload["type"]?.jsonPrimitive?.contentOrNull ?: sseType
+            payload["error"]?.takeUnless { it is JsonNull }?.let { return it.parseErrorDetail() }
             if (eventType !in setOf(
                     "error",
                     "response.cancelled",
@@ -207,38 +230,35 @@ class ResponseAPI(
                 type: String?,
                 data: String
             ) {
-                if (data.trim() == "[DONE]") {
-                    complete()
-                    return
-                }
-
+                if (completed.get() || failed.get() || closedByCollector.get()) return
                 try {
+                    if (data.trim() == "[DONE]") {
+                        emitCompletedTools()
+                        complete()
+                        return
+                    }
                     Log.d(TAG, "onEvent: type=$type bytes=${data.toByteArray().size}")
-                    val payload = json.parseToJsonElement(data).jsonObject
-                    val eventType = payload["type"]?.jsonPrimitive?.contentOrNull ?: type
+                    val rawPayload = json.parseToJsonElement(data).jsonObject
+                    val eventType = rawPayload["type"]?.jsonPrimitive?.contentOrNull ?: type
+                    val payload = if (rawPayload["type"] == null && eventType != null) {
+                        JsonObject(rawPayload + ("type" to JsonPrimitive(eventType)))
+                    } else rawPayload
+                    if (!toolCalls.isNewEvent(payload)) return
                     responseEventFailure(payload, eventType)?.let {
                         fail(it)
                         return
                     }
-
-                    if (eventType == "response.function_call_arguments.delta") {
-                        payload["item_id"]?.jsonPrimitive?.contentOrNull?.let {
-                            functionCallsWithArgumentDeltas += it
-                        }
-                    } else if (eventType == "response.function_call_arguments.done") {
-                        val itemId = payload["item_id"]?.jsonPrimitive?.contentOrNull
-                        if (itemId in functionCallsWithArgumentDeltas) {
-                            return
-                        }
-                    }
+                    if (toolCalls.accept(payload)) return
 
                     // Some compatible gateways only put the terminal type in the SSE event name.
                     if (eventType == "response.completed") {
-                        if (payload["type"] != null) {
-                            parseResponseDelta(payload)?.let { chunk ->
-                                producer.trySend(chunk).onFailure { e ->
-                                    Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
-                                }
+                        val response = payload["response"] as? JsonObject
+                            ?: error("模型返回的 response.completed 缺少 response")
+                        validateResponseStatus(response)
+                        emitCompletedTools(response)
+                        parseResponseDelta(payload)?.let { chunk ->
+                            producer.trySend(chunk).onFailure { e ->
+                                Log.w(TAG, "onEvent: chunk dropped error=${e?.javaClass?.simpleName}")
                             }
                         }
                         complete()
@@ -252,7 +272,13 @@ class ResponseAPI(
                         }
                     }
                 } catch (e: Throwable) {
-                    fail(StreamInterruptedException("OpenAI response stream received an invalid event", e))
+                    fail(if (e is HttpException) e else ModelRequestException(
+                        params.model.modelId,
+                        if (e is ResponseProtocolException) e else ResponseProtocolException(
+                            "模型返回的数据不完整或格式无效，尚未执行本轮工具",
+                            e,
+                        ),
+                    ))
                 }
             }
 
@@ -620,31 +646,7 @@ class ResponseAPI(
                 val item = jsonObject["item"]?.jsonObject ?: error("chunk item not found")
                 val type = item["type"]?.jsonPrimitive?.content ?: error("chunk type not found")
                 val id = item["id"]?.jsonPrimitive?.content ?: error("chunk id not found")
-                if (type == "function_call") {
-                    return MessageChunk(
-                        id = id,
-                        model = "",
-                        choices = listOf(
-                            UIMessageChoice(
-                                index = 0,
-                                message = null,
-                                delta = UIMessage(
-                                    role = MessageRole.ASSISTANT,
-                                    parts = listOf(
-                                        UIMessagePart.Tool(
-                                            toolCallId = id,
-                                            toolName = item["name"]?.jsonPrimitive?.content ?: "",
-                                            input = item["arguments"]?.jsonPrimitive?.content
-                                                ?: "",
-                                            output = emptyList()
-                                        )
-                                    )
-                                ),
-                                finishReason = null
-                            )
-                        )
-                    )
-                } else if (type == "image_generation_call") {
+                if (type == "image_generation_call") {
                     return MessageChunk(
                         id = id,
                         model = "",
@@ -743,64 +745,6 @@ class ResponseAPI(
                 }
             }
 
-            "response.function_call_arguments.delta" -> {
-                val toolCallId =
-                    jsonObject["item_id"]?.jsonPrimitive?.content ?: error("item_id not found")
-                val argumentsDelta =
-                    jsonObject["delta"]?.jsonPrimitive?.content ?: error("delta not found")
-                return MessageChunk(
-                    id = toolCallId,
-                    model = "",
-                    choices = listOf(
-                        UIMessageChoice(
-                            index = 0,
-                            delta = UIMessage(
-                                role = MessageRole.ASSISTANT,
-                                parts = listOf(
-                                    UIMessagePart.Tool(
-                                        toolCallId = toolCallId,
-                                        toolName = "",
-                                        input = argumentsDelta,
-                                        output = emptyList()
-                                    )
-                                )
-                            ),
-                            message = null,
-                            finishReason = null
-                        )
-                    ),
-                )
-            }
-
-            "response.function_call_arguments.done" -> {
-                val toolCallId =
-                    jsonObject["item_id"]?.jsonPrimitive?.content ?: error("item_id not found")
-                val arguments =
-                    jsonObject["arguments"]?.jsonPrimitive?.content ?: error("arguments not found")
-                return MessageChunk(
-                    id = toolCallId,
-                    model = "",
-                    choices = listOf(
-                        UIMessageChoice(
-                            index = 0,
-                            delta = UIMessage(
-                                role = MessageRole.ASSISTANT,
-                                parts = listOf(
-                                    UIMessagePart.Tool(
-                                        toolCallId = toolCallId,
-                                        toolName = "",
-                                        input = arguments,
-                                        output = emptyList()
-                                    )
-                                )
-                            ),
-                            message = null,
-                            finishReason = null
-                        )
-                    ),
-                )
-            }
-
             "response.completed" -> {
                 return MessageChunk(
                     id = jsonObject["item_id"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -814,9 +758,21 @@ class ResponseAPI(
         return null
     }
 
+    private fun validateResponseStatus(response: JsonObject) {
+        val error = response["error"]?.takeUnless { it is JsonNull }
+        if (error != null) throw error.parseErrorDetail()
+        val status = (response["status"] as? JsonPrimitive)?.contentOrNull
+        if (status != null && status != "completed") {
+            throw response["incomplete_details"]?.takeUnless { it is JsonNull }?.parseErrorDetail()
+                ?: ResponseProtocolException("模型未完成请求（$status），尚未执行本轮工具")
+        }
+    }
+
     private fun parseResponseOutput(jsonObject: JsonObject): MessageChunk {
         val outputs = jsonObject["output"]?.jsonArray ?: error("output not found")
         val parts = arrayListOf<UIMessagePart>()
+        val toolsById = ResponseToolCallAccumulator().finish(jsonObject).associateBy { it.toolCallId }
+        val addedCallIds = mutableSetOf<String>()
 
         outputs.forEach { outputItem ->
             val output = outputItem.jsonObject
@@ -843,17 +799,7 @@ class ResponseAPI(
 
                 "function_call" -> {
                     val callId = output["call_id"]?.jsonPrimitive?.content ?: error("call_id not found")
-                    val name = output["name"]?.jsonPrimitive?.content ?: error("name not found")
-                    val arguments =
-                        output["arguments"]?.jsonPrimitive?.content ?: error("arguments not found")
-                    parts.add(
-                        UIMessagePart.Tool(
-                            toolCallId = callId,
-                            toolName = name,
-                            input = arguments,
-                            output = emptyList()
-                        )
-                    )
+                    if (addedCallIds.add(callId)) parts.add(toolsById.getValue(callId))
                 }
 
                 "message" -> {

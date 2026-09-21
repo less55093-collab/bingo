@@ -142,6 +142,9 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                     modifier = Modifier.padding(horizontal = 8.dp),
                     title = { Text(stringResource(R.string.setting_page_model_and_services)) },
                 ) {
+                    item {
+                        GatewaySettings(vm)
+                    }
                     item(
                         onClick = { navController.navigate(Screen.SettingSearch) },
                         leadingContent = { Icon(HugeIcons.GlobalSearch, null) },

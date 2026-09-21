@@ -7,6 +7,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelRequestException
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.StreamInterruptedException
 import me.rerere.ai.provider.TextGenerationParams
@@ -187,10 +188,10 @@ class ProviderStreamInterruptionTest {
     fun `responses assembles streamed chinese tool arguments without duplicating done snapshot`() = runBlocking {
         enqueuePartial(
             listOf(
-                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"call-1\",\"name\":\"search_web\",\"arguments\":\"\"}}",
-                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call-1\",\"delta\":\"{\\\"query\\\":\\\"七\"}",
-                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call-1\",\"delta\":\"政四余\\\"}\"}",
-                "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call-1\",\"arguments\":\"{\\\"query\\\":\\\"七政四余\\\"}\"}",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"search_web\",\"arguments\":\"\"}}",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"delta\":\"{\\\"query\\\":\\\"七\"}",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"delta\":\"政四余\\\"}\"}",
+                "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item-1\",\"arguments\":\"{\\\"query\\\":\\\"七政四余\\\"}\"}",
                 "data: {\"type\":\"response.completed\",\"response\":{}}",
             ).joinToString("\n\n", postfix = "\n\n")
         )
@@ -213,7 +214,7 @@ class ProviderStreamInterruptionTest {
     }
 
     @Test
-    fun `malformed responses event is interrupted without retrying the post`() {
+    fun `malformed responses event names the model without retrying the post`() {
         enqueuePartial("data: {not-json}\n\n")
         val api = ResponseAPI(OkHttpClient(), KeyRoulette.default())
 
@@ -225,7 +226,8 @@ class ProviderStreamInterruptionTest {
             )
         }
 
-        assertTrue(failure is StreamInterruptedException)
+        assertTrue(failure is ModelRequestException)
+        assertEquals("test", (failure as ModelRequestException).modelId)
         assertEquals(1, server.requestCount)
     }
 

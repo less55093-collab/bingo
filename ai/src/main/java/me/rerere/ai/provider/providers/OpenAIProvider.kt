@@ -22,6 +22,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.provider.EmbeddingGenerationParams
 import me.rerere.ai.provider.EmbeddingGenerationResult
+import me.rerere.ai.provider.CHAT_HTTP2_PING_INTERVAL_SECONDS
 import me.rerere.ai.provider.ImageEditParams
 import me.rerere.ai.provider.ImageGenerationParams
 import me.rerere.ai.provider.ImageGenerationTerminalException
@@ -71,7 +72,12 @@ private fun effectiveImageSize(size: String): String =
     size.takeUnless { it.isBlank() || it.equals(ImageGenSize.AUTO.value, ignoreCase = true) }
         ?: ImageGenSize.SQUARE_1024.value
 
-private class ImageTaskNotFoundException(message: String) : ImageGenerationTerminalException(message)
+/** Query access is recoverable after login/key rotation; it says nothing about task execution. */
+class ImageTaskQueryException(
+    val taskId: String,
+    val statusCode: Int? = null,
+    message: String,
+) : IOException(message)
 
 /**
  * The result object has expired at the gateway. This is terminal for the persisted task: retrying
@@ -93,10 +99,13 @@ class OpenAIProvider(
     private val appContext = context?.applicationContext
     private val keyRoulette = if (context != null) KeyRoulette.lru(context) else KeyRoulette.default()
 
-    // A reasoning stream can pause for longer than normal request traffic. Keep it on a dedicated
-    // client so its socket stays alive across long output and mobile network idle periods.
+    // A reasoning stream can pause for longer than normal request traffic, and it must survive the
+    // App going to the background. Keep it on a dedicated client whose keep-alive policy tolerates
+    // a paused process: no read deadline (SSE chunks arrive on the server's schedule) and a 30s
+    // HTTP/2 ping, which OkHttp otherwise treats as fatal after a single unanswered pong.
     private val streamingClient = client.newBuilder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .pingInterval(CHAT_HTTP2_PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
         // A 307/308 preserves a POST body. Streaming requests are billable and cannot safely be
@@ -594,7 +603,7 @@ class OpenAIProvider(
             configuredKeys.filterTo(this) { it != preferredKey }
         }
         val requestTraceId = traceId(traceId)
-        var lastNotFound: ImageTaskNotFoundException? = null
+        var lastQueryFailure: ImageTaskQueryException? = null
         for ((index, key) in candidates.withIndex()) {
             try {
                 pollImageTask(
@@ -604,11 +613,11 @@ class OpenAIProvider(
                     customHeaders = customHeaders,
                     traceId = requestTraceId,
                     onTaskFailed = onTaskFailed,
-                    tryOtherOwnerKeys = true,
                 ).forEach { emit(it) }
                 return@flow
-            } catch (e: ImageTaskNotFoundException) {
-                lastNotFound = e
+            } catch (e: ImageTaskQueryException) {
+                if (e.statusCode !in setOf(401, 403, 404)) throw e
+                lastQueryFailure = e
                 trace(
                     requestTraceId,
                     "async_task_owner_key_miss",
@@ -616,8 +625,10 @@ class OpenAIProvider(
                 )
             }
         }
-        onTaskFailed(taskId)
-        throw lastNotFound ?: IllegalStateException("Failed to poll image: task not found")
+        throw lastQueryFailure ?: ImageTaskQueryException(
+            taskId,
+            message = "暂时无法查询图片任务，任务已保留，请重新登录原账号后恢复",
+        )
     }
 
     private fun selectImageRequestKey(
@@ -672,24 +683,23 @@ class OpenAIProvider(
         val body = try {
             json.parseToJsonElement(submitBody).jsonObject
         } catch (error: Exception) {
-            notifyTaskFailureBestEffort(onTaskFailed, failureCorrelationId)
-            throw ImageGenerationTerminalException(
-                "Asynchronous image submission returned invalid JSON",
-                error,
+            throw ImageTaskQueryException(
+                taskId = failureCorrelationId,
+                message = "生图提交已返回，但任务信息暂时无法读取；请求已保留，请恢复原请求",
             )
         }
-        val taskId = body["task_id"]?.jsonPrimitive?.contentOrNull
-            ?: body["id"]?.jsonPrimitive?.contentOrNull
+        val taskId = (body["task_id"] as? JsonPrimitive)?.contentOrNull
+            ?: (body["id"] as? JsonPrimitive)?.contentOrNull
             ?: run {
-                notifyTaskFailureBestEffort(onTaskFailed, failureCorrelationId)
-                throw ImageGenerationTerminalException(
-                    "Asynchronous image submission did not return a task id",
+                throw ImageTaskQueryException(
+                    taskId = failureCorrelationId,
+                    message = "生图提交未返回任务编号；请求已保留，请恢复原请求",
                 )
             }
         if (taskId.isBlank()) {
-            notifyTaskFailureBestEffort(onTaskFailed, failureCorrelationId)
-            throw ImageGenerationTerminalException(
-                "Asynchronous image submission returned an empty task id",
+            throw ImageTaskQueryException(
+                taskId = failureCorrelationId,
+                message = "生图提交返回的任务编号为空；请求已保留，请恢复原请求",
             )
         }
         onTaskSubmitted(taskId)
@@ -711,15 +721,15 @@ class OpenAIProvider(
         customHeaders: List<me.rerere.ai.provider.CustomHeader>,
         traceId: String,
         onTaskFailed: suspend (String) -> Unit,
-        tryOtherOwnerKeys: Boolean = false,
+        queryUrl: String = "${providerSetting.baseUrl.trimEnd('/')}/images/tasks/$taskId",
     ): List<ImageGenerationItem> = withContext(Dispatchers.IO) {
         var pollCount = 0
         while (true) {
             pollCount++
             val request = Request.Builder()
-                .url("${providerSetting.baseUrl.trimEnd('/')}/images/tasks/$taskId")
+                .url(queryUrl)
                 .headers(customHeaders.toHeaders())
-                .addHeader("Authorization", "Bearer $key")
+                .header("Authorization", "Bearer $key")
                 .get()
                 .configureReferHeaders(providerSetting.baseUrl)
                 .build()
@@ -746,7 +756,7 @@ class OpenAIProvider(
                         delay(retryDelay)
                         return@use
                     }
-                    if (resp.code == 410) {
+                    if (resp.code == 410 && resp.isExpiredImageTaskResult()) {
                         // Sub2 uses 410 for a terminally expired result. Retaining the local
                         // replay record here would make every recovery wake poll the same dead
                         // task forever, while replaying the original POST is unsafe because the
@@ -767,31 +777,37 @@ class OpenAIProvider(
                         }
                         throw ImageTaskResultExpiredException(taskId, detail)
                     }
-                    if (resp.code == 404) {
-                        val error = imageApiError("poll", resp)
-                        if (tryOtherOwnerKeys) {
-                            throw ImageTaskNotFoundException(error.message ?: "Image task not found")
-                        }
-                        notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                        throw ImageTaskNotFoundException(error.message ?: "Image task not found")
-                    }
-                    notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                    throw imageApiError("poll", resp, terminal = true)
+                    // A denied/missing query can be caused by login expiry, key rotation, routing
+                    // or a temporary server failure. Never turn it into a failed paid generation.
+                    throw ImageTaskQueryException(
+                        taskId = taskId,
+                        statusCode = resp.code,
+                        message = "暂时无法查询图片任务（HTTP ${resp.code}），任务已保留，可在原账号恢复",
+                    )
                 }
 
                 val bodyStr = resp.body.string()
                 val body = try {
                     json.parseToJsonElement(bodyStr).jsonObject
                 } catch (error: Exception) {
-                    notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                    throw ImageGenerationTerminalException(
-                        "Image task returned invalid JSON (task=$taskId)",
+                    // An incomplete status response is not evidence that a paid task failed.
+                    // Keep its identity so the manager retries this task's GET after reconnecting.
+                    throw java.io.IOException(
+                        "Unable to read image task status (task=$taskId)",
                         error,
                     )
                 }
-                val status = body["status"]?.jsonPrimitive?.contentOrNull
+                val status = (body["status"] as? JsonPrimitive)?.contentOrNull
                     ?.trim()
                     ?.lowercase()
+                val returnedTaskId = (body["task_id"] as? JsonPrimitive)?.contentOrNull
+                    ?: (body["id"] as? JsonPrimitive)?.contentOrNull
+                if (returnedTaskId != null && returnedTaskId != taskId) {
+                    throw ImageTaskQueryException(
+                        taskId,
+                        message = "图片任务查询返回了不匹配的任务；原任务已保留，稍后重试",
+                    )
+                }
                 when (status) {
                 in PROCESSING_IMAGE_TASK_STATUSES -> {
                     trace(traceId, "async_task_processing", "task_id=$taskId poll=$pollCount")
@@ -801,12 +817,11 @@ class OpenAIProvider(
                 }
 
                 in COMPLETED_IMAGE_TASK_STATUSES -> {
-                    val result = body["result"] ?: run {
-                        notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                        throw ImageGenerationTerminalException(
-                            "Completed image task has no result (task=$taskId)",
+                    val result = body["result"] as? JsonObject
+                        ?: throw ImageTaskQueryException(
+                            taskId,
+                            message = "图片任务已完成，但结果暂时不可读取；任务已保留，稍后恢复下载",
                         )
-                    }
                     trace(
                         traceId,
                         "async_task_completed",
@@ -824,30 +839,36 @@ class OpenAIProvider(
                         )
                         delay(imageTaskPollIntervalMillis)
                     } catch (e: ImageGenerationTerminalException) {
-                        notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                        throw e
+                        // The generic image parser also serves synchronous requests and classifies
+                        // malformed results as terminal there. A completed durable task must remain
+                        // queryable. Do not keep that terminal exception in the cause chain: callers
+                        // inspect nested causes when deciding whether to discard recovery records.
+                        trace(traceId, "async_result_unreadable", "task_id=$taskId error=${e.javaClass.simpleName}")
+                        throw ImageTaskQueryException(
+                            taskId,
+                            message = "图片任务已完成，但返回结果暂时无法读取；任务已保留，稍后恢复下载",
+                        )
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                        throw ImageGenerationTerminalException(
-                            "Completed image task returned an invalid result (task=$taskId)",
-                            e,
+                        trace(traceId, "async_result_unreadable", "task_id=$taskId error=${e.javaClass.simpleName}")
+                        throw ImageTaskQueryException(
+                            taskId,
+                            message = "图片任务已完成，但返回结果暂时无法读取；任务已保留，稍后恢复下载",
                         )
                     }
                 }
 
-                "failed" -> {
+                "failed", "cancelled", "canceled" -> {
                     notifyTaskFailureBestEffort(onTaskFailed, taskId)
                     val detail = (body["error"] as? JsonObject)
-                        ?.get("message")?.jsonPrimitive?.contentOrNull
+                        ?.get("message")?.let { it as? JsonPrimitive }?.contentOrNull
                         ?: "Image generation task failed"
                     throw ImageGenerationTerminalException("Failed to generate image: $detail")
                 }
 
                 else -> {
-                    notifyTaskFailureBestEffort(onTaskFailed, taskId)
-                    throw ImageGenerationTerminalException(
+                    throw java.io.IOException(
                         "Unknown asynchronous image task status${status?.let { " '$it'" }.orEmpty()} (task=$taskId)",
                     )
                 }
@@ -857,6 +878,12 @@ class OpenAIProvider(
         @Suppress("UNREACHABLE_CODE")
         error("image task polling loop exited unexpectedly")
     }
+
+    private fun Response.isExpiredImageTaskResult(): Boolean = runCatching {
+        val body = json.parseToJsonElement(peekBody(ASYNC_IMAGE_ERROR_PEEK_BYTES).string()) as? JsonObject
+        val error = body?.get("error") as? JsonObject
+        (error?.get("code") as? JsonPrimitive)?.contentOrNull == "IMAGE_TASK_RESULT_EXPIRED"
+    }.getOrDefault(false)
 
     /** Prefer the gateway's backoff hint, while keeping a broken header from stalling recovery. */
     private fun pollRetryDelay(response: Response): Long {
@@ -943,7 +970,7 @@ class OpenAIProvider(
     /**
      * n>1 时多张图各自是一个远端 URL, 逐个串行下载会把等待时间直接乘以张数, 所以并发下.
      */
-    internal suspend fun parseImageResponse(
+    suspend fun parseImageResponse(
         bodyStr: String,
         requestTraceId: String = "",
         downloadKey: String = requestTraceId,
@@ -1434,7 +1461,6 @@ class OpenAIProvider(
 
         private const val IMAGE_DOWNLOAD_ATTEMPTS = 3
         private const val IMAGE_DOWNLOAD_RETRY_DELAY_MS = 500L
-        private const val CHAT_HTTP2_PING_INTERVAL_SECONDS = 15L
         private const val IMAGE_TASK_POLL_INTERVAL_MS = 3_000L
         private const val MAX_POLL_RETRY_DELAY_SECONDS = 30L
         private const val ASYNC_IMAGE_UNSUPPORTED_HEADER = "X-Sub2-Async-Image"

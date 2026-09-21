@@ -109,7 +109,10 @@ class ConversationSession(
         idleCheckJob?.cancel()
         idleCheckJob = scope.launch {
             delay(IDLE_TIMEOUT_MS)
-            if (refCount.get() <= 0 && !isGenerating) {
+            val idle = refCount.get() <= 0
+            val generating = isGenerating
+            Log.d(TAG, "idle_check $id refs=${refCount.get()} generating=$generating")
+            if (idle && !generating) {
                 onIdle(id)
             }
         }

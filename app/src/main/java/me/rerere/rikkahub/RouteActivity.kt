@@ -42,6 +42,8 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.navigation3.rememberViewModelStoreNavEntryDecorator
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
@@ -98,6 +100,8 @@ import me.rerere.rikkahub.ui.pages.search.SearchPage
 import me.rerere.rikkahub.data.auth.AuthTokenStore
 import me.rerere.rikkahub.data.repository.AccountRepository
 import me.rerere.rikkahub.data.repository.AuthState
+import me.rerere.rikkahub.data.sync.ChatBackupSync
+import me.rerere.rikkahub.data.sync.StartupRestoreState
 import me.rerere.rikkahub.ui.pages.auth.LoginPage
 import me.rerere.rikkahub.ui.pages.auth.RegisterPage
 import me.rerere.rikkahub.ui.pages.account.AccountPage
@@ -257,6 +261,8 @@ class RouteActivity : ComponentActivity() {
             }
         }
         val migrationState by DatabaseMigrationTracker.state.collectAsStateWithLifecycle()
+        val chatBackupSync = koinInject<ChatBackupSync>()
+        val restoreState by chatBackupSync.startupRestoreState.collectAsStateWithLifecycle()
 
         val authTokenStore = koinInject<AuthTokenStore>()
         // Read synchronously before the first composition: resolving auth in a
@@ -297,6 +303,16 @@ class RouteActivity : ComponentActivity() {
         val accountRepository = koinInject<AccountRepository>()
         val imageGenerationManager = koinInject<ImageGenerationManager>()
         val authState by accountRepository.state.collectAsStateWithLifecycle()
+        val recoveryScope = rememberCoroutineScope()
+        LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+            // Resuming an existing process does not change authState. Reconcile durable tasks
+            // here as well as on cold start; deduplication keeps healthy requests untouched.
+            recoveryScope.launch {
+                if (authTokenStore.currentTokens().isPresent) {
+                    imageGenerationManager.recoverPendingTasks()
+                }
+            }
+        }
         LaunchedEffect(authState) {
             if (authState is AuthState.Unauthenticated &&
                 backStack.lastOrNull() !is Screen.Login &&
@@ -306,9 +322,7 @@ class RouteActivity : ComponentActivity() {
                 backStack.clear()
                 backStack.add(Screen.Login)
             }
-            // Also the enforcement point for locked provider config: this re-runs
-            // ProviderInjector, so a stale model list or edited baseUrl from an older
-            // build or a restored backup is normalized on the first authenticated launch.
+            // Restore the account's catalog and refresh its selected gateway groups on startup.
             if (authState is AuthState.Authenticated) {
                 accountRepository.ensureKeysProvisioned()
                 imageGenerationManager.recoverPendingTasks()
@@ -386,6 +400,7 @@ class RouteActivity : ComponentActivity() {
                             entry<Screen.Tutorial> {
                                 val scope = rememberCoroutineScope()
                                 TutorialPage(
+                                    isLoggedIn = authState is AuthState.Authenticated,
                                     onComplete = {
                                         scope.launch {
                                             authTokenStore.setTutorialShown(true)
@@ -542,7 +557,8 @@ class RouteActivity : ComponentActivity() {
                         }
                     )
                     AnimatedVisibility(
-                        visible = migrationState is MigrationState.Migrating,
+                        visible = migrationState is MigrationState.Migrating ||
+                            restoreState is StartupRestoreState.Restoring,
                         enter = fadeIn(),
                         exit = fadeOut(),
                         modifier = Modifier.fillMaxSize()
@@ -560,10 +576,16 @@ class RouteActivity : ComponentActivity() {
                             ) {
                                 CircularProgressIndicator()
                                 Text(
-                                    text = stringResource(R.string.db_migrating),
+                                    text = stringResource(
+                                        if (restoreState is StartupRestoreState.Restoring) {
+                                            R.string.chat_restore_syncing
+                                        } else {
+                                            R.string.db_migrating
+                                        }
+                                    ),
                                     style = MaterialTheme.typography.bodyLarge
                                 )
-                                if (state != null) {
+                                if (state != null && restoreState !is StartupRestoreState.Restoring) {
                                     Text(
                                         text = "v${state.from} → v${state.to}",
                                         style = MaterialTheme.typography.bodySmall,

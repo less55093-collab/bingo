@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessageAnnotation
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.finishGeneration
 import me.rerere.ai.ui.finishPendingTools
@@ -402,4 +403,34 @@ internal fun Conversation.markGenerationInterrupted(
         },
         updateAt = updateAt,
     )
+}
+
+internal fun Conversation.clearReplyPending(): Conversation = copy(
+    messageNodes = messageNodes.map { node ->
+        node.copy(messages = node.messages.map { message ->
+            if (message.id == node.currentMessage.id) message.copy(
+                annotations = message.annotations.filterNot { it is UIMessageAnnotation.ReplyPending },
+            ) else message
+        })
+    },
+)
+
+internal fun Conversation.withGenerationFailure(
+    target: StreamGenerationTarget?,
+    detail: String,
+): Conversation {
+    val targetIndex = generationNodeIndex(target)
+    if (targetIndex < 0) return clearReplyPending()
+    val current = generationMessage(target) ?: messageNodes[targetIndex].currentMessage
+    val failed = current.finishGeneration().copy(
+        annotations = current.annotations.filterNot {
+            it is UIMessageAnnotation.GenerationFailure || it is UIMessageAnnotation.ReplyPending
+        } + UIMessageAnnotation.GenerationFailure(detail),
+    )
+    return copy(messageNodes = messageNodes.toMutableList().also { nodes ->
+        val node = nodes[targetIndex]
+        nodes[targetIndex] = node.copy(messages = node.messages.map {
+            if (it.id == current.id) failed else it
+        })
+    }).clearReplyPending()
 }

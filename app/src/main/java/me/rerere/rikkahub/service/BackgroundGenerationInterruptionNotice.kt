@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import me.rerere.ai.provider.StreamInterruptedException
+import me.rerere.ai.provider.ModelRequestException
 
 internal enum class BackgroundGenerationNoticeKind {
     FIRST_MESSAGE,
@@ -24,7 +25,8 @@ internal fun shouldShowBackgroundGenerationNotice(
     alreadyPending: Boolean,
 ): Boolean = !appInForeground &&
     !protectionLost &&
-    error is StreamInterruptedException &&
+    (error is StreamInterruptedException ||
+        (error is ModelRequestException && error.cause is StreamInterruptedException)) &&
     !alreadyHandled &&
     !alreadyPending
 

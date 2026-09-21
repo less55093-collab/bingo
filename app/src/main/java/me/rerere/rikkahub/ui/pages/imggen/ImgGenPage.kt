@@ -220,6 +220,7 @@ private fun ImageGenScreen(vm: ImgGenVM) {
     val currentGeneratedImages by vm.currentGeneratedImages.collectAsStateWithLifecycle()
     val referenceImages by vm.referenceImages.collectAsStateWithLifecycle()
     val error by vm.error.collectAsStateWithLifecycle()
+    val waitingForRecovery by vm.waitingForRecovery.collectAsStateWithLifecycle()
     val settings by vm.settingsStore.settingsFlow.collectAsStateWithLifecycle()
     val selectedModel = settings.findModelById(settings.imageGenerationModelId)
     val context = LocalContext.current
@@ -426,11 +427,20 @@ private fun ImageGenScreen(vm: ImgGenVM) {
         )
 
         when {
+            waitingForRecovery -> {
+                Text(
+                    "任务已保留，等待恢复连接。回到前台后会自动继续获取结果，请勿重复生成。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                )
+            }
             isGenerating -> {
                 ImageGenerationLoading(
                     progress = progress,
                     showSlowHint = slowHint,
                     loading = true,
+                    loadingText = "正在提交或等待生图模型返回，请先保持 App 在前台",
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(240.dp),

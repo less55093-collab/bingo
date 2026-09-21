@@ -87,6 +87,13 @@ object ModelRegistry {
         toolReasoningAbility()
     }
 
+    private val GPT_6 = defineModel {
+        tokens("gpt", "6")
+        notTokens("image")
+        visionInput()
+        toolReasoningAbility()
+    }
+
     private val GEMINI_20_FLASH = defineModel {
         tokens("gemini", "2", "0", "flash")
         visionInput()
@@ -514,6 +521,7 @@ object ModelRegistry {
     }
 
     private val ALL_MODELS = listOf(
+        GPT_6,
         GPT4O,
         GPT_4_1,
         OPENAI_O_MODELS,

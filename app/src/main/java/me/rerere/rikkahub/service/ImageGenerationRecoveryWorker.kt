@@ -79,12 +79,13 @@ class ImageGenerationRecoveryWorker(
                 // The dedicated generation service is the actual owner. A notification/bridge
                 // promotion failure is recoverable through the durable retry below.
             }
+            manager.reconcileAccountImageTasks()
             if (!manager.hasPendingTasks()) return Result.success()
             // This worker can start before RouteActivity. Reconcile locked provider settings and
             // rotated image keys here so a stale key cannot turn a recoverable task into a false
             // terminal auth failure. A provisioning error retains the pending task for the next
             // fixed-backoff wake.
-            if (!accountRepository.ensureKeysProvisioned()) return reschedule()
+            if (!manager.hasSavedRecoveryCredentials() && !accountRepository.ensureKeysProvisioned()) return reschedule()
             manager.recoverPendingTasks()
             // Keep a durable WorkManager wake-up pending while a record remains. The in-process
             // generation job is de-duplicated by request id, so heartbeats only matter after

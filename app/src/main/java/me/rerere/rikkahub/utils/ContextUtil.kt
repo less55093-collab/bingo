@@ -112,18 +112,28 @@ fun Context.openUsageAccessSettings() {
     }
 }
 
-/** Opens the vendor-controlled per-app background policy screen when the device exposes it. */
+fun Context.isGenerationBatteryExempt(): Boolean =
+    (getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager)
+        ?.isIgnoringBatteryOptimizations(packageName) == true
+
+/** The OS always asks the user; applications cannot grant themselves this exemption. */
+@android.annotation.SuppressLint("BatteryLife")
 fun Context.openBackgroundGenerationSettings() {
-    runCatching {
-        startActivity(
-            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+    val candidates = buildList {
+        if (!isGenerationBatteryExempt()) {
+            add(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                 data = Uri.fromParts("package", packageName, null)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        )
-    }.onFailure {
-        Log.e(TAG, "openBackgroundGenerationSettings failed", it)
+            })
+            add(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+        add(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
+        })
     }
+    for (intent in candidates) {
+        if (runCatching { startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess) return
+    }
+    Log.w(TAG, "No background policy settings screen is available")
 }
 
 /**

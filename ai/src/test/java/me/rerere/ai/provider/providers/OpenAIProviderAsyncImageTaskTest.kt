@@ -51,6 +51,25 @@ class OpenAIProviderAsyncImageTaskTest {
     )
 
     @Test
+    fun `unreadable completed result resumes with GET and never creates another image`() = runBlocking {
+        server.enqueue(jsonResponse(202, TASK_SUBMITTED))
+        server.enqueue(jsonResponse(200, """{"task_id":"imgtask_test","status":"completed","result":{"data":[]}}"""))
+        server.enqueue(jsonResponse(200, TASK_COMPLETED))
+        var submitted = ""
+        var failures = 0
+        val initial = runCatching {
+            provider.generateImage(setting(), ImageGenerationParams(model = model(), prompt = "circle",
+                idempotencyKey = "stable-operation", onTaskSubmitted = { submitted = it },
+                onTaskFailed = { failures++ })).toList()
+        }
+        assertTrue(initial.exceptionOrNull() is ImageTaskQueryException)
+        val recovered = provider.resumeImageTask(setting(), submitted, onTaskFailed = { failures++ }).toList()
+        assertEquals("AAAA", recovered.single().data)
+        assertEquals(0, failures)
+        assertEquals(listOf("POST", "GET", "GET"), List(3) { server.takeRequest().method })
+    }
+
+    @Test
     fun `generation submits once then polls until completed`() = runBlocking {
         server.enqueue(jsonResponse(202, TASK_SUBMITTED))
         server.enqueue(jsonResponse(200, TASK_PROCESSING))
@@ -442,7 +461,7 @@ class OpenAIProviderAsyncImageTaskTest {
     }
 
     @Test
-    fun `missing task invokes terminal callback`() {
+    fun `missing task keeps the paid task recoverable`() {
         server.enqueue(jsonResponse(202, TASK_SUBMITTED))
         server.enqueue(
             jsonResponse(404, """{"error":{"message":"image task not found"}}""")
@@ -462,7 +481,7 @@ class OpenAIProviderAsyncImageTaskTest {
             }
         }
 
-        assertEquals("imgtask_test", failedTask)
+        assertEquals("", failedTask)
     }
 
     @Test
@@ -620,7 +639,7 @@ class OpenAIProviderAsyncImageTaskTest {
     }
 
     @Test
-    fun `resume invokes terminal callback once only after every key returns not found`() {
+    fun `resume retains task after every key returns not found`() {
         server.enqueue(jsonResponse(404, """{"error":{"message":"image task not found"}}"""))
         server.enqueue(jsonResponse(404, """{"error":{"message":"image task not found"}}"""))
         var failures = 0
@@ -637,7 +656,8 @@ class OpenAIProviderAsyncImageTaskTest {
         }
 
         assertTrue(result.isFailure)
-        assertEquals(1, failures)
+        assertTrue(result.exceptionOrNull() is ImageTaskQueryException)
+        assertEquals(0, failures)
         assertEquals("Bearer sk-second", server.takeRequest().headers["Authorization"])
         assertEquals("Bearer sk-first", server.takeRequest().headers["Authorization"])
         assertEquals(2, server.requestCount)
@@ -672,7 +692,7 @@ class OpenAIProviderAsyncImageTaskTest {
     }
 
     @Test
-    fun `completed task without image data is terminal and clears the task`() = runBlocking {
+    fun `completed task with temporarily unreadable data is retained`() = runBlocking {
         server.enqueue(jsonResponse(202, TASK_SUBMITTED))
         server.enqueue(
             jsonResponse(
@@ -693,13 +713,13 @@ class OpenAIProviderAsyncImageTaskTest {
             ).toList()
         }
 
-        assertTrue(result.exceptionOrNull() is ImageGenerationTerminalException)
-        assertEquals(1, failures)
+        assertTrue(result.exceptionOrNull() is ImageTaskQueryException)
+        assertEquals(0, failures)
         assertEquals(2, server.requestCount)
     }
 
     @Test
-    fun `non transient poll failure is terminal instead of retrying forever`() = runBlocking {
+    fun `expired key pauses polling and preserves task for login recovery`() = runBlocking {
         server.enqueue(jsonResponse(202, TASK_SUBMITTED))
         server.enqueue(jsonResponse(401, """{"error":{"message":"invalid key"}}"""))
         var failures = 0
@@ -715,13 +735,13 @@ class OpenAIProviderAsyncImageTaskTest {
             ).toList()
         }
 
-        assertTrue(result.exceptionOrNull() is ImageGenerationTerminalException)
-        assertEquals(1, failures)
+        assertTrue(result.exceptionOrNull() is ImageTaskQueryException)
+        assertEquals(0, failures)
         assertEquals(2, server.requestCount)
     }
 
     @Test
-    fun `accepted response without task id is terminal and clears correlation`() = runBlocking {
+    fun `accepted response without task id retains original correlation`() = runBlocking {
         server.enqueue(jsonResponse(202, """{"status":"processing"}"""))
         var failedCorrelation = ""
 
@@ -737,8 +757,8 @@ class OpenAIProviderAsyncImageTaskTest {
             ).toList()
         }
 
-        assertTrue(result.exceptionOrNull() is ImageGenerationTerminalException)
-        assertEquals("missing-task-id", failedCorrelation)
+        assertTrue(result.exceptionOrNull() is ImageTaskQueryException)
+        assertEquals("", failedCorrelation)
         assertEquals(1, server.requestCount)
     }
 

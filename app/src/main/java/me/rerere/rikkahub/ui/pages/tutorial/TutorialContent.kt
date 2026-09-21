@@ -1,42 +1,53 @@
 package me.rerere.rikkahub.ui.pages.tutorial
 
+import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import me.rerere.rikkahub.R
 
-/**
- * What the step's primary button does. Kept as a sealed type rather than a lambda so the content
- * list stays a plain value that can be declared at the top level.
- */
-enum class TutorialAction { None }
-
-enum class TutorialPreview { Idea, Plan, Result }
+data class TutorialImage(
+    @StringRes val label: Int,
+    @DrawableRes val preview: Int,
+    @DrawableRes val detail: Int = preview,
+)
 
 data class TutorialStep(
     @StringRes val title: Int,
     @StringRes val body: Int,
-    val preview: TutorialPreview,
-    val action: TutorialAction = TutorialAction.None,
-    @StringRes val actionLabel: Int? = null,
+    @StringRes val instruction: Int,
+    val images: List<TutorialImage>,
 )
 
-/**
- * Copy and illustrations ship in-app rather than being fetched: the tutorial has to work before the
- * user has an account, a balance, or any reason to trust the network.
- */
-val TutorialSteps: List<TutorialStep> = listOf(
+// First-run examples must be available before login and without a network connection.
+val TutorialSteps = listOf(
     TutorialStep(
-        title = R.string.tutorial_step_idea_title,
-        body = R.string.tutorial_step_idea_body,
-        preview = TutorialPreview.Idea,
+        R.string.tutorial_shop_copy_title,
+        R.string.tutorial_shop_copy_body,
+        R.string.tutorial_shop_copy_instruction,
+        listOf(TutorialImage(R.string.tutorial_shop_copy_example, R.drawable.tutorial_shop_copy, R.drawable.tutorial_shop_chat)),
     ),
     TutorialStep(
-        title = R.string.tutorial_step_plan_title,
-        body = R.string.tutorial_step_plan_body,
-        preview = TutorialPreview.Plan,
+        R.string.tutorial_shop_models_title,
+        R.string.tutorial_shop_models_body,
+        R.string.tutorial_shop_models_instruction,
+        listOf(
+            TutorialImage(R.string.tutorial_shop_models_example, R.drawable.tutorial_shop_models),
+            TutorialImage(R.string.tutorial_shop_groups_example, R.drawable.tutorial_shop_groups),
+        ),
     ),
     TutorialStep(
-        title = R.string.tutorial_step_approve_title,
-        body = R.string.tutorial_step_approve_body,
-        preview = TutorialPreview.Result,
+        R.string.tutorial_shop_image_title,
+        R.string.tutorial_shop_image_body,
+        R.string.tutorial_shop_image_instruction,
+        listOf(
+            TutorialImage(R.string.tutorial_shop_result_example, R.drawable.tutorial_shop_result),
+            TutorialImage(R.string.tutorial_shop_product_example, R.drawable.tutorial_shop_product),
+            TutorialImage(R.string.tutorial_shop_plan_example, R.drawable.tutorial_shop_plan, R.drawable.tutorial_shop_plan_full),
+        ),
+    ),
+    TutorialStep(
+        R.string.tutorial_shop_gallery_title,
+        R.string.tutorial_shop_gallery_body,
+        R.string.tutorial_shop_gallery_instruction,
+        listOf(TutorialImage(R.string.tutorial_shop_gallery_example, R.drawable.tutorial_shop_gallery)),
     ),
 )

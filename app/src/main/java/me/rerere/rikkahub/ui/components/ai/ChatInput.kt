@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
@@ -70,6 +71,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
@@ -94,6 +96,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.getQuickMessagesOfAssistant
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
@@ -131,6 +134,8 @@ fun ChatInput(
     onCancelClick: () -> Unit,
     onSendClick: () -> Unit,
     onLongSendClick: () -> Unit,
+    onUpdateImageModel: (Model) -> Unit = {},
+    onOpenImageGen: () -> Unit = {},
 ) {
     val toaster = LocalToaster.current
     val assistant = settings.getCurrentAssistant()
@@ -160,7 +165,9 @@ fun ChatInput(
     fun sendMessageWithoutAnswer() {
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
-        if (loading) onCancelClick() else onLongSendClick()
+        if (loading) onCancelClick()
+        else if (state.directImageGeneration && !state.isEditing()) onSendClick()
+        else onLongSendClick()
     }
 
     val asr = LocalASRState.current
@@ -228,6 +235,60 @@ fun ChatInput(
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
+                    if (!state.isEditing()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Surface(
+                                selected = true,
+                                onClick = {},
+                                enabled = !loading,
+                                shape = RoundedCornerShape(20.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                                modifier = Modifier.weight(1f).height(40.dp),
+                            ) {
+                                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                                    Text(
+                                        "聊天生图",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        textAlign = TextAlign.Center,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    )
+                                }
+                            }
+                            Surface(
+                                onClick = onOpenImageGen,
+                                enabled = !loading,
+                                shape = RoundedCornerShape(20.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .testTag("chat_open_image_gen"),
+                            ) {
+                                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                                    Text(
+                                        "专业生图",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                            }
+                        }
+                        if (state.directImageGeneration) {
+                            val imageModel = settings.findModelById(settings.imageGenerationModelId)
+                            Text(
+                                text = imageModel?.let { "生图模型：${it.modelId} · 每次生成一张" }
+                                    ?: "当前生图模型不可用，点左侧模型图标选择生图模型",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (imageModel == null) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                     if (state.messageContent.isNotEmpty()) {
                         MediaFileInputRow(state = state)
                     }
@@ -251,53 +312,63 @@ fun ChatInput(
                                 .horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
-                            // Model Picker
+                            val chatModelId = assistant.chatModelId ?: settings.chatModelId
+                            val imageModelId = settings.imageGenerationModelId
                             ModelSelector(
-                                modelId = assistant.chatModelId ?: settings.chatModelId,
+                                modelId = if (state.directImageGeneration) imageModelId else chatModelId,
                                 providers = settings.providers,
-                                onSelect = {
-                                    onUpdateChatModel(it)
+                                onSelect = { model ->
+                                    if (model.type == ModelType.IMAGE) {
+                                        state.directImageGeneration = true
+                                        onUpdateImageModel(model)
+                                    } else {
+                                        state.directImageGeneration = false
+                                        onUpdateChatModel(model)
+                                    }
                                 },
-                                type = ModelType.CHAT,
+                                type = if (state.directImageGeneration) ModelType.IMAGE else ModelType.CHAT,
+                                secondaryType = if (state.directImageGeneration) ModelType.CHAT else ModelType.IMAGE,
+                                secondaryModelId = if (state.directImageGeneration) chatModelId else imageModelId,
                                 onlyIcon = true,
                                 modifier = Modifier,
                             )
 
-                            // Search
-                            val enableSearchMsg = stringResource(R.string.web_search_enabled)
-                            val disableSearchMsg = stringResource(R.string.web_search_disabled)
-                            val chatModel = settings.getCurrentChatModel()
-                            SearchPickerButton(
-                                enableSearch = enableSearch,
-                                settings = settings,
-                                onToggleSearch = { enabled ->
-                                    onToggleSearch(enabled)
-                                    toaster.show(
-                                        message = if (enabled) enableSearchMsg else disableSearchMsg,
-                                        duration = 1.seconds,
-                                        type = if (enabled) {
-                                            ToastType.Success
-                                        } else {
-                                            ToastType.Normal
-                                        }
-                                    )
-                                },
-                                onUpdateSearchService = onUpdateSearchService,
-                                model = chatModel,
-                            )
-
-                            // Reasoning
-                            val model = settings.getCurrentChatModel()
-                            if (model?.abilities?.contains(ModelAbility.REASONING) == true) {
-                                ReasoningButton(
-                                    reasoningLevel = assistant.reasoningLevel,
-                                    onUpdateReasoningLevel = {
-                                        onUpdateAssistant(assistant.copy(reasoningLevel = it))
+                            if (!state.directImageGeneration || state.isEditing()) {
+                                val enableSearchMsg = stringResource(R.string.web_search_enabled)
+                                val disableSearchMsg = stringResource(R.string.web_search_disabled)
+                                val chatModel = settings.getCurrentChatModel()
+                                SearchPickerButton(
+                                    enableSearch = enableSearch,
+                                    settings = settings,
+                                    onToggleSearch = { enabled ->
+                                        onToggleSearch(enabled)
+                                        toaster.show(
+                                            message = if (enabled) enableSearchMsg else disableSearchMsg,
+                                            duration = 1.seconds,
+                                            type = if (enabled) ToastType.Success else ToastType.Normal,
+                                        )
                                     },
-                                    onlyIcon = true,
+                                    onUpdateSearchService = onUpdateSearchService,
+                                    model = chatModel,
+                                )
+
+                                if (settings.getCurrentChatModel() != null) {
+                                    ReasoningButton(
+                                        reasoningLevel = assistant.reasoningLevel,
+                                        onUpdateReasoningLevel = {
+                                            onUpdateAssistant(assistant.copy(reasoningLevel = it))
+                                        },
+                                        onlyIcon = false,
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    "发送后直接生成，可在作品中查看",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(vertical = 8.dp),
                                 )
                             }
-
                         }
 
                         ActionIconButton(
@@ -554,7 +625,9 @@ private fun TextInputRow(
                 },
             shape = MaterialTheme.shapes.largeIncreased,
             placeholder = {
-                Text(stringResource(R.string.chat_input_placeholder))
+                Text(if (state.directImageGeneration && !state.isEditing()) {
+                    "描述要生成的图片，可添加参考图"
+                } else stringResource(R.string.chat_input_placeholder))
             },
             lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 5),
             keyboardOptions = KeyboardOptions(

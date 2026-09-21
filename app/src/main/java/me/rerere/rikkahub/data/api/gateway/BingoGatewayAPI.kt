@@ -31,6 +31,17 @@ import retrofit2.http.Query
  */
 interface BingoGatewayAPI {
 
+    @GET("api/v1/user/image-tasks")
+    suspend fun imageTasks(@Query("cursor") cursor: String = "0"):
+        me.rerere.rikkahub.data.model.gateway.GatewayImageTaskPage
+
+    @GET("api/v1/user/image-tasks/{id}")
+    suspend fun imageTask(@Path("id") id: String):
+        me.rerere.rikkahub.data.model.gateway.GatewayImageTask
+
+    @GET("api/v1/groups/available")
+    suspend fun availableGroups(): GatewayEnvelope<List<me.rerere.rikkahub.data.model.gateway.GatewayGroup>>
+
     @POST("api/v1/auth/send-verify-code")
     suspend fun sendVerifyCode(@Body body: SendVerifyCodeRequest): GatewayEnvelope<Unit>
 

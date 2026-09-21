@@ -23,10 +23,46 @@ class SettingVM(
     private val s3Sync: S3Sync,
     private val authTokenStore: AuthTokenStore,
     private val s3CredentialStore: S3CredentialStore,
+    private val keyProvisioner: me.rerere.rikkahub.data.auth.KeyProvisioner,
 ) :
     ViewModel() {
     val settings: StateFlow<Settings> = settingsStore.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Lazily, Settings(init = true, providers = emptyList()))
+
+    val gatewaySync = keyProvisioner.syncState
+    val gatewayRouting = authTokenStore.gatewayRoutingFlow.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5_000),
+        me.rerere.rikkahub.data.model.gateway.GatewayRouting(),
+    )
+
+    fun refreshGateway() {
+        if (gatewaySync.value.loading) return
+        viewModelScope.launch {
+            try {
+                keyProvisioner.refresh()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // The provisioner exposes a safe, actionable error via gatewaySync.
+            }
+        }
+    }
+
+    fun selectGatewayGroup(purpose: me.rerere.rikkahub.data.model.gateway.GatewayPurpose, groupId: Int) {
+        if (gatewaySync.value.loading) return
+        viewModelScope.launch { keyProvisioner.switchGroup(purpose, groupId) }
+    }
+
+    fun selectGatewayModel(purpose: me.rerere.rikkahub.data.model.gateway.GatewayPurpose, id: kotlin.uuid.Uuid) {
+        viewModelScope.launch {
+            settingsStore.update { current ->
+                if (current.providers.none { provider -> provider.models.any { it.id == id } }) current
+                else if (purpose == me.rerere.rikkahub.data.model.gateway.GatewayPurpose.CHAT)
+                    current.copy(chatModelId = id)
+                else current.copy(imageGenerationModelId = id)
+            }
+        }
+    }
 
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {

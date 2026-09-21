@@ -25,6 +25,9 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.core.app.NotificationManagerCompat
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.DisplaySetting
@@ -34,6 +37,7 @@ import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.openBackgroundGenerationSettings
+import me.rerere.rikkahub.utils.isGenerationBatteryExempt
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
 
@@ -43,6 +47,12 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
     val navController = LocalNavController.current
     val settings by vm.settings.collectAsStateWithLifecycle()
     var displaySetting by remember(settings) { mutableStateOf(settings.displaySetting) }
+    var batteryExempt by remember { mutableStateOf(context.isGenerationBatteryExempt()) }
+    var notificationsAllowed by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        batteryExempt = context.isGenerationBatteryExempt()
+        notificationsAllowed = NotificationManagerCompat.from(context).areNotificationsEnabled()
+    }
 
     fun updateDisplaySetting(setting: DisplaySetting) {
         displaySetting = setting
@@ -280,8 +290,20 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                         onClick = {
                             context.openBackgroundGenerationSettings()
                         },
-                        headlineContent = { Text(stringResource(R.string.setting_background_generation_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_background_generation_desc)) },
+                        headlineContent = { Text("后台运行权限") },
+                        supportingContent = {
+                            Text(if (batteryExempt) "已关闭 Android 电池优化。部分手机还需在应用信息中允许后台活动。"
+                            else "Android 电池优化仍开启。点击申请放宽限制，可减少后台中断；已提交的生图任务会在回到 App 后继续获取结果。")
+                        },
+                    )
+                    item(
+                        onClick = {
+                            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+                        },
+                        headlineContent = { Text("生成完成通知") },
+                        supportingContent = { Text(if (notificationsAllowed) "系统已允许通知。后台受限时，通知仍可能延迟。"
+                            else "系统未允许通知。点击开启后，可接收生成完成提醒。") },
                     )
                 }
             }

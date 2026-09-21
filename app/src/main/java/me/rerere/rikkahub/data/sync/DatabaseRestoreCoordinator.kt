@@ -22,6 +22,8 @@ internal object DatabaseRestoreCoordinator {
     private const val MARKER = "pending"
     private const val TARGET_DATABASE = "target_database"
 
+    fun hasPending(context: Context): Boolean = File(directory(context), MARKER).exists()
+
     fun stage(
         context: Context,
         source: File,

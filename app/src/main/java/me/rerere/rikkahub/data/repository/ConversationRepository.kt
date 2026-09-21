@@ -11,9 +11,12 @@ import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessageAnnotation
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.markGenerationInterrupted
 import me.rerere.rikkahub.data.db.AppDatabase
@@ -29,6 +32,8 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.service.withImageDeliveries
+import me.rerere.rikkahub.service.ImageOperationContext
 import java.time.Instant
 import kotlin.uuid.Uuid
 
@@ -40,6 +45,70 @@ class ConversationRepository(
     private val filesManager: FilesManager,
     private val messageFtsManager: MessageFtsManager,
 ) {
+    private val _imageDeliveries = MutableSharedFlow<Pair<Uuid, UIMessage>>(extraBufferCapacity = 64)
+    val imageDeliveries = _imageDeliveries.asSharedFlow()
+
+    suspend fun findImageDelivery(operation: ImageOperationContext): UIMessageAnnotation.ImageDelivery? =
+        messageNodeDAO.getNodesContainingMessage(operation.conversationId, operation.messageId)
+            .flatMap { JsonInstant.decodeFromString<List<UIMessage>>(it.messages) }
+            .filter { it.id.toString() == operation.messageId }
+            .flatMap { it.annotations.filterIsInstance<UIMessageAnnotation.ImageDelivery>() }
+            .lastOrNull { it.requestId == operation.requestId && it.error == null && it.imageUrls.isNotEmpty() }
+
+    /** The saved tool identity can repair associations even if the local task journal was damaged. */
+    suspend fun findImageTaskOrigin(requestId: String): ImageOperationContext? {
+        var offset = 0
+        while (true) {
+            val nodes = messageNodeDAO.getImageToolNodes(64, offset)
+            if (nodes.isEmpty()) return null
+            nodes.forEach { node ->
+                val messages = runCatching { JsonInstant.decodeFromString<List<UIMessage>>(node.messages) }
+                    .getOrElse { emptyList() }
+                messages.forEach { message ->
+                    message.getTools().filter { it.toolName == "generate_image" || it.toolName == "plan_image_generation" }
+                        .forEach { tool ->
+                            for (index in 0..2) {
+                                val origin = ImageOperationContext(node.conversationId, message.id.toString(), tool.toolCallId, index)
+                                if (origin.requestId == requestId) return origin
+                            }
+                        }
+                }
+            }
+            offset += nodes.size
+        }
+    }
+
+    /** The caller retains its task until this transaction succeeds. Deleted chats stay deleted. */
+    suspend fun deliverImageResult(
+        conversationId: String,
+        messageId: String,
+        receipt: UIMessageAnnotation.ImageDelivery,
+    ) {
+        var deliveredMessage: UIMessage? = null
+        database.withTransaction {
+            messageNodeDAO.getNodesContainingMessage(conversationId, messageId).forEach { node ->
+                val messages = JsonInstant.decodeFromString<List<UIMessage>>(node.messages)
+                if (messages.none { it.id.toString() == messageId }) return@forEach
+                val updated = messages.map { message ->
+                    if (message.id.toString() != messageId) message
+                    else message.withImageDeliveries(listOf(receipt)).also { deliveredMessage = it }
+                }
+                messageNodeDAO.update(node.copy(messages = JsonInstant.encodeToString(updated)))
+            }
+        }
+        deliveredMessage?.let { _imageDeliveries.emit(Uuid.parse(conversationId) to it) }
+    }
+
+    private suspend fun preserveImageDeliveries(conversation: Conversation): Conversation {
+        val receipts = messageNodeDAO.getNodesWithImageDeliveries(conversation.id.toString())
+            .flatMap { JsonInstant.decodeFromString<List<UIMessage>>(it.messages) }
+            .associate { it.id to it.annotations.filterIsInstance<UIMessageAnnotation.ImageDelivery>() }
+        return conversation.copy(messageNodes = conversation.messageNodes.map { node ->
+            node.copy(messages = node.messages.map { message ->
+                message.withImageDeliveries(receipts[message.id].orEmpty())
+            })
+        })
+    }
     companion object {
         private const val PAGE_SIZE = 20
         private const val INITIAL_LOAD_SIZE = 40
@@ -300,15 +369,17 @@ class ConversationRepository(
     }
 
     suspend fun updateConversation(conversation: Conversation) {
+        var saved = conversation
         database.withTransaction {
+            saved = preserveImageDeliveries(conversation)
             conversationDAO.update(
-                conversationToConversationEntity(conversation)
+                conversationToConversationEntity(saved)
             )
             // 删除旧的节点，插入新的节点
             messageNodeDAO.deleteByConversation(conversation.id.toString())
-            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            saveMessageNodes(saved.id.toString(), saved.messageNodes)
         }
-        messageFtsManager.indexConversation(conversation)
+        messageFtsManager.indexConversation(saved)
     }
 
     /**
@@ -317,8 +388,9 @@ class ConversationRepository(
      */
     suspend fun saveStreamingSnapshot(conversation: Conversation) {
         database.withTransaction {
-            conversationDAO.update(conversationToConversationEntity(conversation))
-            upsertMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            val saved = preserveImageDeliveries(conversation)
+            conversationDAO.update(conversationToConversationEntity(saved))
+            upsertMessageNodes(saved.id.toString(), saved.messageNodes)
         }
     }
 
@@ -535,6 +607,22 @@ class ConversationRepository(
 internal fun Conversation.recoverSelectedGeneration(
     recoveredAt: Instant = Instant.now(),
 ): Conversation? {
+    val lastNode = messageNodes.lastOrNull()
+    val lastMessage = lastNode?.currentMessage
+    if (lastMessage?.role == MessageRole.USER &&
+        lastMessage.annotations.any { it is UIMessageAnnotation.ReplyPending }) {
+        val recoveredMessage = lastMessage.copy(annotations = lastMessage.annotations.filterNot {
+            it is UIMessageAnnotation.ReplyPending
+        } + UIMessageAnnotation.GenerationFailure(
+            "上次请求在收到回复前中断，消息已保留。请保持 App 在前台后点击重试；本次没有自动重新提交。",
+        ))
+        return copy(
+            messageNodes = messageNodes.dropLast(1) + lastNode.copy(messages = lastNode.messages.map {
+                if (it.id == lastMessage.id) recoveredMessage else it
+            }),
+            updateAt = recoveredAt,
+        )
+    }
     val selectedAssistant = messageNodes
         .withIndex()
         .lastOrNull { (_, node) -> node.currentMessage.role == MessageRole.ASSISTANT }

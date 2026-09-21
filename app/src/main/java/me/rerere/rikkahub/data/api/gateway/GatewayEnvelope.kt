@@ -51,7 +51,7 @@ object GatewayReasons {
     const val INVALID_VERIFY_CODE = "INVALID_VERIFY_CODE"
 }
 
-/** Group ids on api.bingoapi.top. Not discoverable at runtime: `/admin/groups` is admin-only. */
+/** Legacy defaults, used only when first migrating an account without a saved selection. */
 object GatewayGroups {
     /** deepseek platform, rate multiplier 1.2 — serves the deepseek-* models. */
     const val CHAT = 29
