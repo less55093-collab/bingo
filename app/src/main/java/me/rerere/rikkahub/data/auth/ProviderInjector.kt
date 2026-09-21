@@ -89,6 +89,7 @@ object ProviderInjector {
         val active = routing.enforceGroupRestrictions()
         val existing = settings.providers.flatMap { it.models }.associateBy { it.id }
         val models = (models(active.chat, GatewayPurpose.CHAT) + models(active.image, GatewayPurpose.IMAGE))
+            .distinctBy { it.id }
             .map { model -> model.copy(tools = (existing[model.id]?.tools ?: model.tools)
                 .filterNot { it == BuiltInTools.ImageGeneration }.toSet()) }
         val chatIds = models.filter { it.type == ModelType.CHAT }.map { it.id }

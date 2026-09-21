@@ -337,7 +337,7 @@ private fun ColumnScope.ModelList(
         if (model.type !in listedTypes) return@mapNotNull null
         val provider = model.findProvider(providers = settings.value.providers, checkOverwrite = false) ?: return@mapNotNull null
         model to provider
-    }
+    }.distinctBy { it.first.id }
 
     var searchKeywords by remember { mutableStateOf("") }
 
@@ -552,7 +552,7 @@ private fun ColumnScope.ModelList(
             listedTypes.forEach { sectionType ->
                 val sectionModels = providers.flatMap { providerSetting ->
                     searchFilteredModelsByProvider[providerSetting.id].orEmpty().fastFilter { it.type == sectionType }
-                }
+                }.distinctBy { it.id }
                 stickyHeader(key = "header:${sectionType.name}") {
                     Text(
                         text = modelTypeSectionTitle(sectionType),
@@ -577,7 +577,7 @@ private fun ColumnScope.ModelList(
                 } else {
                     items(
                         items = sectionModels,
-                        key = { "${sectionType.name}:${it.id}" }
+                        key = { model -> "${sectionType.name}:${model.id}:${model.modelId}" }
                     ) { model ->
                         ModelPickRow(
                             model = model,
@@ -600,9 +600,10 @@ private fun ColumnScope.ModelList(
             }
         } else {
             providers.fastForEach { providerSetting ->
+                val providerModels = searchFilteredModelsByProvider[providerSetting.id].orEmpty().distinctBy { it.id }
                 items(
-                    items = searchFilteredModelsByProvider[providerSetting.id].orEmpty(),
-                    key = { it.id }
+                    items = providerModels,
+                    key = { model -> "${providerSetting.id}:${model.id}:${model.modelId}" }
                 ) { model ->
                     ModelPickRow(
                         model = model,

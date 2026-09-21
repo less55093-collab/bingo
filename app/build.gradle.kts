@@ -20,8 +20,8 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 20
-        versionName = "1.0.18"
+        versionCode = 21
+        versionName = "1.0.19"
 
         // 版本更新检查地址. 指向一个返回 UpdateInfo JSON 的静态文件即可,
         // 格式见 UpdateChecker.kt 中 UpdateInfo/UpdateDownload 的定义.
@@ -71,6 +71,10 @@ android {
                     storePassword = storePasswordValue
                     keyAlias = keyAliasValue
                     keyPassword = keyPasswordValue
+                    enableV1Signing = true
+                    enableV2Signing = true
+                    enableV3Signing = true
+                    enableV4Signing = false
                 }
             }
         }
