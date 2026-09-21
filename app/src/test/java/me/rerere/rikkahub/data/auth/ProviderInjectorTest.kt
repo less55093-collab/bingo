@@ -17,17 +17,17 @@ class ProviderInjectorTest {
 
     private val routing = GatewayRouting(
         chat = binding(16, "openai", "gpt-5.6-sol", "new-upstream-model"),
-        image = binding(2, "openai", "gpt-image-2", "custom-image-model"),
+        image = binding(2, "openai", "gpt-image-2.5", "custom-image-model"),
     )
 
     private fun Settings.models() = providers.single().models
 
     @Test fun `new upstream entries appear without a client allowlist`() {
         val settings = ProviderInjector.inject(Settings(), routing)
-        assertEquals(listOf("gpt-5.6-sol", "new-upstream-model", "gpt-image-2", "custom-image-model"),
+        assertEquals(listOf("gpt-5.6-sol", "new-upstream-model", "gpt-image-2.5", "custom-image-model"),
             settings.models().map { it.modelId })
         assertEquals(BingoModelIds.GPT_5_6_SOL, settings.chatModelId)
-        assertEquals(BingoModelIds.GPT_IMAGE_2, settings.imageGenerationModelId)
+        assertEquals(BingoModelIds.GPT_IMAGE_2_5, settings.imageGenerationModelId)
     }
 
     @Test fun `same upstream name in both purposes has separate stable identities and credentials`() {

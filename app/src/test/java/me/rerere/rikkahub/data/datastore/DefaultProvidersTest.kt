@@ -78,7 +78,7 @@ class DefaultProvidersTest {
         // container's key — it needs its own overwrite despite being the same openai platform.
         assertEquals(1, imageModels.size)
         val image = imageModels.single()
-        assertEquals("gpt-image-2", image.modelId)
+        assertEquals("gpt-image-2.5", image.modelId)
         assertEquals(BINGO_IMAGE_MODEL_ID, image.id)
         assertTrue(Modality.IMAGE in image.outputModalities)
 

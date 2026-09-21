@@ -35,7 +35,7 @@ object ProviderInjector {
 
     fun modelId(id: String, purpose: GatewayPurpose): Uuid =
         (if (purpose == GatewayPurpose.CHAT) legacyChatIds[id]
-        else if (id == "gpt-image-2") BingoModelIds.GPT_IMAGE_2 else null)
+        else if (id == "gpt-image-2.5" || id == "gpt-image-2") BingoModelIds.GPT_IMAGE_2_5 else null)
             ?: Uuid.parse(UUID.nameUUIDFromBytes("bingo:${purpose.name}:$id".toByteArray(Charsets.UTF_8)).toString())
 
     // Also used to recover previously submitted image tasks, whose group may no longer be selectable.

@@ -33,7 +33,8 @@ object BingoModelIds {
     val GPT_5_4_MINI: Uuid get() = DEEPSEEK_FLASH
     val GPT_5_6_SOL: Uuid get() = DEEPSEEK_FLASH
     val GPT_5_6_TERRA: Uuid get() = DEEPSEEK_V4_PRO
-    val GPT_IMAGE_2: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f1")
+    val GPT_IMAGE_2_5: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f1")
+    val GPT_IMAGE_2: Uuid = GPT_IMAGE_2_5
 }
 
 /**
@@ -84,8 +85,8 @@ val BINGO_MODELS: List<Model> = listOf(
         abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
     ),
     Model(
-        id = BingoModelIds.GPT_IMAGE_2,
-        modelId = "gpt-image-2",
+        id = BingoModelIds.GPT_IMAGE_2_5,
+        modelId = "gpt-image-2.5",
         displayName = "AI 绘画",
         type = ModelType.IMAGE,
         inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
@@ -96,7 +97,7 @@ val BINGO_MODELS: List<Model> = listOf(
 )
 
 /** The only image model, so image generation never needs a picker. */
-val BINGO_IMAGE_MODEL_ID: Uuid = BingoModelIds.GPT_IMAGE_2
+val BINGO_IMAGE_MODEL_ID: Uuid = BingoModelIds.GPT_IMAGE_2_5
 
 /** Default chat model for a fresh install. */
 val BINGO_DEFAULT_MODEL_ID: Uuid = BingoModelIds.DEEPSEEK_FLASH
