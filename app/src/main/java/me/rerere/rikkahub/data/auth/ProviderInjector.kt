@@ -26,11 +26,11 @@ object ProviderInjector {
         "deepseek-v4-pro" to BingoModelIds.DEEPSEEK_V4_PRO,
         "deepseek-chat" to BingoModelIds.DEEPSEEK_FLASH,
         "deepseek-reasoner" to BingoModelIds.DEEPSEEK_V4_PRO,
-        "gpt-5.6-sol" to BingoModelIds.GPT_5_6_SOL,
-        "gpt-5.6-terra" to BingoModelIds.GPT_5_6_TERRA,
-        "gpt-5.5" to BingoModelIds.GPT_5_5,
-        "gpt-5.4" to BingoModelIds.GPT_5_4,
-        "gpt-5.4-mini" to BingoModelIds.GPT_5_4_MINI,
+        "gpt-5.6-sol" to BingoModelIds.DEEPSEEK_FLASH,
+        "gpt-5.6-terra" to BingoModelIds.DEEPSEEK_V4_PRO,
+        "gpt-5.5" to BingoModelIds.DEEPSEEK_V4_PRO,
+        "gpt-5.4" to BingoModelIds.DEEPSEEK_FLASH,
+        "gpt-5.4-mini" to BingoModelIds.DEEPSEEK_FLASH,
     )
 
     fun modelId(id: String, purpose: GatewayPurpose): Uuid =

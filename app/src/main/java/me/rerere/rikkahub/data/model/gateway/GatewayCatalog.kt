@@ -45,7 +45,7 @@ data class GatewayRouting(
 )
 
 enum class GatewayPurpose(val allowedGroupIds: List<Int>, val defaultGroupId: Int) {
-    CHAT(listOf(29), 29),
+    CHAT(listOf(29, 23, 16), 16),
     IMAGE(listOf(13, 2), 2);
 
     fun allowsGroup(groupId: Int): Boolean = groupId in allowedGroupIds
