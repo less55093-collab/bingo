@@ -1184,6 +1184,8 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="update_notification_connecting">正在连接下载服务器</string>
   <string name="update_notification_progress">已下载 %1$d%%</string>
   <string name="update_notification_preparing">下载完成，正在校验并备份数据</string>
+  <string name="update_notification_installing">正在打开系统安装界面</string>
+  <string name="update_notification_downloaded">下载完成，点击立即安装更新</string>
   <string name="update_notification_failed">更新失败：%1$s</string>
   <string name="upload_file">上传文件</string>
   <string name="use_web_search">网络搜索</string>

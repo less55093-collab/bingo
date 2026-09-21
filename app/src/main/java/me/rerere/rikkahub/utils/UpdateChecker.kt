@@ -113,8 +113,16 @@ class UpdateChecker(
             runCatching { createBackup(appContext) }
                 .onFailure { error -> Log.w(TAG, "pre-install backup failed", error) }
             notification.showOpeningInstaller()
-            launchInstaller(appContext, apk)
-            notification.cancel()
+            try {
+                launchInstaller(appContext, apk)
+            } catch (e: Throwable) {
+                // 如果系统安装器启动失败，保留下载通知并引导点击安装
+                notification.showDownloadedReady(apk)
+                throw e
+            }
+            // 不要立刻 cancel 通知！对于 PackageInstaller 会有后续回调；对于 ACTION_VIEW 用户需要在系统安装器操作。
+            // 将通知更新为“已就绪/点击安装”，避免状态栏直接消失给用户造成闪退或没有反应的假象。
+            notification.showDownloadedReady(apk)
         } catch (error: Throwable) {
             apk.delete()
             throw error
@@ -131,7 +139,7 @@ class UpdateChecker(
         url: String,
         notification: UpdateProgressNotification,
     ): File = withContext(Dispatchers.IO) {
-        val directory = File(context.cacheDir, "updates").also { it.mkdirs() }
+        val directory = (context.getExternalFilesDir("updates") ?: File(context.cacheDir, "updates")).also { it.mkdirs() }
         val partial = File(directory, "pending.apk.part")
         val apk = File(directory, "pending.apk")
         partial.delete()
@@ -225,9 +233,10 @@ class UpdateChecker(
     }
 
     private fun launchInstaller(context: Context, apk: File) {
-        runCatching { installWithPackageInstaller(context, apk) }
-            .onFailure { error -> Log.w(TAG, "PackageInstaller session failed, falling back to ACTION_VIEW", error) }
-            .recoverCatching { installWithViewIntent(context, apk) }
+        // 优先使用标准 ACTION_VIEW 调用系统安装器，在绝大部分系统（MIUI、OriginOS、ColorOS、原生）上最稳定且能直接前台弹窗
+        runCatching { installWithViewIntent(context, apk) }
+            .onFailure { error -> Log.w(TAG, "installWithViewIntent failed, falling back to PackageInstaller session", error) }
+            .recoverCatching { installWithPackageInstaller(context, apk) }
             .getOrThrow()
     }
 
@@ -267,7 +276,7 @@ class UpdateChecker(
         }
     }
 
-    private fun installWithViewIntent(context: Context, apk: File) {
+    internal fun createInstallViewIntent(context: Context, apk: File): Intent {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, "application/vnd.android.package-archive")
@@ -284,6 +293,11 @@ class UpdateChecker(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
         }
+        return intent
+    }
+
+    private fun installWithViewIntent(context: Context, apk: File) {
+        val intent = createInstallViewIntent(context, apk)
         context.startActivity(intent)
     }
 
@@ -455,6 +469,41 @@ private class UpdateProgressNotification(private val context: Context) {
                 .setProgress(0, 0, true)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
+        )
+    }
+
+    fun showDownloadedReady(apk: File) {
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            apk,
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            2004,
+            installIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val content = context.getString(R.string.update_notification_downloaded)
+        notify(
+            baseBuilder()
+                .setContentText(content)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+                .setProgress(0, 0, false)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setContentIntent(pendingIntent)
+                .addAction(
+                    R.drawable.small_icon,
+                    context.getString(R.string.common_install),
+                    pendingIntent,
+                )
         )
     }
 

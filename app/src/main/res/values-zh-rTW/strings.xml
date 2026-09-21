@@ -1097,7 +1097,9 @@
   <string name="update_notification_title">正在更新 Bingo</string>
   <string name="update_notification_connecting">正在連接下載伺服器</string>
   <string name="update_notification_progress">已下載 %1$d%%</string>
-  <string name="update_notification_preparing">下載完成，正在驗證並備份資料</string>
+  <string name="update_notification_preparing">下載完成，正在校驗並備份數據</string>
+  <string name="update_notification_installing">正在打開系統安裝介面</string>
+  <string name="update_notification_downloaded">下載完成，點擊立即安裝更新</string>
   <string name="update_notification_failed">更新失敗：%1$s</string>
   <string name="upload_file">上傳檔案</string>
   <string name="use_web_search">網路搜尋</string>
