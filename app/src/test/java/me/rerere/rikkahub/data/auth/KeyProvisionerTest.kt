@@ -21,7 +21,7 @@ class KeyProvisionerTest {
     }
 
     private class Fixture {
-        val groups = mutableListOf(GatewayGroup(16, "Chat"), GatewayGroup(2, "Image"),
+        val groups = mutableListOf(GatewayGroup(29, "Chat"), GatewayGroup(2, "Image"),
             GatewayGroup(23, "Other chat"), GatewayGroup(13, "Other image"), GatewayGroup(30, "Other"))
         val keys = mutableListOf<ApiKeyDto>()
         val creations = mutableListOf<CreateKeyRequest>()
@@ -103,9 +103,9 @@ class KeyProvisionerTest {
     @Test fun `revoked selected group is cleared without choosing a different billing group`() = runBlocking {
         val f = Fixture()
         f.provisioner.refresh()
-        f.groups.removeAll { it.id == 16 }
+        f.groups.removeAll { it.id == 29 }
         f.provisioner.refresh()
-        assertEquals(16, f.store.routing.chat!!.group.id)
+        assertEquals(29, f.store.routing.chat!!.group.id)
         assertEquals("", f.store.routing.chat!!.key)
         assertTrue(f.store.routing.chat!!.models.isEmpty())
         assertNotNull(f.provisioner.syncState.value.error)
@@ -127,11 +127,11 @@ class KeyProvisionerTest {
     @Test fun `keys beyond first page and legacy names are reused without mutation`() = runBlocking {
         val f = Fixture()
         f.keys += (1..4).map { ApiKeyDto(it.toLong(), "sk-$it", "unrelated", 30, "active") }
-        f.keys += ApiKeyDto(5, "sk-legacy", "app-gpt", 16, "active")
+        f.keys += ApiKeyDto(5, "sk-legacy", "app-gpt", 29, "active")
         f.provisioner.refresh()
         assertTrue(f.pages >= 3)
         assertEquals("sk-legacy", f.store.routing.chat!!.key)
-        assertFalse(f.creations.any { it.groupId == 16 })
+        assertFalse(f.creations.any { it.groupId == 29 })
     }
 
     @Test fun `cached startup restores catalog and throttles network while explicit refresh fetches`() = runBlocking {
@@ -166,7 +166,7 @@ class KeyProvisionerTest {
         val requests = f.modelRequests.size
         val creations = f.creations.size
         for (id in listOf(13, 2, 30)) f.provisioner.switchGroup(GatewayPurpose.CHAT, id)
-        for (id in listOf(23, 16, 30)) f.provisioner.switchGroup(GatewayPurpose.IMAGE, id)
+        for (id in listOf(23, 29, 30)) f.provisioner.switchGroup(GatewayPurpose.IMAGE, id)
         assertEquals(original, f.store.routing)
         assertEquals(requests, f.modelRequests.size)
         assertEquals(creations, f.creations.size)
@@ -192,7 +192,7 @@ class KeyProvisionerTest {
         val f = Fixture()
         f.provisioner.refresh()
         val oldImage = f.store.routing.image
-        f.groups.removeAll { it.id == 16 || it.id == 2 }
+        f.groups.removeAll { it.id == 29 || it.id == 2 }
         f.failKeys = true
         assertTrue(runCatching { f.provisioner.refresh() }.isFailure)
         assertTrue(f.store.routing.chat!!.key.isEmpty())
@@ -203,7 +203,7 @@ class KeyProvisionerTest {
 
     @Test fun `missing default permissions require a choice rather than selecting a new billing group`() = runBlocking {
         val f = Fixture()
-        f.groups.removeAll { it.id == 16 || it.id == 2 }
+        f.groups.removeAll { it.id == 29 || it.id == 2 }
         f.provisioner.refresh()
         assertNull(f.store.routing.chat)
         assertNull(f.store.routing.image)

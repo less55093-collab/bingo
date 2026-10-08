@@ -474,15 +474,6 @@ class ChatCompletionsAPI(
                         })
                     }
 
-                    "api.deepseek.com" -> {
-                        put("thinking", buildJsonObject {
-                            put("type", if (!level.isEnabled) "disabled" else "enabled")
-                        })
-                        if (level.isEnabled && level != ReasoningLevel.AUTO) {
-                            put("reasoning_effort", level.effort)
-                        }
-                    }
-
                     "integrate.api.nvidia.com" -> {
                         if ("deepseek-v4" in params.model.modelId.lowercase()) {
                             if (level != ReasoningLevel.AUTO) {
@@ -543,9 +534,11 @@ class ChatCompletionsAPI(
                 ModelRegistry.KIMI_K2_6.match(model.modelId) ||
                 ModelRegistry.KIMI_K3.match(model.modelId) ||
                 ModelRegistry.KIMI_K3_ALIAS.match(model.modelId)
+        val isDeepseekReasoner = ModelRegistry.DEEPSEEK_REASONER.match(model.modelId)
         return !ModelRegistry.OPENAI_O_MODELS.match(model.modelId) && 
                !ModelRegistry.GPT_5.match(model.modelId) && 
-               !isMoonshotRestricted
+               !isMoonshotRestricted &&
+               !isDeepseekReasoner
     }
 
     private fun buildMessages(

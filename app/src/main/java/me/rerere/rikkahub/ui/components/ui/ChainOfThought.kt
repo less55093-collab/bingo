@@ -1,6 +1,11 @@
 package me.rerere.rikkahub.ui.components.ui
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -293,13 +298,15 @@ private class ChainOfThoughtScopeImpl : ChainOfThoughtScope {
         val shouldFillMaxWidth = !collapsedAdaptiveWidth || contentVisible
 
         Column(
-            modifier = Modifier.then(
-                if (shouldFillMaxWidth) {
-                    Modifier.fillMaxWidth()
-                } else {
-                    Modifier
-                }
-            ),
+            modifier = Modifier
+                .animateContentSize()
+                .then(
+                    if (shouldFillMaxWidth) {
+                        Modifier.fillMaxWidth()
+                    } else {
+                        Modifier
+                    }
+                ),
         ) {
             // Label 行：Icon + Label + Extra + 指示器
             Row(
@@ -393,8 +400,12 @@ private class ChainOfThoughtScopeImpl : ChainOfThoughtScope {
                 }
             }
 
-            // 展开内容（缩进对齐 label）
-            if (contentVisible && hasContent) {
+            // 展开内容（缩进对齐 label，平滑展开折叠）
+            AnimatedVisibility(
+                visible = contentVisible && hasContent,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
                 Box(
                     modifier = Modifier
                         .then(
@@ -406,7 +417,7 @@ private class ChainOfThoughtScopeImpl : ChainOfThoughtScope {
                         )
                         .padding(start = 32.dp, top = 4.dp, bottom = 8.dp)
                 ) {
-                    content()
+                    content?.invoke()
                 }
             }
         }

@@ -274,25 +274,40 @@ val dataSourceModule = module {
 
     single { S3CredentialStore(get()) }
 
+    // Presigned OSS URLs and auth refresh must not receive the gateway Bearer token or authenticator.
+    single(named(GATEWAY_RAW_CLIENT)) {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .followSslRedirects(true)
+            .followRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+
+    single(named("gatewayAuthRetrofit")) {
+        Retrofit.Builder()
+            .baseUrl(BingoGatewayAPI.BASE_URL)
+            .client(get(named(GATEWAY_RAW_CLIENT)))
+            .addConverterFactory(get<Json>().asConverterFactory("application/json; charset=UTF8".toMediaType()))
+            .build()
+    }
+
+    single(named("gatewayAuthApi")) {
+        get<Retrofit>(named("gatewayAuthRetrofit")).create(BingoGatewayAPI::class.java)
+    }
+
     // Derived from the shared client to reuse its connection pool and generic headers, but kept a
     // distinct instance so the Authorization header and token refresh never touch inference traffic.
     single(named(GATEWAY_CLIENT)) {
         get<OkHttpClient>().newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor(get()))
-            // Lazy lookup breaks the cycle: the authenticator needs the API, which needs the client.
-            .authenticator(TokenAuthenticator(get()) { get<BingoGatewayAPI>() })
-            .build()
-    }
-
-    // Presigned OSS URLs must not receive the gateway Bearer token or authenticator.
-    single(named(GATEWAY_RAW_CLIENT)) {
-        OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.MINUTES)
-            .writeTimeout(10, TimeUnit.MINUTES)
-            .followSslRedirects(true)
-            .followRedirects(true)
-            .retryOnConnectionFailure(true)
+            // Use gatewayAuthApi to break the recursion cycle on 401 refresh
+            .authenticator(TokenAuthenticator(get()) { get<BingoGatewayAPI>(named("gatewayAuthApi")) })
             .build()
     }
 

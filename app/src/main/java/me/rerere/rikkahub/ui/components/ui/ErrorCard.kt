@@ -116,12 +116,6 @@ fun ErrorCard(
     val rawMessage = error.error.message?.takeIf { it.isNotBlank() }
     val friendlyMessage = error.error.localizedChatMessage(context)
 
-    // 5 秒后自动消失
-    LaunchedEffect(error.id) {
-        delay(5000)
-        onDismiss()
-    }
-
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),

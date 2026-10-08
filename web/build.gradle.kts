@@ -41,8 +41,10 @@ android {
     }
 }
 
-tasks.named("preBuild") {
-    dependsOn(buildWebUi)
+if (!file("src/main/resources/static/index.html").exists()) {
+    tasks.named("preBuild") {
+        dependsOn(buildWebUi)
+    }
 }
 
 dependencies {

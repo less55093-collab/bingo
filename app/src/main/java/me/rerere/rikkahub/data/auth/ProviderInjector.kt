@@ -24,8 +24,8 @@ object ProviderInjector {
     private val legacyChatIds = mapOf(
         "deepseek-flash" to BingoModelIds.DEEPSEEK_FLASH,
         "deepseek-v4-pro" to BingoModelIds.DEEPSEEK_V4_PRO,
-        "deepseek-chat" to BingoModelIds.DEEPSEEK_FLASH,
-        "deepseek-reasoner" to BingoModelIds.DEEPSEEK_V4_PRO,
+        "deepseek-chat" to BingoModelIds.DEEPSEEK_CHAT,
+        "deepseek-reasoner" to BingoModelIds.DEEPSEEK_REASONER,
         "gpt-5.6-sol" to BingoModelIds.DEEPSEEK_FLASH,
         "gpt-5.6-terra" to BingoModelIds.DEEPSEEK_V4_PRO,
         "gpt-5.5" to BingoModelIds.DEEPSEEK_V4_PRO,

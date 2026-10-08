@@ -115,8 +115,11 @@ private fun rememberReasoningState(reasoning: UIMessagePart.Reasoning): Pair<Rea
     }
 
     LaunchedEffect(reasoning.reasoning, loading) {
-        if (loading) {
-            scrollState.animateScrollTo(scrollState.maxValue)
+        if (loading && !scrollState.isScrollInProgress) {
+            val isNearBottom = scrollState.maxValue - scrollState.value <= 60
+            if (isNearBottom) {
+                scrollState.scrollTo(scrollState.maxValue)
+            }
         }
     }
 
@@ -124,7 +127,7 @@ private fun rememberReasoningState(reasoning: UIMessagePart.Reasoning): Pair<Rea
         if (loading) {
             while (isActive) {
                 state.duration = (reasoning.finishedAt ?: Clock.System.now()) - reasoning.createdAt
-                delay(50)
+                delay(100)
             }
         }
     }

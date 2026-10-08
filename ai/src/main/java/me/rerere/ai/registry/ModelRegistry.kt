@@ -267,12 +267,12 @@ object ModelRegistry {
         add(DEEPSEEK_V3_MODEL, DEEPSEEK_CHAT)
     }
 
-    private val DEEPSEEK_R1_MODEL = defineModel {
+    internal val DEEPSEEK_R1_MODEL = defineModel {
         tokens("deepseek", "r", "1")
         toolReasoningAbility()
     }
 
-    private val DEEPSEEK_REASONER = defineModel {
+    internal val DEEPSEEK_REASONER = defineModel {
         tokens("deepseek", "reasoner")
         toolReasoningAbility()
     }

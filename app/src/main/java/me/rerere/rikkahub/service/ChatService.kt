@@ -375,7 +375,6 @@ class ChatService(
 
         val session = getOrCreateSession(conversationId)
         val previousJob = session.getJob()
-        if (previousJob?.isActive == true) return
         previousJob?.cancel()
 
         val job = launchChatGeneration(conversationId) { lease ->

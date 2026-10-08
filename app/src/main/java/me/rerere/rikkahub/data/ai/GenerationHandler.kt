@@ -459,6 +459,7 @@ class GenerationHandler(
             if (parts.any { part ->
                     when (part) {
                         is UIMessagePart.Text -> part.text.isNotBlank()
+                        is UIMessagePart.Reasoning -> part.reasoning.isNotBlank()
                         is UIMessagePart.Tool -> part.toolName.isNotBlank() || part.input.isNotBlank()
                         is UIMessagePart.Image -> part.url.isNotBlank()
                         is UIMessagePart.Audio -> true

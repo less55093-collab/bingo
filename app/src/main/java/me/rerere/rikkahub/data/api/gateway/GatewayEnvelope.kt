@@ -63,7 +63,7 @@ object GatewayGroups {
 
 /** Reserved API-key names so provisioning is idempotent across reinstalls. */
 object GatewayKeyNames {
-    const val CHAT = "app-gpt"
-    const val GPT = "app-gpt"
+    const val CHAT = "app-deepseek"
+    const val GPT = "app-deepseek"
     const val IMAGE = "app-image"
 }

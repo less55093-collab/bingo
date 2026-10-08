@@ -8,6 +8,8 @@ import kotlinx.coroutines.sync.withLock
 import me.rerere.rikkahub.data.api.gateway.BingoGatewayAPI
 import me.rerere.rikkahub.data.api.gateway.GatewayKeyNames
 import me.rerere.rikkahub.data.api.gateway.GatewayModelAPI
+import me.rerere.rikkahub.data.api.gateway.InsufficientBalanceException
+import me.rerere.rikkahub.data.api.gateway.ApiKeyExpiredException
 import me.rerere.rikkahub.data.api.gateway.requireData
 import me.rerere.rikkahub.data.model.gateway.*
 
@@ -50,17 +52,42 @@ class KeyProvisioner(
                     continue
                 }
                 try {
-                    val key = provision(remote, purpose, group.id)
+                    var key = provision(remote, purpose, group.id)
                     val fresh = previous?.key == key && previous.syncedAt > 0 &&
                         System.currentTimeMillis() - previous.syncedAt < 15 * 60_000
-                    val binding = if (!force && fresh) previous.copy(group = group)
-                    else GatewayBinding(group, key, modelAPI.listModels(key), System.currentTimeMillis())
+                    val models = if (!force && fresh && previous.models.isNotEmpty()) {
+                        previous.models
+                    } else {
+                        try {
+                            val remoteModels = modelAPI.listModels(key)
+                            if (remoteModels.isNotEmpty()) remoteModels else fallbackModels(purpose, group)
+                        } catch (e: ApiKeyExpiredException) {
+                            // Key 过期自愈：自动生成新 Key 并再次获取模型
+                            key = createNewKey(purpose, group.id)
+                            try {
+                                val remoteModels = modelAPI.listModels(key)
+                                if (remoteModels.isNotEmpty()) remoteModels else fallbackModels(purpose, group)
+                            } catch (balanceErr: InsufficientBalanceException) {
+                                errors += "账户余额不足，请充值后使用"
+                                fallbackModels(purpose, group)
+                            } catch (_: Exception) {
+                                fallbackModels(purpose, group)
+                            }
+                        } catch (e: InsufficientBalanceException) {
+                            errors += "账户余额不足，请充值后使用"
+                            fallbackModels(purpose, group)
+                        } catch (e: Exception) {
+                            errors += if (purpose == GatewayPurpose.CHAT) "聊天模型同步失败，已载入默认模型" else "生图模型同步失败，已载入默认模型"
+                            fallbackModels(purpose, group)
+                        }
+                    }
+                    val binding = GatewayBinding(group, key, models, System.currentTimeMillis())
                     routing = replace(routing, purpose, binding)
                     commit(routing)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    errors += if (purpose == GatewayPurpose.CHAT) "聊天模型同步失败，保留上次配置" else "生图模型同步失败，保留上次配置"
+                    errors += if (purpose == GatewayPurpose.CHAT) "聊天配置保存失败：${e.message}" else "生图配置保存失败：${e.message}"
                 }
             }
             _syncState.value = _syncState.value.copy(error = errors.takeIf { it.isNotEmpty() }?.joinToString("；"))
@@ -89,8 +116,25 @@ class KeyProvisioner(
             routing = enforcePermissions(routing, groups)
             val group = purpose.availableGroups(groups).firstOrNull { it.id == groupId }
                 ?: error("该分组已不可用，请刷新后重选")
-            val key = provision(listAllKeys(), purpose, group.id)
-            val binding = GatewayBinding(group, key, modelAPI.listModels(key), System.currentTimeMillis())
+            var key = provision(listAllKeys(), purpose, group.id)
+            val models = try {
+                val remoteModels = modelAPI.listModels(key)
+                if (remoteModels.isNotEmpty()) remoteModels else fallbackModels(purpose, group)
+            } catch (e: ApiKeyExpiredException) {
+                key = createNewKey(purpose, group.id)
+                try {
+                    val remoteModels = modelAPI.listModels(key)
+                    if (remoteModels.isNotEmpty()) remoteModels else fallbackModels(purpose, group)
+                } catch (_: Exception) {
+                    fallbackModels(purpose, group)
+                }
+            } catch (e: InsufficientBalanceException) {
+                _syncState.value = _syncState.value.copy(error = "账户余额不足，请充值后使用")
+                fallbackModels(purpose, group)
+            } catch (_: Exception) {
+                fallbackModels(purpose, group)
+            }
+            val binding = GatewayBinding(group, key, models, System.currentTimeMillis())
             commit(replace(routing, purpose, binding))
         } catch (e: CancellationException) {
             throw e
@@ -155,11 +199,47 @@ class KeyProvisioner(
         val base = if (purpose == GatewayPurpose.CHAT) GatewayKeyNames.GPT else GatewayKeyNames.IMAGE
         val name = "$base-group-$groupId"
         // Keep keys immutable across groups. Deleting or rebinding one would break pending image tasks.
-        return remote.filter { it.groupId == groupId && it.isUsable && (it.name == name || it.name == base) }
+        val legacyNames = setOf(name, base, "app-gpt", "app-deepseek", "app-gpt-group-$groupId", "app-deepseek-group-$groupId")
+        return remote.filter { it.groupId == groupId && it.isUsable && it.name in legacyNames }
             .maxByOrNull { it.id }?.key
             ?: api.createKey(CreateKeyRequest(name, groupId)).requireData().let {
                 check(it.groupId == groupId && it.isUsable) { "中转站未返回可用密钥" }
                 it.key
             }
+    }
+
+    private suspend fun createNewKey(purpose: GatewayPurpose, groupId: Int): String {
+        val base = if (purpose == GatewayPurpose.CHAT) GatewayKeyNames.GPT else GatewayKeyNames.IMAGE
+        val name = "$base-group-$groupId-${System.currentTimeMillis() % 10000}"
+        return api.createKey(CreateKeyRequest(name, groupId)).requireData().let {
+            check(it.groupId == groupId && it.isUsable) { "中转站未返回可用密钥" }
+            it.key
+        }
+    }
+
+    private fun fallbackModels(purpose: GatewayPurpose, group: GatewayGroup): List<GatewayModel> {
+        return if (purpose == GatewayPurpose.CHAT) {
+            when (group.id) {
+                29 -> listOf(
+                    GatewayModel("deepseek-flash", "DeepSeek-Flash"),
+                    GatewayModel("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+                    GatewayModel("deepseek-chat", "DeepSeek-Chat"),
+                    GatewayModel("deepseek-reasoner", "DeepSeek-Reasoner"),
+                )
+                16 -> listOf(
+                    GatewayModel("gpt-5.6-sol", "GPT-5.6-Sol"),
+                    GatewayModel("gpt-5.6-terra", "GPT-5.6-Terra"),
+                )
+                23 -> listOf(
+                    GatewayModel("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+                )
+                else -> listOf(
+                    GatewayModel("deepseek-flash", "DeepSeek-Flash"),
+                    GatewayModel("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+                )
+            }
+        } else {
+            listOf(GatewayModel("gpt-image-2.5", "AI 绘画"))
+        }
     }
 }

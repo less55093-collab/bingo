@@ -24,12 +24,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.surfaceColorAtElevation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -86,6 +88,7 @@ fun ColumnScope.ConversationList(
     onMoveToFolder: (Conversation) -> Unit = {}
 ) {
     var hasScrolledToCurrent by remember(current.id) { mutableStateOf(false) }
+    var conversationPendingDelete by remember { mutableStateOf<Conversation?>(null) }
 
     LaunchedEffect(current.id, conversations.itemCount, hasScrolledToCurrent) {
         if (hasScrolledToCurrent) return@LaunchedEffect
@@ -155,7 +158,7 @@ fun ColumnScope.ConversationList(
                         selected = item.conversation.id == current.id,
                         loading = item.conversation.id in conversationJobs,
                         onClick = onClick,
-                        onDelete = onDelete,
+                        onDelete = { conversationPendingDelete = it },
                         onRegenerateTitle = onRegenerateTitle,
                         onPin = onPin,
                         onMoveToAssistant = onMoveToAssistant,
@@ -169,6 +172,37 @@ fun ColumnScope.ConversationList(
                 }
             }
         }
+    }
+
+    conversationPendingDelete?.let { target ->
+        AlertDialog(
+            onDismissRequest = { conversationPendingDelete = null },
+            title = { Text(stringResource(R.string.chat_page_delete)) },
+            text = {
+                Text(
+                    text = "确定要删除对话 \"${target.title.ifBlank { stringResource(R.string.chat_page_new_message) }}\" 吗？此操作不可撤销。"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val toDelete = target
+                        conversationPendingDelete = null
+                        onDelete(toDelete)
+                    }
+                ) {
+                    Text(
+                        stringResource(R.string.chat_page_delete),
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { conversationPendingDelete = null }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            }
+        )
     }
 }
 
@@ -351,14 +385,21 @@ private fun ConversationItem(
 
                 DropdownMenuItem(
                     text = {
-                        Text(stringResource(id = R.string.chat_page_delete))
+                        Text(
+                            text = stringResource(id = R.string.chat_page_delete),
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     },
                     onClick = {
-                        onDelete(conversation)
                         showDropdownMenu = false
+                        onDelete(conversation)
                     },
                     leadingIcon = {
-                        Icon(HugeIcons.Delete01, null)
+                        Icon(
+                            imageVector = HugeIcons.Delete01,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                        )
                     }
                 )
             }

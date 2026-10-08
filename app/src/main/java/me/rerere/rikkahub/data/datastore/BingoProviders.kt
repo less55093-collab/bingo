@@ -24,10 +24,10 @@ val BINGO_IMAGE_OVERWRITE_ID: Uuid = Uuid.parse("3ac9d1f7-8e62-4b0d-95c4-1f7a6e2
 object BingoModelIds {
     val DEEPSEEK_FLASH: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000001")
     val DEEPSEEK_V4_PRO: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000002")
+    val DEEPSEEK_CHAT: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000003")
+    val DEEPSEEK_REASONER: Uuid = Uuid.parse("98765432-0000-0000-0000-000000000004")
 
     // Aliases
-    val DEEPSEEK_CHAT: Uuid get() = DEEPSEEK_FLASH
-    val DEEPSEEK_REASONER: Uuid get() = DEEPSEEK_V4_PRO
     val GPT_5_5: Uuid get() = DEEPSEEK_FLASH
     val GPT_5_4: Uuid get() = DEEPSEEK_FLASH
     val GPT_5_4_MINI: Uuid get() = DEEPSEEK_FLASH
@@ -82,6 +82,18 @@ val BINGO_MODELS: List<Model> = listOf(
         BingoModelIds.DEEPSEEK_V4_PRO,
         "deepseek-v4-pro",
         "DeepSeek-V4-Pro",
+        abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
+    ),
+    deepseekModel(
+        BingoModelIds.DEEPSEEK_CHAT,
+        "deepseek-chat",
+        "DeepSeek-Chat",
+        abilities = listOf(ModelAbility.TOOL),
+    ),
+    deepseekModel(
+        BingoModelIds.DEEPSEEK_REASONER,
+        "deepseek-reasoner",
+        "DeepSeek-Reasoner",
         abilities = listOf(ModelAbility.TOOL, ModelAbility.REASONING),
     ),
     Model(

@@ -292,7 +292,8 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                         navController = navController,
                         current = conversation,
                         vm = vm,
-                        settings = setting
+                        settings = setting,
+                        drawerState = drawerState,
                     )
                 }
             ) {
@@ -325,7 +326,8 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                         navController = navController,
                         current = conversation,
                         vm = vm,
-                        settings = setting
+                        settings = setting,
+                        drawerState = drawerState,
                     )
                 }
             ) {
@@ -391,8 +393,15 @@ private fun ChatPageContent(
                 return
             }
         } else if (currentChatModel == null) {
-            toaster.show("请先选择模型", type = ToastType.Error)
-            return
+            val availableModel = setting.providers.flatMap { it.models }.firstOrNull { it.type == me.rerere.ai.provider.ModelType.CHAT }
+            if (availableModel != null) {
+                vm.setChatModel(assistant = assistant, model = availableModel)
+                toaster.show("已自动为您选择模型：${availableModel.displayName.ifBlank { availableModel.modelId }}", type = ToastType.Normal)
+            } else {
+                toaster.show("未找到可用模型，请先在设置中配置", type = ToastType.Error)
+                navController.navigate(Screen.Setting)
+                return
+            }
         }
         if (inputState.isEditing()) {
             vm.handleMessageEdit(

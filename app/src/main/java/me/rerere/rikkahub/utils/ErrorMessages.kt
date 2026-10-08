@@ -50,6 +50,7 @@ internal fun Throwable.chatErrorResId(): Int? {
             R.string.chat_error_rate_limited
 
         hay.containsAny("invalid_api_key", "invalid api key", "incorrect api key",
+            "api_key_required", "api key is required",
             "unauthorized", "no auth credentials", "authentication_error", "401") ->
             R.string.chat_error_invalid_key
 
