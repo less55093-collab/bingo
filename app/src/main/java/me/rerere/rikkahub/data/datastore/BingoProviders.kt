@@ -34,7 +34,7 @@ object BingoModelIds {
     val GPT_5_6_SOL: Uuid get() = DEEPSEEK_FLASH
     val GPT_5_6_TERRA: Uuid get() = DEEPSEEK_V4_PRO
     val GPT_IMAGE_2_5: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f1")
-    val GPT_IMAGE_2: Uuid = GPT_IMAGE_2_5
+    val GPT_IMAGE_2: Uuid = Uuid.parse("7f4a1c2e-6d38-4b95-9a17-0c5e8b3d42f2")
 }
 
 /**
@@ -99,7 +99,17 @@ val BINGO_MODELS: List<Model> = listOf(
     Model(
         id = BingoModelIds.GPT_IMAGE_2_5,
         modelId = "gpt-image-2.5",
-        displayName = "AI 绘画",
+        displayName = "AI 绘画 (2.5)",
+        type = ModelType.IMAGE,
+        inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
+        outputModalities = listOf(Modality.IMAGE),
+        abilities = emptyList(),
+        providerOverwrite = imageOverwrite(),
+    ),
+    Model(
+        id = BingoModelIds.GPT_IMAGE_2,
+        modelId = "gpt-image-2",
+        displayName = "AI 绘画 (2.0)",
         type = ModelType.IMAGE,
         inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
         outputModalities = listOf(Modality.IMAGE),

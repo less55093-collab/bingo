@@ -35,7 +35,9 @@ object ProviderInjector {
 
     fun modelId(id: String, purpose: GatewayPurpose): Uuid =
         (if (purpose == GatewayPurpose.CHAT) legacyChatIds[id]
-        else if (id == "gpt-image-2.5" || id == "gpt-image-2") BingoModelIds.GPT_IMAGE_2_5 else null)
+        else if (id == "gpt-image-2.5") BingoModelIds.GPT_IMAGE_2_5
+        else if (id == "gpt-image-2") BingoModelIds.GPT_IMAGE_2
+        else null)
             ?: Uuid.parse(UUID.nameUUIDFromBytes("bingo:${purpose.name}:$id".toByteArray(Charsets.UTF_8)).toString())
 
     // Also used to recover previously submitted image tasks, whose group may no longer be selectable.
@@ -101,9 +103,12 @@ object ProviderInjector {
         val migrateDefault = (!settings.solDefaultApplied && BingoModelIds.DEEPSEEK_FLASH in chatIds)
             || (!settings.solDefaultApplied && BingoModelIds.GPT_5_6_SOL in chatIds)
         // This only chooses a default; it never removes unfamiliar upstream models from the picker.
-        val imageDefault = imageModels.firstOrNull { looksLikeImageModel(it.modelId) }?.id
+        val imageDefault = imageModels.firstOrNull { it.modelId == "gpt-image-2.5" }?.id
+            ?: imageModels.firstOrNull { looksLikeImageModel(it.modelId) }?.id
             ?: imageIds.firstOrNull() ?: Uuid.NIL
         fun chat(id: Uuid) = id.takeIf { it in chatIds } ?: chatDefault
+        val defaultImageId = (BingoModelIds.GPT_IMAGE_2_5.takeIf { it in imageIds }
+            ?: settings.imageGenerationModelId.takeIf { it in imageIds }) ?: imageDefault
         return settings.copy(
             providers = listOf(BINGO_PROVIDER.copy(apiKey = active.chat?.key.orEmpty(), models = models)),
             chatModelId = if (migrateDefault) (BingoModelIds.DEEPSEEK_FLASH.takeIf { it in chatIds } ?: BingoModelIds.GPT_5_6_SOL) else chat(settings.chatModelId),
@@ -114,7 +119,7 @@ object ProviderInjector {
             suggestionModelId = settings.suggestionModelId?.let(::chat),
             ocrModelId = chat(settings.ocrModelId),
             compressModelId = chat(settings.compressModelId),
-            imageGenerationModelId = settings.imageGenerationModelId.takeIf { it in imageIds } ?: imageDefault,
+            imageGenerationModelId = defaultImageId,
             assistants = settings.assistants.map { assistant ->
                 assistant.copy(
                     chatModelId = if (migrateDefault) (BingoModelIds.DEEPSEEK_FLASH.takeIf { it in chatIds } ?: BingoModelIds.GPT_5_6_SOL) else assistant.chatModelId?.takeIf { it in chatIds }

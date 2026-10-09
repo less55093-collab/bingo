@@ -239,7 +239,10 @@ class KeyProvisioner(
                 )
             }
         } else {
-            listOf(GatewayModel("gpt-image-2.5", "AI 绘画"))
+            listOf(
+                GatewayModel("gpt-image-2.5", "AI 绘画 (2.5)"),
+                GatewayModel("gpt-image-2", "AI 绘画 (2.0)"),
+            )
         }
     }
 }
